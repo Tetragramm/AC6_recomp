@@ -164,10 +164,17 @@ void BlendFieldDelta(uint8_t* base, uint32_t ea, float pre, double ratio, const 
 PPC_EXTERN_FUNC(__imp__rex_sub_823046A0);  // flight-model force step
 PPC_EXTERN_FUNC(__imp__rex_sub_82329B40);  // flight-model input shaping
 
+// KB+M context switch (ac6_kbm_input.cpp): the force step is the reliable
+// "flight sim is stepping" heartbeat (runs per frame for every aircraft,
+// halts when paused / in menus).
+void ac6KbmNotifyFlightStep();
+
 // Flight-model core force step (0x823046A0): rescale the per-frame stepped
 // longitudinal force/speed command at [this+1320].
 PPC_FUNC_IMPL(rex_sub_823046A0) {
   PPC_FUNC_PROLOGUE();
+
+  ac6KbmNotifyFlightStep();
 
   const uint32_t self = ctx.r3.u32;
   const double ratio = StepRatio();
