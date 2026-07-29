@@ -46,6 +46,30 @@ class Presenter;
 class Window;
 class Win32Window;
 
+// Runtime override of the letterbox presentation decision, for a game-side
+// classifier that knows more about the frame than the present_letterbox cvar
+// does. AC6 ultrawide drives it per frame: fill while a mission renders
+// through its widened cameras, letterbox for 16:9-authored output (the whole
+// front end, and CPU-written FMV/loading frames even in-mission).
+//
+// The override REPLACES the cvar for as long as it is set, and is deliberately
+// separate from it: a feature must never write present_letterbox itself, or
+// the value leaks into the user's saved config and outlives the feature being
+// switched off. kUseCVar restores stock behaviour.
+// Thread-safe; read once per paint.
+enum class PresentLetterboxOverride : uint32_t {
+  kUseCVar = 0,
+  kForceLetterbox,
+  kForceFill,
+};
+void SetPresentLetterboxOverride(PresentLetterboxOverride mode);
+
+// Last known presentation surface size in physical pixels, stamped every
+// guest output paint. Returns false until the first paint. Thread-safe; used
+// by the AC6 ultrawide feature to derive the target aspect ratio from the
+// actual window instead of a manually configured value.
+bool GetPresentSurfaceSize(uint32_t* width, uint32_t* height);
+
 class UIDrawContext {
  public:
   UIDrawContext(const UIDrawContext& context) = delete;

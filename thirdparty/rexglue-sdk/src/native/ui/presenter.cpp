@@ -284,6 +284,41 @@ GuestOutputPaintConfig BuildGuestOutputPaintConfigFromCVar() {
 namespace rex {
 namespace ui {
 
+// See SetPresentLetterboxOverride in the header. Stamped from the GPU
+// subsystem (swap-source classification), read by GetGuestOutputPaintFlow.
+static std::atomic<PresentLetterboxOverride> g_present_letterbox_override{
+    PresentLetterboxOverride::kUseCVar};
+
+void SetPresentLetterboxOverride(PresentLetterboxOverride mode) {
+  g_present_letterbox_override.store(mode, std::memory_order_relaxed);
+}
+
+// Whether the letterbox path is enabled for this paint: the override when one
+// is set, the cvar otherwise.
+static bool PresentLetterboxEnabled() {
+  switch (g_present_letterbox_override.load(std::memory_order_relaxed)) {
+    case PresentLetterboxOverride::kForceLetterbox:
+      return true;
+    case PresentLetterboxOverride::kForceFill:
+      return false;
+    default:
+      return REXCVAR_GET(present_letterbox);
+  }
+}
+
+// See GetPresentSurfaceSize in the header. Width in the high 32 bits.
+static std::atomic<uint64_t> g_present_surface_size{0};
+
+bool GetPresentSurfaceSize(uint32_t* width, uint32_t* height) {
+  uint64_t packed = g_present_surface_size.load(std::memory_order_relaxed);
+  if (!packed) {
+    return false;
+  }
+  *width = uint32_t(packed >> 32);
+  *height = uint32_t(packed);
+  return true;
+}
+
 void Presenter::FatalErrorHostGpuLossCallback([[maybe_unused]] bool is_responsible,
                                               [[maybe_unused]] bool statically_from_ui_thread) {
   rex::FatalError("Graphics device lost (probably due to an internal error)");
@@ -880,6 +915,11 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
     return flow;
   }
 
+  // Publish the surface size for aspect-ratio auto-detection (AC6 ultrawide).
+  g_present_surface_size.store((uint64_t(surface_width_in_paint_connection_) << 32) |
+                                   surface_height_in_paint_connection_,
+                               std::memory_order_relaxed);
+
   flow.properties = properties;
 
   // Multiplication-division rounding to the nearest.
@@ -929,7 +969,7 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
       output_height = rescale_unsigned(surface_height_in_paint_connection_, 100, present_safe_area);
       letterbox = true;
     }
-    if (letterbox && REXCVAR_GET(present_letterbox)) {
+    if (letterbox && PresentLetterboxEnabled()) {
       output_width = rescale_unsigned(surface_height_in_paint_connection_ * 100,
                                       properties.display_aspect_ratio_x,
                                       properties.display_aspect_ratio_y * present_safe_area);
@@ -964,7 +1004,7 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
       output_width = rescale_unsigned(surface_width_in_paint_connection_, 100, present_safe_area);
       letterbox = true;
     }
-    if (letterbox && REXCVAR_GET(present_letterbox)) {
+    if (letterbox && PresentLetterboxEnabled()) {
       output_height = rescale_unsigned(surface_width_in_paint_connection_ * 100,
                                        properties.display_aspect_ratio_y,
                                        properties.display_aspect_ratio_x * present_safe_area);
