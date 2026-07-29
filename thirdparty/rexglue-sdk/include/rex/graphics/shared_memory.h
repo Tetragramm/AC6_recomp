@@ -96,6 +96,12 @@ class SharedMemory {
   // regions in those pages.
   void RangeWrittenByGpu(uint32_t start, uint32_t length);
 
+  // Whether any page in the range currently holds GPU-generated data (set by
+  // RangeWrittenByGpu, cleared when the CPU overwrites the page). Used by the
+  // AC6 ultrawide swap classification: a presented frontbuffer with no
+  // GPU-written pages was composed by the CPU (FMV frames, loading images).
+  bool IsAnyPageGpuWritten(uint32_t start, uint32_t length);
+
  protected:
   SharedMemory(memory::Memory& memory);
   // Call in implementation-specific initialization.

@@ -34,6 +34,7 @@
 #include <rex/ui/d3d12/d3d12_util.h>
 
 #include "../../../../../src/ac6_backend_fixes/ac6_backend_hooks.h"
+#include "../../../../../src/ac6_backend_fixes/ac6_widescreen.h"
 #include "../../../../../src/ac6_native_graphics.h"
 #include "../../../../../src/render_hooks.h"
 
@@ -1118,6 +1119,10 @@ bool D3D12CommandProcessor::SetupContext() {
         memory_->RegisterPhysicalMemoryInvalidationCallback(
             VertexBufferMemoryInvalidationCallbackThunk, this);
   }
+
+  // AC6: start the ultrawide camera-aspect patcher (idles unless the
+  // ac6_widescreen cvar is enabled).
+  ac6::WidescreenInit(memory_);
 
   // Initialize the render target cache before configuring binding - need to
   // know if using rasterizer-ordered views for the bindless root signature.
@@ -2674,6 +2679,59 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     ac6::NotifyWorldCompositorDraw();
   }
 
+  // AC6 ultrawide: pre-squeeze the game's screen-space 2D transforms in the
+  // VS float constants so the presenter's fill-window stretch cancels out
+  // where the fill presentation is active (in-mission; the gameplay HUD's
+  // excluded marker shader is left full-width so world-projected target
+  // markers stay aligned). No-op unless ac6_widescreen + ac6_widescreen_ui
+  // are enabled.
+  // Sub-screen guest viewport (radar window, PiP inset): |x scale| is half
+  // the viewport width in guest pixels - well under the full 640.
+  float ac6_vp_xscale;
+  std::memcpy(&ac6_vp_xscale, &regs.values[XE_GPU_REG_PA_CL_VPORT_XSCALE],
+              sizeof(ac6_vp_xscale));
+  float ac6_vp_xscale_abs = ac6_vp_xscale < 0.0f ? -ac6_vp_xscale : ac6_vp_xscale;
+  bool ac6_sub_viewport = ac6_vp_xscale_abs >= 1.0f && ac6_vp_xscale_abs < 576.0f;
+  if (ac6::WidescreenPatchUiOrtho(&register_file_->values[XE_GPU_REG_SHADER_CONSTANT_000_X],
+                                  vertex_shader ? vertex_shader->ucode_data_hash() : 0,
+                                  ac6_sub_viewport)) {
+    cbuffer_binding_float_vertex_.up_to_date = false;
+  }
+  // AC6 ultrawide: narrow target-marker quads about their own centres so the
+  // fill-window stretch renders them square while the game-computed aim points
+  // stay put (see WidescreenShrinkMarkerQuads). The game draws them as a quad
+  // list of screen-space positions in a CPU-written arena, so the edit is made
+  // in guest memory here - before the vertex buffers are requested below - and
+  // is naturally transient (the arena is rewritten every frame).
+  if (vertex_shader && primitive_type == xenos::PrimitiveType::kQuadList &&
+      ac6::WidescreenWantsMarkerQuadFix(vertex_shader->ucode_data_hash())) {
+    for (const Shader::VertexBinding& vb : vertex_shader->vertex_bindings()) {
+      if (vb.attributes.empty() || !vb.stride_words) {
+        continue;
+      }
+      xenos::xe_gpu_vertex_fetch_t vf = regs.GetVertexFetch(vb.fetch_constant);
+      if (vf.type != xenos::FetchConstantType::kVertex) {
+        continue;
+      }
+      uint32_t arena_base = vf.address << 2;
+      uint8_t* vertex_data = memory_->TranslatePhysical(arena_base);
+      if (!vertex_data) {
+        continue;
+      }
+      const uint8_t* index_data = nullptr;
+      bool indices_32bit = false;
+      if (index_buffer_info && index_buffer_info->guest_base) {
+        index_data = memory_->TranslatePhysical(index_buffer_info->guest_base);
+        indices_32bit = index_buffer_info->format == xenos::IndexFormat::kInt32;
+      }
+      // The position attribute is the one at offset 0 of the vertex.
+      ac6::WidescreenShrinkMarkerQuads(vertex_data, vb.stride_words * sizeof(uint32_t),
+                                       uint32_t(vb.attributes[0].fetch_instr.attributes.offset) *
+                                           sizeof(uint32_t),
+                                       index_data, indices_32bit, index_count, arena_base);
+    }
+  }
+
   if (!BeginSubmission(true)) {
     return false;
   }
@@ -4072,6 +4130,30 @@ void D3D12CommandProcessor::UpdateFixedFunctionState(
   viewport.Height = float(viewport_info.xy_extent[1]);
   viewport.MinDepth = viewport_info.z_min;
   viewport.MaxDepth = viewport_info.z_max;
+
+  // AC6 ultrawide: sub-viewport draws (radar window, PiP inset) are placed
+  // by their VIEWPORT rect, not their shader constants - shrinking their
+  // constants moves content around the viewport center instead of the screen
+  // center (the radar-misregistration bug). Shrink the viewport rect (and
+  // its scissor) around the render target center instead; the constant-level
+  // patch skips these draws.
+  bool ac6_vp_scaled = false;
+  float ac6_vp_shrink = ac6::WidescreenViewportShrinkX();
+  if (ac6_vp_shrink != 1.0f && !normalized_depth_control.z_enable &&
+      (viewport.TopLeftX >= 8.0f || viewport.TopLeftY >= 8.0f)) {
+    // Placed UI insets only (radar window, PiP): inset-sized, depth
+    // disabled, and offset from the origin. Internal render-to-texture
+    // passes (half-res effects, shadows, EDRAM ops) are depth-enabled
+    // and/or origin-anchored - scaling THEIR viewports white-outs the world
+    // (learned the hard way).
+    float ac6_full_width = 1280.0f * float(texture_cache_->draw_resolution_scale_x());
+    if (viewport.Width >= 1.0f && viewport.Width < ac6_full_width * 0.35f) {
+      float ac6_center_x = ac6_full_width * 0.5f;
+      viewport.TopLeftX = ac6_center_x + (viewport.TopLeftX - ac6_center_x) * ac6_vp_shrink;
+      viewport.Width *= ac6_vp_shrink;
+      ac6_vp_scaled = true;
+    }
+  }
   SetViewport(viewport);
 
   // Scissor.
@@ -4080,6 +4162,13 @@ void D3D12CommandProcessor::UpdateFixedFunctionState(
   scissor_rect.top = LONG(scissor.offset[1]);
   scissor_rect.right = LONG(scissor.offset[0] + scissor.extent[0]);
   scissor_rect.bottom = LONG(scissor.offset[1] + scissor.extent[1]);
+  if (ac6_vp_scaled) {
+    float ac6_center_x = 1280.0f * float(texture_cache_->draw_resolution_scale_x()) * 0.5f;
+    scissor_rect.left = LONG(ac6_center_x + (float(scissor_rect.left) - ac6_center_x) *
+                                                ac6_vp_shrink);
+    scissor_rect.right = LONG(ac6_center_x + (float(scissor_rect.right) - ac6_center_x) *
+                                                  ac6_vp_shrink + 0.5f);
+  }
   SetScissorRect(scissor_rect);
 
   if (render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets) {

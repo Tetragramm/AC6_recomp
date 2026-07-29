@@ -38,7 +38,10 @@
 #include <rex/hash.h>
 
 #include "../../../../../src/ac6_backend_fixes/ac6_backend_hooks.h"
+#include "../../../../../src/ac6_backend_fixes/ac6_widescreen.h"
 #include "../../../../../src/ac6_texture_overrides.h"
+
+REXCVAR_DECLARE(bool, ac6_widescreen);
 
 namespace rex::graphics::d3d12 {
 
@@ -1600,6 +1603,37 @@ ID3D12Resource* D3D12TextureCache::RequestSwapTexture(D3D12_SHADER_RESOURCE_VIEW
   // Only texture->key, not the result of BindingInfoFromFetchConstant, contains
   // whether the texture is scaled.
   key = texture->key();
+  // AC6 ultrawide: classify this swap for the presenter via the shared
+  // memory's GPU-written page tracking (authoritative: RangeWrittenByGpu sets
+  // it on resolves, a CPU overwrite clears it - unlike the scaled-resolve
+  // marking, which can serve upsampled CPU data while still reading as
+  // "scaled"). A presented frontbuffer with no GPU-written pages was composed
+  // by the CPU (FMV frames, loading images) - 16:9-authored pixels that must
+  // be letterboxed rather than stretched to the window.
+  {
+    bool gpu_composed = false;
+    // The page query and its log only matter (and only cost) with the
+    // feature on; the notify itself early-outs when disabled.
+    if (REXCVAR_GET(ac6_widescreen)) {
+      texture_util::TextureGuestLayout swap_layout = key.GetGuestLayout();
+      uint32_t swap_extent = swap_layout.base.level_data_extent_bytes;
+      gpu_composed =
+          swap_extent && shared_memory().IsAnyPageGpuWritten(key.base_page << 12, swap_extent);
+      // Log frontbuffer address + composition on state change (capped).
+      static uint32_t ac6_last_swap_state = UINT32_MAX;
+      static uint32_t ac6_swap_state_logs = 0;
+      uint32_t ac6_swap_state = (uint32_t(key.base_page) << 1) | (gpu_composed ? 1u : 0u);
+      if (ac6_swap_state != ac6_last_swap_state) {
+        ac6_last_swap_state = ac6_swap_state;
+        if (ac6_swap_state_logs < 32) {
+          ++ac6_swap_state_logs;
+          REXGPU_ERROR("[AC6-SWAP] frontbuffer base_page={:05X} gpu_written={} extent=0x{:X}",
+                       uint32_t(key.base_page), gpu_composed ? 1 : 0, swap_extent);
+        }
+      }
+    }
+    ac6::WidescreenNotifySwapSource(gpu_composed, true);
+  }
   if (width_unscaled_out) {
     *width_unscaled_out = key.GetWidth();
   }
