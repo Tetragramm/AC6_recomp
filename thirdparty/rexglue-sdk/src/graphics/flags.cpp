@@ -65,6 +65,35 @@ REXCVAR_DEFINE_STRING(ac6_neutralize_deswizzle_hashes, "", "GPU/Shader",
                     "Xenos tfetch slot 4 (needed when only some fetches de-swizzle, e.g. "
                     "the AC6 cloud compositor: scene fetch de-swizzles, mask/cloud "
                     "fetches use plain UVs and must be left alone). Runtime, no rebuild.");
+REXCVAR_DEFINE_STRING(ac6_snap_guest_texel_hashes, "", "GPU/Shader",
+                    "AC6: same \"<hash>[:<slot>[+<slot>...]]\" token list as "
+                    "ac6_neutralize_deswizzle_hashes, naming guest pixel-shader ucode "
+                    "hashes whose texture taps encode fractional guest-texel bilinear "
+                    "positions (e.g. the cutscene depth-of-field gather pair). Sampling "
+                    "a resolution-scaled texture with such a kernel reinterprets every "
+                    "blend ratio against the finer host grid and alternates the kernel "
+                    "phase per output pixel, aliasing into striping at >1x. For matching "
+                    "fetches the normalized coordinate is snapped to the guest texel "
+                    "center (where host bilinear of a scaled texture returns exactly the "
+                    "guest texel's box average), restoring the guest sampling grid at any "
+                    "draw resolution scale. Applied only at >1x and only to "
+                    "resolution-scaled textures. Runtime, no rebuild.");
+REXCVAR_DEFINE_STRING(ac6_densify_x_fetch_hashes, "", "GPU/Shader",
+                    "AC6: \"<hash>[:<slot>[+<slot>...]]\" list for HORIZONTAL-axis "
+                    "separable filter passes (e.g. the cutscene DoF H gather "
+                    "6328f9c40913c82c). Each allowlisted fetch becomes the average of "
+                    "2*draw_resolution_scale_x samples spread along X across one "
+                    "guest-texel half-gap on each side of the original tap - the union "
+                    "of all taps' cells covers the kernel span continuously, so ghost "
+                    "copies of arbitrarily thin features merge at any resolution scale. "
+                    "Convolving the authored kernel with the 2-texel cell box widens the "
+                    "blur by ~2% (visually shape-faithful). Per-axis scale aware; no-op "
+                    "when draw_resolution_scale_x is 1. Read at shader translation.");
+REXCVAR_DEFINE_STRING(ac6_densify_y_fetch_hashes, "", "GPU/Shader",
+                    "AC6: as ac6_densify_x_fetch_hashes, for VERTICAL-axis separable "
+                    "filter passes (e.g. the cutscene DoF V gather 5bd20f9d0d911687): "
+                    "2*draw_resolution_scale_y samples along Y per fetch. No-op when "
+                    "draw_resolution_scale_y is 1.");
 REXCVAR_DEFINE_BOOL(ac6_flare_drop_quad2, true, "GPU/Shader",
                     "AC6: cull the sun lens-flare's spurious second billboard "
                     "(vertices 4-7) to remove the faint rectangle in the sky");

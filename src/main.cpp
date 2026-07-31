@@ -19,6 +19,9 @@ REXCVAR_DECLARE(int32_t, draw_resolution_scale_y);
 REXCVAR_DECLARE(bool, param_gen_integer_guest_position);
 REXCVAR_DECLARE(bool, param_gen_host_subpixel_restore);
 REXCVAR_DECLARE(std::string, ac6_neutralize_deswizzle_hashes);
+REXCVAR_DECLARE(std::string, ac6_snap_guest_texel_hashes);
+REXCVAR_DECLARE(std::string, ac6_densify_x_fetch_hashes);
+REXCVAR_DECLARE(std::string, ac6_densify_y_fetch_hashes);
 REXCVAR_DECLARE(std::string, log_file);
 REXCVAR_DECLARE(std::string, log_level);
 REXCVAR_DECLARE(bool, ac6_d3d_trace);
@@ -70,6 +73,13 @@ REXCVAR_DEFINE_BOOL(ac6_fix_deswizzle, true, "AC6",
                     "sub-tile de-swizzle, which is always a wrong texel permutation once the "
                     "emulator detiles to linear. On by default; effective at all draw scales "
                     "(the swizzle is present at 1x too).");
+REXCVAR_DEFINE_BOOL(ac6_fix_dof, true, "AC6",
+                    "Fix the in-engine cutscene depth-of-field striping/ghosting at draw "
+                    "resolution scale > 1: the 6-pass DoF chain is authored for the 640x360 "
+                    "grid, so its guest-texel kernels alias against the extra detail of "
+                    "scaled sources (combed CoC weights, ghost copies at the sparse gather "
+                    "taps). Snaps the CoC pre-blurs to the guest grid and densifies the "
+                    "gather taps along each pass's axis. On by default; inert at 1x.");
 
 #include "generated/ac6recomp_config.h"
 #include "generated/ac6recomp_init.h"
@@ -186,6 +196,15 @@ void ApplyAc6FixDefaults() {
     if (REXCVAR_GET(ac6_fix_deswizzle)) {
         AC6_SET_IF_UNSET(ac6_neutralize_deswizzle_hashes,
                          "7d22894002d16018, 17e5e4ac3e713245:4");
+    }
+    // Cutscene DoF chain (CoC pre-blur pair snapped to the guest grid; the
+    // two 13-tap gathers densified along their pass axes). The translator
+    // only emits these at draw scale > 1, so no scale gate is needed here.
+    if (REXCVAR_GET(ac6_fix_dof)) {
+        AC6_SET_IF_UNSET(ac6_snap_guest_texel_hashes,
+                         "85d733927e3bba9c, d050dfa6f58567f6");
+        AC6_SET_IF_UNSET(ac6_densify_x_fetch_hashes, "6328f9c40913c82c");
+        AC6_SET_IF_UNSET(ac6_densify_y_fetch_hashes, "5bd20f9d0d911687");
     }
 }
 #undef AC6_SET_IF_UNSET

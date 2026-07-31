@@ -862,6 +862,63 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
         UcodeHashSlotInList(current_shader().ucode_data_hash(), tfetch_index,
                             neutralize_hashes);
   }
+  // Guest-texel snap for scale-broken filter kernels: some game passes (AC6's
+  // cutscene depth-of-field gather pair) build their kernel out of fractional
+  // guest-texel tap offsets whose bilinear blend ratios are tuned for the
+  // guest-resolution texel grid. Against a resolution-scaled texture the same
+  // UVs land on the finer host grid: every ratio is reinterpreted and the
+  // kernel phase alternates per output pixel, aliasing into striping. For an
+  // allowlisted shader (same syntax as the de-swizzle neutralize) snap the
+  // final coordinate to the guest texel center, where host bilinear of a
+  // scaled texture returns exactly the guest texel's box average - the guest
+  // sampling grid at any scale. Unlike the passes above these shaders sample
+  // via interpolators, so no param_gen requirement.
+  bool apply_guest_texel_snap = false;
+  if (instr.opcode == FetchOpcode::kTextureFetch &&
+      !instr.attributes.unnormalized_coordinates &&
+      instr.dimension == xenos::FetchOpDimension::k2D && is_pixel_shader() &&
+      (draw_resolution_scale_x_ > 1 || draw_resolution_scale_y_ > 1)) {
+    const std::string& snap_hashes = REXCVAR_GET(ac6_snap_guest_texel_hashes);
+    apply_guest_texel_snap =
+        !snap_hashes.empty() &&
+        UcodeHashSlotInList(current_shader().ucode_data_hash(), tfetch_index,
+                            snap_hashes);
+  }
+  // Tap-footprint box filter for sparse-kernel shaders (AC6 DoF gathers):
+  // taps several guest texels apart alias against the extra detail of a
+  // resolution-scaled source. Each allowlisted fetch becomes the average of a
+  // 4-sample cluster at (+/-0.25, +/-0.25) guest texels around the original
+  // position - a guest-Nyquist low-pass at the exact tap location, preserving
+  // the kernel's fractional placement (no output quantization, unlike the
+  // texel-center snap above).
+  // Axis densification for separable sparse-kernel passes (AC6 DoF gathers):
+  // each allowlisted fetch becomes the average of 2*scale_axis samples spread
+  // along the pass axis across one guest-texel half-gap on each side of the
+  // tap. The union of adjacent taps' cells covers the kernel span
+  // continuously, so ghost copies of features thinner than the tap spacing
+  // merge at any resolution scale; the effective kernel is the authored one
+  // convolved with a 2-guest-texel box (~2% wider - shape-faithful). Per-axis
+  // resolution scale aware (Xenia allows asymmetric X/Y scales); no-op when
+  // the relevant axis scale is 1.
+  uint32_t densify_axis_samples[2] = {0, 0};
+  if (instr.opcode == FetchOpcode::kTextureFetch &&
+      !instr.attributes.unnormalized_coordinates &&
+      instr.dimension == xenos::FetchOpDimension::k2D && is_pixel_shader()) {
+    const std::string& densify_x_hashes = REXCVAR_GET(ac6_densify_x_fetch_hashes);
+    if (draw_resolution_scale_x_ > 1 && !densify_x_hashes.empty() &&
+        UcodeHashSlotInList(current_shader().ucode_data_hash(), tfetch_index,
+                            densify_x_hashes)) {
+      densify_axis_samples[0] = 2 * uint32_t(draw_resolution_scale_x_);
+    }
+    const std::string& densify_y_hashes = REXCVAR_GET(ac6_densify_y_fetch_hashes);
+    if (draw_resolution_scale_y_ > 1 && !densify_y_hashes.empty() &&
+        UcodeHashSlotInList(current_shader().ucode_data_hash(), tfetch_index,
+                            densify_y_hashes)) {
+      densify_axis_samples[1] = 2 * uint32_t(draw_resolution_scale_y_);
+    }
+  }
+  const bool apply_cluster_filter =
+      densify_axis_samples[0] != 0 || densify_axis_samples[1] != 0;
   uint32_t size_needed_components = 0b0000;
   if (instr.opcode == FetchOpcode::kGetTextureWeights) {
     // Size needed for denormalization for coordinate lerp factor.
@@ -926,10 +983,12 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
     // the texture is 3D unconditionally.
     size_needed_components |= 0b1000;
   }
-  if (apply_host_subpixel_correction || apply_deswizzle_identity) {
+  if (apply_host_subpixel_correction || apply_deswizzle_identity ||
+      apply_guest_texel_snap || apply_cluster_filter) {
     // Need the guest texture width/height (XY) to convert the host sub-pixel
     // offset (Tier B) or the SV_Position into normalized texture space
-    // (de-swizzle identity).
+    // (de-swizzle identity), or to locate the guest texel grid (texel snap /
+    // cluster filters).
     size_needed_components |= 0b0011;
   }
   uint32_t size_and_is_3d_temp = size_needed_components ? PushSystemTemp() : UINT32_MAX;
@@ -1301,6 +1360,32 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
       a_.OpDiv(dxbc::Dest::R(coord_and_sampler_temp, 0b0011),
                dxbc::Src::V1D(in_reg_ps_position_), dxbc::Src::R(deswizzle_temp));
       // Release deswizzle_temp.
+      PopSystemTemp();
+    }
+    if (apply_guest_texel_snap) {
+      // coord_and_sampler_temp.xy is the final normalized coordinate. Snap it
+      // to the guest texel center so the allowlisted kernel samples the guest
+      // grid regardless of the host storage resolution (see the gate above).
+      uint32_t snap_temp = PushSystemTemp();
+      // snap_temp.xy = (floor(uv * guest_size) + 0.5) / guest_size.
+      a_.OpMul(dxbc::Dest::R(snap_temp, 0b0011),
+               dxbc::Src::R(coord_and_sampler_temp), dxbc::Src::R(size_and_is_3d_temp));
+      a_.OpRoundNI(dxbc::Dest::R(snap_temp, 0b0011), dxbc::Src::R(snap_temp));
+      a_.OpAdd(dxbc::Dest::R(snap_temp, 0b0011), dxbc::Src::R(snap_temp),
+               dxbc::Src::LF(0.5f, 0.5f, 0.0f, 0.0f));
+      a_.OpDiv(dxbc::Dest::R(snap_temp, 0b0011), dxbc::Src::R(snap_temp),
+               dxbc::Src::R(size_and_is_3d_temp));
+      // Only textures stored at host resolution present a finer grid than the
+      // kernel was tuned for; guest-resolution sources stay stock.
+      a_.OpAnd(dxbc::Dest::R(snap_temp, 0b0100),
+               LoadSystemConstant(SystemConstants::Index::kTexturesResolutionScaled,
+                                  offsetof(SystemConstants, textures_resolution_scaled),
+                                  dxbc::Src::kXXXX),
+               dxbc::Src::LU(uint32_t(1) << tfetch_index));
+      a_.OpIf(true, dxbc::Src::R(snap_temp, dxbc::Src::kZZZZ));
+      a_.OpMov(dxbc::Dest::R(coord_and_sampler_temp, 0b0011), dxbc::Src::R(snap_temp));
+      a_.OpEndIf();
+      // Release snap_temp.
       PopSystemTemp();
     }
     switch (instr.dimension) {
@@ -1957,6 +2042,65 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
               texture_binding_signed.bindful_srv_index,
               uint32_t(SRVMainRegister::kBindfulTexturesStart) + texture_binding_index_signed);
         }
+        // Tap densification (see the gate above): re-emit the whole sample
+        // block once per cluster offset around the original coordinate and
+        // average the RAW results (before format decode - consistent with how
+        // Xenos bilinear itself filters in storage space). Restricted to
+        // plain 2D fetches. Cluster geometry: 2*scale_axis samples per listed
+        // axis, spanning one guest texel each side of the tap (a grid if both
+        // axes are listed).
+        const bool cluster_this_srv = apply_cluster_filter &&
+                                      srv_dimension == xenos::FetchOpDimension::k2D &&
+                                      !layer_lerp_needed;
+        float cluster_dx[64];
+        float cluster_dy[64];
+        uint32_t cluster_count = 1;
+        cluster_dx[0] = 0.0f;
+        cluster_dy[0] = 0.0f;
+        if (cluster_this_srv) {
+          float xs[8], ys[8];
+          uint32_t nx = 1, ny = 1;
+          xs[0] = 0.0f;
+          ys[0] = 0.0f;
+          if (densify_axis_samples[0]) {
+            nx = std::min(densify_axis_samples[0], 8u);
+            for (uint32_t j = 0; j < nx; ++j) {
+              xs[j] = (float(j) + 0.5f) * 2.0f / float(nx) - 1.0f;
+            }
+          }
+          if (densify_axis_samples[1]) {
+            ny = std::min(densify_axis_samples[1], 8u);
+            for (uint32_t j = 0; j < ny; ++j) {
+              ys[j] = (float(j) + 0.5f) * 2.0f / float(ny) - 1.0f;
+            }
+          }
+          cluster_count = 0;
+          for (uint32_t jy = 0; jy < ny; ++jy) {
+            for (uint32_t jx = 0; jx < nx; ++jx) {
+              cluster_dx[cluster_count] = xs[jx];
+              cluster_dy[cluster_count] = ys[jy];
+              ++cluster_count;
+            }
+          }
+        }
+        uint32_t cluster_accum_temp = UINT32_MAX;
+        uint32_t cluster_coord_temp = UINT32_MAX;
+        const uint32_t cluster_passes = cluster_this_srv ? cluster_count : 1;
+        if (cluster_this_srv) {
+          cluster_accum_temp = PushSystemTemp();
+          cluster_coord_temp = PushSystemTemp();
+          // The original tap coordinate (and the sampler index in W).
+          a_.OpMov(dxbc::Dest::R(cluster_coord_temp), dxbc::Src::R(coord_and_sampler_temp));
+        }
+        for (uint32_t cluster_pass = 0; cluster_pass < cluster_passes; ++cluster_pass) {
+        if (cluster_this_srv) {
+          // coord.xy = original + cluster offset (guest texels) / guest_size.
+          a_.OpDiv(dxbc::Dest::R(coord_and_sampler_temp, 0b0011),
+                   dxbc::Src::LF(cluster_dx[cluster_pass], cluster_dy[cluster_pass], 0.0f, 0.0f),
+                   dxbc::Src::R(size_and_is_3d_temp));
+          a_.OpAdd(dxbc::Dest::R(coord_and_sampler_temp, 0b0011),
+                   dxbc::Src::R(coord_and_sampler_temp), dxbc::Src::R(cluster_coord_temp));
+        }
         for (uint32_t layer = 0; layer < (layer_lerp_needed ? 2u : 1u); ++layer) {
           uint32_t layer_value_temp = system_temp_result_;
           if (layer) {
@@ -2049,6 +2193,26 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
             // Release the allocated layer_value_temp.
             PopSystemTemp();
           }
+        }
+        if (cluster_this_srv) {
+          if (cluster_pass == 0) {
+            a_.OpMov(dxbc::Dest::R(cluster_accum_temp, used_result_nonzero_components),
+                     dxbc::Src::R(system_temp_result_));
+          } else {
+            a_.OpAdd(dxbc::Dest::R(cluster_accum_temp, used_result_nonzero_components),
+                     dxbc::Src::R(cluster_accum_temp), dxbc::Src::R(system_temp_result_));
+          }
+        }
+        }  // cluster_pass
+        if (cluster_this_srv) {
+          // The tap's value = the average of the cluster samples.
+          a_.OpMul(dxbc::Dest::R(system_temp_result_, used_result_nonzero_components),
+                   dxbc::Src::R(cluster_accum_temp),
+                   dxbc::Src::LF(1.0f / float(cluster_passes)));
+          // Restore the unoffset coordinate for any downstream use.
+          a_.OpMov(dxbc::Dest::R(coord_and_sampler_temp), dxbc::Src::R(cluster_coord_temp));
+          // Release cluster_coord_temp and cluster_accum_temp.
+          PopSystemTemp(2);
         }
       }
       if (instr.dimension == xenos::FetchOpDimension::k3DOrStacked) {

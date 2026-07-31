@@ -1,4 +1,4 @@
-/**
+﻿/**
  * ReXGlue native audio runtime
  * Part of the AC6 Recompilation project
  */
@@ -17,6 +17,8 @@
 #include <native/stream.h>
 
 REXCVAR_DECLARE(bool, audio_deep_trace);
+REXCVAR_DECLARE(bool, audio_xma_loop_guard);
+REXCVAR_DECLARE(bool, audio_xma_preserve_timeline);
 
 namespace rex::audio {
 
@@ -341,7 +343,31 @@ void XmaContext::UpdateLoopStatus(XMA_CONTEXT_DATA* data) {
   const uint32_t loop_start = std::max(kBitsPerPacketHeader, data->loop_start);
   const uint32_t loop_end = std::max(kBitsPerPacketHeader, data->loop_end);
 
-  if (data->input_buffer_read_offset != loop_end) {
+  if (REXCVAR_GET(audio_xma_loop_guard)) {
+    // Xenia master's TrySetupNextLoop guard (PR #1808, debugged on Ace
+    // Combat 6): streamed voices can carry degenerate loop metadata
+    // (loop_count=0xff, loop_start == loop_end == 0). The clamps above turn
+    // that into start == end == kBitsPerPacketHeader, and SwapInputBuffer
+    // resets the read offset to exactly kBitsPerPacketHeader, so without a
+    // real-window check every buffer swap re-fires the loop machinery -
+    // the frame output limit truncates that frame and the loop-start skip
+    // drops subframes. Require loop_start < loop_end (raw values) and use
+    // master's read_offset >= loop_end trigger.
+    if (data->loop_start >= data->loop_end ||
+        data->input_buffer_read_offset < loop_end) {
+      if (data->loop_start >= data->loop_end &&
+          data->input_buffer_read_offset == loop_end && IsDeepTraceEnabled()) {
+        REXAPU_DEBUG(
+            "XmaContext {}: loop guard suppressed degenerate loop fire "
+            "(loop_start={} loop_end={} loop_count={} read_offset={})",
+            id(), static_cast<uint32_t>(data->loop_start),
+            static_cast<uint32_t>(data->loop_end),
+            static_cast<uint32_t>(data->loop_count),
+            static_cast<uint32_t>(data->input_buffer_read_offset));
+      }
+      return;
+    }
+  } else if (data->input_buffer_read_offset != loop_end) {
     return;
   }
 
@@ -853,11 +879,32 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
       .sample_rate = static_cast<uint32_t>(GetSampleRate(data->sample_rate)),
       .is_two_channel = bool(data->is_stereo),
   };
-  if (decoder_backend_ &&
+  const bool frame_decoded =
+      decoder_backend_ &&
       decoder_backend_->DecodePacket(
-          decode_request, std::span<uint8_t>(raw_frame_.data(), raw_frame_.size()))) {
+          decode_request, std::span<uint8_t>(raw_frame_.data(), raw_frame_.size()));
+  if (!frame_decoded && REXCVAR_GET(audio_xma_preserve_timeline)) {
+    // A frame the decoder rejects still occupies exactly kSamplesPerFrame
+    // samples of the stream's timeline, and the read offset advances past it
+    // below either way. Dropping the output entirely (the legacy behavior)
+    // silently shortens the stream by one frame - a latent correctness bug
+    // for multi-stream sources that must stay sample-locked, e.g. 5.1
+    // premixes carried as parallel stereo streams (AC6's cutscene mixes).
+    // Instrumented AC6 runs decode every cutscene frame successfully, so no
+    // in-game trigger is known - this is robustness against decode errors,
+    // not a fix for an audible symptom. Deliver the frame as silence
+    // instead - raw_frame_ is zero-filled above, so falling through emits
+    // one frame of silence in this stream (~10 ms, masked by the other
+    // streams) and the timeline holds.
+    REXAPU_DEBUG(
+        "XmaContext {}: undecodable frame (packet={} offset={} frame_bits={}) - "
+        "emitting silence to preserve the stream timeline",
+        id(), last_packet_index_, last_input_read_offset_before_,
+        packet_info.current_frame_size_);
+  }
+  if (frame_decoded || REXCVAR_GET(audio_xma_preserve_timeline)) {
     current_frame_remaining_subframes_ = 4 << data->is_stereo;
-    last_decode_succeeded_ = true;
+    last_decode_succeeded_ = frame_decoded;
 
     if (is_loop_end_frame) {
       loop_frame_output_limit_ = (data->loop_subframe_end + 1) << data->is_stereo;
