@@ -19,6 +19,16 @@ REXCVAR_DEFINE_BOOL(audio_trace_render_driver_verbose, false, "Audio",
                     "Trace render-driver activity");
 REXCVAR_DEFINE_BOOL(audio_deep_trace, false, "Audio",
                     "Enable verbose runtime audio tracing");
+REXCVAR_DEFINE_BOOL(audio_xma_preserve_timeline, true, "Audio",
+                    "When the XMA decoder backend rejects a damaged frame, emit that "
+                    "frame's worth of silence instead of dropping it. The input read "
+                    "offset advances past the frame either way, so dropping the output "
+                    "silently shortens the stream's timeline by 512 samples per damaged "
+                    "frame - which would permanently desynchronize multi-stream sources "
+                    "(5.1 premixes carried as parallel stereo streams, e.g. AC6's "
+                    "cutscene mixes). Robustness fix - no in-game trigger is known in "
+                    "AC6 (instrumented runs decode every frame). On by default; off "
+                    "restores the legacy drop behavior.");
 
 namespace rex::audio {
 

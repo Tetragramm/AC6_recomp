@@ -17,6 +17,7 @@
 #include <native/stream.h>
 
 REXCVAR_DECLARE(bool, audio_deep_trace);
+REXCVAR_DECLARE(bool, audio_xma_preserve_timeline);
 
 namespace rex::audio {
 
@@ -853,11 +854,32 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
       .sample_rate = static_cast<uint32_t>(GetSampleRate(data->sample_rate)),
       .is_two_channel = bool(data->is_stereo),
   };
-  if (decoder_backend_ &&
+  const bool frame_decoded =
+      decoder_backend_ &&
       decoder_backend_->DecodePacket(
-          decode_request, std::span<uint8_t>(raw_frame_.data(), raw_frame_.size()))) {
+          decode_request, std::span<uint8_t>(raw_frame_.data(), raw_frame_.size()));
+  if (!frame_decoded && REXCVAR_GET(audio_xma_preserve_timeline)) {
+    // A frame the decoder rejects still occupies exactly kSamplesPerFrame
+    // samples of the stream's timeline, and the read offset advances past it
+    // below either way. Dropping the output entirely (the legacy behavior)
+    // silently shortens the stream by one frame - a latent correctness bug
+    // for multi-stream sources that must stay sample-locked, e.g. 5.1
+    // premixes carried as parallel stereo streams (AC6's cutscene mixes).
+    // Instrumented AC6 runs decode every cutscene frame successfully, so no
+    // in-game trigger is known - this is robustness against decode errors,
+    // not a fix for an audible symptom. Deliver the frame as silence
+    // instead - raw_frame_ is zero-filled above, so falling through emits
+    // one frame of silence in this stream (~10 ms, masked by the other
+    // streams) and the timeline holds.
+    REXAPU_DEBUG(
+        "XmaContext {}: undecodable frame (packet={} offset={} frame_bits={}) - "
+        "emitting silence to preserve the stream timeline",
+        id(), last_packet_index_, last_input_read_offset_before_,
+        packet_info.current_frame_size_);
+  }
+  if (frame_decoded || REXCVAR_GET(audio_xma_preserve_timeline)) {
     current_frame_remaining_subframes_ = 4 << data->is_stereo;
-    last_decode_succeeded_ = true;
+    last_decode_succeeded_ = frame_decoded;
 
     if (is_loop_end_frame) {
       loop_frame_output_limit_ = (data->loop_subframe_end + 1) << data->is_stereo;
