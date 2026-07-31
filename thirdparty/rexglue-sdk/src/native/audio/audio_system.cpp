@@ -19,6 +19,16 @@ REXCVAR_DEFINE_BOOL(audio_trace_render_driver_verbose, false, "Audio",
                     "Trace render-driver activity");
 REXCVAR_DEFINE_BOOL(audio_deep_trace, false, "Audio",
                     "Enable verbose runtime audio tracing");
+REXCVAR_DEFINE_BOOL(audio_xma_loop_guard, true, "Audio",
+                    "Require a real loop window (loop_start < loop_end, "
+                    "read_offset >= loop_end) before engaging XMA loop "
+                    "handling, as in current Xenia master (PR #1808, debugged "
+                    "on Ace Combat 6). Off: legacy behavior, where streamed "
+                    "voices carrying degenerate loop metadata (loop_count="
+                    "0xff, loop_start == loop_end == 0) re-fire the loop "
+                    "machinery on every input buffer swap, truncating/"
+                    "skipping subframes of the stream (confirmed firing on "
+                    "AC6 cutscene streams via the deep-trace counter).");
 REXCVAR_DEFINE_BOOL(audio_xma_preserve_timeline, true, "Audio",
                     "When the XMA decoder backend rejects a damaged frame, emit that "
                     "frame's worth of silence instead of dropping it. The input read "
