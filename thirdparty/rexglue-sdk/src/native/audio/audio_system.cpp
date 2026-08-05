@@ -84,6 +84,19 @@ REXCVAR_DEFINE_BOOL(audio_xma_header_straddle_fix, true, "Audio",
                     "combs on the stereo fold - the long-reported doubled/"
                     "robotic cutscene dialogue. Off restores the legacy "
                     "walk for A/B.");
+REXCVAR_DEFINE_BOOL(audio_xma_loop_end_guard, true, "Audio",
+                    "Apply the degenerate-loop guard (see "
+                    "audio_xma_loop_guard) to the loop-end frame test as "
+                    "well. That test is evaluated before the loop-status "
+                    "update, so the guard there never reaches it: with "
+                    "loop_count > 0 and loop_start >= loop_end (metadata "
+                    "AC6's streamed voices carry), the clamped loop_end "
+                    "equals a voice's starting read offset for the stream "
+                    "that begins at packet 0, arming the frame output limit "
+                    "and silently discarding 384 samples of that stream's "
+                    "first frame - permanently offsetting one context of a "
+                    "multi-stream voice from its siblings. Off restores the "
+                    "legacy behavior for A/B.");
 REXCVAR_DEFINE_BOOL(audio_xma_preserve_timeline, true, "Audio",
                     "When the XMA decoder backend rejects a damaged frame, emit that "
                     "frame's worth of silence instead of dropping it. The input read "

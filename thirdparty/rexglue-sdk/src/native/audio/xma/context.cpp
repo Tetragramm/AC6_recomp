@@ -20,6 +20,7 @@ REXCVAR_DECLARE(bool, audio_deep_trace);
 REXCVAR_DECLARE(bool, audio_xma_loop_guard);
 REXCVAR_DECLARE(bool, audio_xma_preserve_timeline);
 REXCVAR_DECLARE(bool, audio_xma_header_straddle_fix);
+REXCVAR_DECLARE(bool, audio_xma_loop_end_guard);
 
 namespace rex::audio {
 
@@ -726,6 +727,22 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
   if (data->loop_count > 0) {
     const uint32_t loop_end = std::max(kBitsPerPacketHeader, data->loop_end);
     is_loop_end_frame = (data->input_buffer_read_offset == loop_end);
+    if (is_loop_end_frame && REXCVAR_GET(audio_xma_loop_end_guard) &&
+        data->loop_start >= data->loop_end) {
+      // This test is evaluated before UpdateLoopStatus, so the degenerate-loop
+      // guard there (audio_xma_loop_guard) never reaches it. With
+      // loop_count > 0 and loop_start >= loop_end the clamp above turns
+      // loop_end into kBitsPerPacketHeader - which is exactly a voice's
+      // starting read offset for the stream that begins at packet 0, and
+      // exactly what SwapInputBuffer resets the read offset to - so the
+      // frame output limit armed on the first frame of that stream (and on
+      // any post-swap pass that lands at the raw offset), and Consume()
+      // silently discarded the tail of the frame: 384 samples lost on ONE
+      // context of a multi-stream voice, which permanently offsets it from
+      // its siblings. Apply the same real-window requirement here that
+      // UpdateLoopStatus applies.
+      is_loop_end_frame = false;
+    }
   }
 
   UpdateLoopStatus(data);
