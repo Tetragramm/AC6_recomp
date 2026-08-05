@@ -16,12 +16,16 @@ NativeGraphicsStatusDialog::NativeGraphicsStatusDialog(rex::ui::ImGuiDrawer* img
 
 NativeGraphicsStatusDialog::~NativeGraphicsStatusDialog() = default;
 
+bool NativeGraphicsStatusDialog::IsVisible() const {
+  return visible_ && !REXCVAR_GET(ac6_performance_mode);
+}
+
 void NativeGraphicsStatusDialog::OnDraw(ImGuiIO& io) {
   (void)io;
 
   ApplyAc6PerformanceModeOverridesPublic();
 
-  if (REXCVAR_GET(ac6_performance_mode) || !visible_) {
+  if (!IsVisible()) {
     return;
   }
 

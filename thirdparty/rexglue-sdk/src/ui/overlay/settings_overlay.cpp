@@ -344,6 +344,11 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
       bool is_capturing = (capturing_bind_name_ == entry.name);
 
       if (is_capturing) {
+        // Waiting for the new binding: the next key press belongs to this
+        // window, not to the application. No widget is active while waiting
+        // (the Rebind button was already released), so WantCaptureKeyboard
+        // would read false - declare keyboard ownership explicitly.
+        ImGui::SetNextFrameWantCaptureKeyboard(true);
         ImGui::Button("Press any key...##v", ImVec2(140.0f, 0));
 
         if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {

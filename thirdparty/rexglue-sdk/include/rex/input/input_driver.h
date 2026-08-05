@@ -40,6 +40,13 @@ class InputDriver {
 
   virtual void OnWindowAvailable(rex::ui::Window* /*window*/) {}
 
+  // Whether this driver synthesizes its state from the host keyboard/mouse
+  // and must therefore pause while the host UI (overlay dialogs) captures
+  // them. Real controller drivers keep the default false: a physical pad has
+  // nothing to do with UI capture - the overlays are not pad-navigable - and
+  // must keep working while a dialog has the cursor or keyboard focus.
+  virtual bool SuppressedByUICapture() const { return false; }
+
   void set_is_active_callback(std::function<bool()> is_active_callback) {
     is_active_callback_ = is_active_callback;
   }

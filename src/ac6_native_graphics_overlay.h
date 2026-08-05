@@ -17,7 +17,12 @@ class NativeGraphicsStatusDialog final : public rex::ui::ImGuiDialog {
 
   void Show() { visible_ = true; }
   void ToggleVisible() { visible_ = !visible_; }
-  bool IsVisible() const { return visible_; }
+  // Effective visibility, not just the toggle: performance mode suppresses
+  // the window entirely (see OnDraw), and a window that never draws must not
+  // count as visible for the drawer's input-ownership aggregate - the app
+  // calls Show() at startup, so the raw flag alone would report a window on
+  // every plain user run.
+  bool IsVisible() const override;
 
  protected:
   void OnDraw(ImGuiIO& io) override;

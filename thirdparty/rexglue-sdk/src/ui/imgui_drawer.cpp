@@ -34,6 +34,17 @@ const char kProggyTinyCompressedDataBase85[10950 + 1] =
 
 static_assert(sizeof(ImmediateVertex) == sizeof(ImDrawVert), "Vertex types must match");
 
+std::atomic<bool> ImGuiDrawer::dialogs_capture_mouse_{false};
+std::atomic<bool> ImGuiDrawer::dialogs_capture_keyboard_{false};
+std::atomic<bool> ImGuiDrawer::dialogs_want_text_input_{false};
+
+void ImGuiDrawer::PublishDialogInputOwnership(bool capture_mouse, bool capture_keyboard,
+                                              bool want_text_input) {
+  dialogs_capture_mouse_.store(capture_mouse, std::memory_order_relaxed);
+  dialogs_capture_keyboard_.store(capture_keyboard, std::memory_order_relaxed);
+  dialogs_want_text_input_.store(want_text_input, std::memory_order_relaxed);
+}
+
 ImGuiDrawer::ImGuiDrawer(rex::ui::Window* window, size_t z_order, FontSetupCallback font_setup)
     : window_(window), z_order_(z_order), font_setup_(std::move(font_setup)) {
   Initialize();
@@ -359,10 +370,12 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
   if (!immediate_drawer_) {
     // A presenter has been attached, but an immediate drawer hasn't been
     // attached yet.
+    PublishDialogInputOwnership(false, false, false);
     return;
   }
 
   if (dialogs_.empty()) {
+    PublishDialogInputOwnership(false, false, false);
     return;
   }
 
@@ -392,6 +405,29 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
     dialogs_[dialog_loop_next_index_++]->Draw();
   }
   dialog_loop_next_index_ = SIZE_MAX;
+
+  // Publish this frame's dialog input ownership: the ImGui capture flags
+  // (computed in NewFrame) conjoined with post-loop visibility, so a dialog
+  // hidden this frame (e.g. via its toggle hotkey) stops owning input
+  // immediately, whatever focus state ImGui still holds for its window.
+  bool any_dialog_visible = false;
+  for (ImGuiDialog* dialog : dialogs_) {
+    if (dialog->IsVisible()) {
+      any_dialog_visible = true;
+      break;
+    }
+  }
+  // Keyboard follows FOCUS, and in this ImGui version io.WantCaptureKeyboard
+  // alone is not focus - it is only true while a widget is actively engaged
+  // (InputText active, slider held, modal open). A focused-but-idle dialog
+  // window must still own the keyboard, like any focused desktop window, so
+  // OR in "some ImGui window holds focus" (a freshly opened dialog takes
+  // focus; clicking the game void releases it).
+  const bool keyboard_owned =
+      io.WantCaptureKeyboard || ImGui::IsWindowFocused(ImGuiFocusedFlags_AnyWindow);
+  PublishDialogInputOwnership(any_dialog_visible && io.WantCaptureMouse,
+                              any_dialog_visible && keyboard_owned,
+                              any_dialog_visible && io.WantTextInput);
 
   ImGui::Render();
   ImDrawData* draw_data = ImGui::GetDrawData();
@@ -647,6 +683,8 @@ void ImGuiDrawer::DetachIfLastDialogRemoved() {
   // which will be persistent until new events actualize individual input
   // properties.
   ClearInput();
+  // No dialogs left: nothing can own input until the drawer reattaches.
+  PublishDialogInputOwnership(false, false, false);
 }
 
 }  // namespace ui

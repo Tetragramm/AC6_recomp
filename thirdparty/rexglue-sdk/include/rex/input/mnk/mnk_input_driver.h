@@ -38,6 +38,10 @@ class MnkInputDriver final : public InputDriver,
 
   void OnWindowAvailable(rex::ui::Window* window) override;
 
+  // Synthesizes a pad from the host keyboard/mouse, so it pauses while a UI
+  // dialog captures them (unlike real controller drivers).
+  bool SuppressedByUICapture() const override { return true; }
+
   // WindowInputListener
   void OnKeyDown(rex::ui::KeyEvent& e) override;
   void OnKeyUp(rex::ui::KeyEvent& e) override;

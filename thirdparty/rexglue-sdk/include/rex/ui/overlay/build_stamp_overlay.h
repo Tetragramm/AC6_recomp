@@ -19,6 +19,13 @@ class BuildStampOverlay : public ImGuiDialog {
  public:
   explicit BuildStampOverlay(ImGuiDrawer* imgui_drawer);
 
+  // The watermark is drawn with NoInputs|NoNav: ImGui can neither hover nor
+  // focus it, so it can never own the mouse or keyboard. It is also always
+  // attached - reporting it visible would keep the drawer's dialog input
+  // ownership permanently live and void the closed-overlay guarantee the
+  // real overlay windows rely on. It is a stamp, not a window.
+  bool IsVisible() const override { return false; }
+
  protected:
   void OnDraw(ImGuiIO& io) override;
 };

@@ -30,7 +30,7 @@ class DebugOverlayDialog : public ImGuiDialog {
   ~DebugOverlayDialog();
 
   void ToggleVisible() { visible_ = !visible_; }
-  bool IsVisible() const { return visible_; }
+  bool IsVisible() const override { return visible_; }
   void SetStatsProvider(FrameStatsProvider provider) { stats_provider_ = std::move(provider); }
 
  protected:

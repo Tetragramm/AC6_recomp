@@ -234,11 +234,16 @@ bool ReXApp::OnInitialize() {
         runtime_->set_display_window(window_.get());
         runtime_->set_imgui_drawer(imgui_drawer_.get());
 
-        // Tell input drivers to suppress input when ImGui wants the mouse
-        // (e.g. overlay is open). This controls MnK mouse capture.
+        // Pause the MnK virtual pad while a visible dialog owns the mouse.
+        // Uses the drawer's published per-frame flag: visibility-conjoined
+        // (a closed dialog can never latch it) and safe to read from the
+        // input threads, unlike ImGui IO. Real controller drivers never
+        // receive this callback (see InputSystem::SetActiveCallback) - a
+        // physical pad keeps working with a dialog open.
         auto* input_sys = static_cast<rex::input::InputSystem*>(runtime_->input_system());
         if (input_sys) {
-          input_sys->SetActiveCallback([]() { return !ImGui::GetIO().WantCaptureMouse; });
+          input_sys->SetActiveCallback(
+              []() { return !rex::ui::ImGuiDrawer::DialogsCaptureMouse(); });
         }
       }
     }

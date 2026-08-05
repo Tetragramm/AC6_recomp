@@ -28,7 +28,7 @@ class ConsoleDialog : public ImGuiDialog {
   ~ConsoleDialog();
 
   void ToggleVisible();
-  bool IsVisible() const { return visible_; }
+  bool IsVisible() const override { return visible_; }
 
  protected:
   void OnDraw(ImGuiIO& io) override;

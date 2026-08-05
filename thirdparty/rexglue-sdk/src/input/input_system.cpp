@@ -52,8 +52,17 @@ void InputSystem::AttachWindow(rex::ui::Window* window) {
 }
 
 void InputSystem::SetActiveCallback(std::function<bool()> callback) {
+  // The callback reports "the host UI is not capturing input". Only drivers
+  // that synthesize their state from the host keyboard/mouse (MnK) receive
+  // it; real controller drivers keep a null callback (always active), so a
+  // physical pad never goes dead while an overlay dialog has the cursor or
+  // focus. (The SDL driver zeroes its gamepad state while inactive - wiring
+  // the callback onto it makes a real pad drop out whenever the mouse
+  // hovers a dialog.)
   for (auto& driver : drivers_) {
-    driver->set_is_active_callback(callback);
+    if (driver->SuppressedByUICapture()) {
+      driver->set_is_active_callback(callback);
+    }
   }
 }
 

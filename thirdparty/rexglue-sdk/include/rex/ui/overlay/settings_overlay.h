@@ -23,7 +23,7 @@ class SettingsDialog : public ImGuiDialog {
   ~SettingsDialog();
 
   void ToggleVisible() { visible_ = !visible_; }
-  bool IsVisible() const { return visible_; }
+  bool IsVisible() const override { return visible_; }
 
  protected:
   void OnDraw(ImGuiIO& io) override;

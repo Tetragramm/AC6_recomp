@@ -39,6 +39,13 @@ class ImGuiDialog {
 
   void Draw();
 
+  // Whether the dialog currently draws a window. Toggleable overlays override
+  // this with their own visibility state; a dialog without one (e.g. a message
+  // box) is visible for as long as it is attached. ImGuiDrawer aggregates this
+  // every frame to publish whether any dialog window is on screen and may own
+  // the mouse or keyboard (see ImGuiDrawer::DialogsCaptureMouse()).
+  virtual bool IsVisible() const { return true; }
+
  protected:
   ImGuiDialog(ImGuiDrawer* imgui_drawer);
 

@@ -12,6 +12,7 @@
 #ifndef REX_UI_IMGUI_DRAWER_H_
 #define REX_UI_IMGUI_DRAWER_H_
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -58,6 +59,25 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
 
   void Draw(UIDrawContext& ui_draw_context) override;
 
+  // Dialog input ownership, published once per frame by Draw() and cleared
+  // when the drawer detaches. Desktop window-manager semantics: the mouse
+  // belongs to the dialog window under the cursor (or that a drag started
+  // on), the keyboard to the dialog window holding FOCUS (freshly opened or
+  // clicked into; released by clicking the game area) or actively engaging a
+  // widget. Each flag is conjoined with "some dialog window is visible", so
+  // a hidden dialog can never own input regardless of any focus state ImGui
+  // retains for it. Safe to read from any thread, including low-level hook
+  // threads - a plain atomic load, no ImGui access.
+  static bool DialogsCaptureMouse() {
+    return dialogs_capture_mouse_.load(std::memory_order_relaxed);
+  }
+  static bool DialogsCaptureKeyboard() {
+    return dialogs_capture_keyboard_.load(std::memory_order_relaxed);
+  }
+  static bool DialogsWantTextInput() {
+    return dialogs_want_text_input_.load(std::memory_order_relaxed);
+  }
+
  protected:
   void OnKeyDown(KeyEvent& e) override;
   void OnKeyUp(KeyEvent& e) override;
@@ -83,6 +103,8 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
 
   bool IsDrawingDialogs() const { return dialog_loop_next_index_ != SIZE_MAX; }
   void DetachIfLastDialogRemoved();
+
+  void PublishDialogInputOwnership(bool capture_mouse, bool capture_keyboard, bool want_text_input);
 
   std::optional<ImGuiKey> VirtualKeyToImGuiKey(VirtualKey vkey);
 
@@ -119,6 +141,11 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
 
   double frame_time_tick_frequency_;
   uint64_t last_frame_time_ticks_;
+
+  // See DialogsCaptureMouse()/DialogsCaptureKeyboard()/DialogsWantTextInput().
+  static std::atomic<bool> dialogs_capture_mouse_;
+  static std::atomic<bool> dialogs_capture_keyboard_;
+  static std::atomic<bool> dialogs_want_text_input_;
 };
 
 }  // namespace ui

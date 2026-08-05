@@ -47,13 +47,13 @@
 
 #include <fmt/format.h>
 #include <fmt/ranges.h>
-#include <imgui.h>
 #include <toml++/toml.hpp>
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/memory/utils.h>
 #include <rex/ppc.h>
+#include <rex/ui/imgui_drawer.h>
 #include <rex/ui/keybinds.h>
 #include <rex/ui/virtual_key.h>
 
@@ -559,16 +559,42 @@ void EnforceMnkOff() {
   }
 }
 
-// ---- Host keyboard state ----------------------------------------------------
+// Mouse-steering state (used by MouseSteerPoll below). Declared here because
+// the input gate consults `capturing`: while steering pins the cursor it OWNS
+// the pointer, and overlay mouse ownership is suspended.
+struct MouseSteer {
+  double x = 0.0, y = 0.0;          // position model: virtual stick, -1..1
+  double rate_x = 0.0, rate_y = 0.0;  // velocity model: filtered px/s
+  double cam_x = 0.0, cam_y = 0.0;  // camera-control mode: held RS deflection
+  bool capturing = false;
+  int64_t last_ms = 0;
+};
+MouseSteer g_mouse;
+
+// ---- Host input gates -------------------------------------------------------
+// Input ownership follows desktop window-manager rules: the MOUSE belongs to
+// whatever is under the CURSOR, the KEYBOARD to whatever holds FOCUS. The
+// ImGuiDrawer publishes once per frame whether any visible overlay
+// window owns the pointer / the keyboard / an active text field - its ImGui
+// capture flags conjoined with overlay visibility, so a CLOSED overlay can
+// never own input by construction (the focus latch that got a raw
+// WantCaptureKeyboard gate rejected here previously cannot form).
+// One rule on top, also window-manager semantics (pointer capture): while
+// mouse steering holds the pointer - pinned to the window center and hidden -
+// there is no cursor to hover an overlay with, so the mouse stays with the
+// game until steering releases it (menus, pause, mode "off", focus loss).
+// Pad input is deliberately NOT gated: the overlays are not pad-navigable
+// (the drawer feeds ImGui keyboard/mouse/touch only), so no overlay can own
+// pad input and gating it would change behaviour with no owner on the other
+// side.
 struct GateState {
   bool fg_ok = false;
-  bool imgui_ctx = false;
-  bool want_text = false;
-  bool want_capture = false;
-  // Block only on an active text field: WantCaptureKeyboard proved too broad
-  // a signal to gate on (it can be latched by overlay focus), so it is logged
-  // for diagnosis but does not gate.
-  bool open() const { return fg_ok && !want_text; }
+  bool capture_mouse = false;     // a visible overlay owns the pointer
+  bool capture_keyboard = false;  // a visible overlay owns the keyboard
+  bool want_text = false;         // an overlay text field is active
+  bool steer_owns_pointer = false;  // mouse steering is pinning the cursor
+  bool keys_ok() const { return fg_ok && !capture_keyboard && !want_text; }
+  bool mouse_ok() const { return fg_ok && (steer_owns_pointer || !capture_mouse); }
 };
 
 GateState QueryGate() {
@@ -583,13 +609,31 @@ GateState QueryGate() {
 #else
   g.fg_ok = true;
 #endif
-  if (ImGui::GetCurrentContext() != nullptr) {
-    g.imgui_ctx = true;
-    const ImGuiIO& io = ImGui::GetIO();
-    g.want_text = io.WantTextInput;
-    g.want_capture = io.WantCaptureKeyboard;
-  }
+  g.capture_mouse = rex::ui::ImGuiDrawer::DialogsCaptureMouse();
+  g.capture_keyboard = rex::ui::ImGuiDrawer::DialogsCaptureKeyboard();
+  g.want_text = rex::ui::ImGuiDrawer::DialogsWantTextInput();
+  g.steer_owns_pointer = g_mouse.capturing;
   return g;
+}
+
+// LMB/RMB/MMB/X1/X2 and the synthetic wheel keys are MOUSE input (ownership
+// follows the cursor); every other key is KEYBOARD input (ownership follows
+// focus). The two kinds gate independently, like windows on a desktop.
+bool IsMouseKey(VirtualKey vk) {
+  switch (vk) {
+    case VirtualKey::kLButton:
+    case VirtualKey::kRButton:
+    case VirtualKey::kMButton:
+    case VirtualKey::kXButton1:
+    case VirtualKey::kXButton2:
+      return true;
+    default:
+      return vk == kVkWheelUp || vk == kVkWheelDown;
+  }
+}
+
+bool KeyAllowed(const GateState& gate, VirtualKey vk) {
+  return IsMouseKey(vk) ? gate.mouse_ok() : gate.keys_ok();
 }
 
 bool KeyHeld(VirtualKey vk) {
@@ -660,19 +704,11 @@ void SetCursorHidden(bool, void*) {}
 #endif
 
 // ---- Mouse steering (M3) -----------------------------------------------------
-// Virtual left stick fed by raw cursor deltas. While flying with mode=steer
-// and the input gate open, the OS cursor is pinned to the game window's
-// center each poll and the deltas accumulate into a clamped stick position
-// with config-driven feel. Keyboard pitch/roll overrides its axis.
-struct MouseSteer {
-  double x = 0.0, y = 0.0;          // position model: virtual stick, -1..1
-  double rate_x = 0.0, rate_y = 0.0;  // velocity model: filtered px/s
-  double cam_x = 0.0, cam_y = 0.0;  // camera-control mode: held RS deflection
-  bool capturing = false;
-  int64_t last_ms = 0;
-};
-MouseSteer g_mouse;
-
+// Virtual left stick fed by raw cursor deltas (state in MouseSteer above).
+// While flying with mode=steer and the mouse owned by the game, the OS cursor
+// is pinned to the game window's center each poll and the deltas accumulate
+// into a clamped stick position with config-driven feel. Keyboard pitch/roll
+// overrides its axis.
 void MouseSteerRelease() {
   g_mouse.capturing = false;
   g_mouse.x = g_mouse.y = 0.0;
@@ -844,11 +880,11 @@ void DumpMaskTables(uint8_t* base, uint32_t singleton, uint32_t fifth) {
   }
 }
 
-uint32_t GatherMirrorBits() {
+uint32_t GatherMirrorBits(const GateState& gate) {
   uint32_t mirror = 0;
   for (size_t i = 0; i < kNumMenuActions; ++i) {
     for (VirtualKey vk : g_config.menu_keys[i]) {
-      if (KeyHeld(vk)) {
+      if (KeyAllowed(gate, vk) && KeyHeld(vk)) {
         mirror |= 1u << kMenuActions[i].mirror_bit;
         break;
       }
@@ -857,12 +893,14 @@ uint32_t GatherMirrorBits() {
   return mirror;
 }
 
-void InjectMenu(uint8_t* base, uint32_t inst, double dt, bool gate_open,
-                uint32_t kb_mirror) {
+void InjectMenu(uint8_t* base, uint32_t inst, double dt, uint32_t kb_mirror) {
   // Translate mirror-space presses into THIS instance's action bits via its
   // own binding masks - bit-exact with what a real pad press produces here.
+  // kb_mirror is already input-ownership-gated by GatherMirrorBits; a gate
+  // closing mid-hold arrives as kb_mirror dropping to 0, which produces the
+  // released-edge below - keys never stick when an overlay takes the input.
   uint32_t level = 0;
-  if (gate_open && kb_mirror) {
+  if (kb_mirror) {
     for (int a = 0; a < 32; ++a) {
       if (ActionMask(base, inst, a) & kb_mirror) {
         level |= 1u << a;
@@ -1007,7 +1045,7 @@ PPC_EXTERN_FUNC(__imp__rex_sub_82390CE0);  // guest XamInputGetState(user,0,stat
 // right here at the XamInputGetState boundary as XINPUT button bits: every
 // downstream layer then sees keyboard presses exactly as pad presses.
 // (Flight/M2 will gate this by game mode so flight keys never collide.)
-uint32_t GatherXInputBits() {
+uint32_t GatherXInputBits(const GateState& gate) {
   static const uint16_t kXBits[kNumMenuActions] = {
       0x0001,  // up      -> DPAD_UP
       0x0002,  // down    -> DPAD_DOWN
@@ -1021,7 +1059,7 @@ uint32_t GatherXInputBits() {
   uint32_t bits = 0;
   for (size_t i = 0; i < kNumMenuActions; ++i) {
     for (VirtualKey vk : g_config.menu_keys[i]) {
-      if (KeyHeld(vk)) {
+      if (KeyAllowed(gate, vk) && KeyHeld(vk)) {
         bits |= kXBits[i];
         break;
       }
@@ -1053,112 +1091,123 @@ PPC_FUNC_IMPL(rex_sub_82390CE0) {
 
   // Device-level keyboard injection (user 0 only, successful polls only).
   // Context switch: flying -> [flight] key set; everything else -> [menu] set.
+  // Ownership gating is per input KIND (KeyAllowed): keyboard keys drop out
+  // while an overlay holds keyboard focus, mouse buttons and the wheel while
+  // the cursor is over an overlay. A gate closing mid-hold simply stops
+  // asserting the bits - downstream edge detection sees a clean release.
   if (REXCVAR_GET(ac6_kbm_enabled) && user == 0 && state_ptr != 0 &&
       ctx.r3.u32 == 0) {
     const GateState gate = QueryGate();
-    if (gate.open()) {
-      if (FlightActive()) {
-        uint16_t btn = 0;
-        uint8_t lt = 0, rt = 0;
-        int32_t lx = 0, ly = 0, rx = 0, ry = 0;
-        for (size_t i = 0; i < kNumFlightActions; ++i) {
-          for (VirtualKey vk : g_config.flight_keys[i]) {
-            if (KeyHeld(vk)) {
-              const FlightActionDef& d = kFlightActions[i];
-              btn |= d.buttons;
-              if (d.lt > lt) lt = d.lt;
-              if (d.rt > rt) rt = d.rt;
-              lx += d.lx;
-              ly += d.ly;
-              rx += d.rx;
-              ry += d.ry;
-              break;
-            }
-          }
-        }
-        // AC7-style camera control key: while held, the mouse drives the
-        // camera (right stick) instead of pitch/roll.
-        bool cam_mode = false;
-        for (VirtualKey vk : g_config.flight_keys[CameraControlAction()]) {
-          if (KeyHeld(vk)) {
-            cam_mode = true;
+    if (FlightActive()) {
+      uint16_t btn = 0;
+      uint8_t lt = 0, rt = 0;
+      int32_t lx = 0, ly = 0, rx = 0, ry = 0;
+      for (size_t i = 0; i < kNumFlightActions; ++i) {
+        for (VirtualKey vk : g_config.flight_keys[i]) {
+          if (KeyAllowed(gate, vk) && KeyHeld(vk)) {
+            const FlightActionDef& d = kFlightActions[i];
+            btn |= d.buttons;
+            if (d.lt > lt) lt = d.lt;
+            if (d.rt > rt) rt = d.rt;
+            lx += d.lx;
+            ly += d.ly;
+            rx += d.rx;
+            ry += d.ry;
             break;
           }
         }
-
-        // Mouse steering: runs every flight poll (maintains capture/recenter);
-        // keyboard keys override the mouse per axis, pad stick wins when both idle.
-        // With the camera key held, mx/my are the held camera deflection instead.
-        double mx = 0.0, my = 0.0;
-        const bool mouse_on = MouseSteerPoll(cam_mode, mx, my);
-
-        const bool any = btn || lt || rt || lx != 0 || ly != 0 || rx != 0 || ry != 0 ||
-                         (mouse_on && (mx != 0.0 || my != 0.0));
-        if (any) {
-          const uint16_t cur = rex::memory::load_and_swap<uint16_t>(base + state_ptr + 4);
-          rex::memory::store_and_swap<uint16_t>(base + state_ptr + 4,
-                                                static_cast<uint16_t>(cur | btn));
-          auto max_u8 = [&](uint32_t off, uint8_t v) {
-            uint8_t c = *(base + state_ptr + off);
-            if (v > c) *(base + state_ptr + off) = v;
-          };
-          max_u8(6, lt);
-          max_u8(7, rt);
-          auto clamp16 = [](int32_t v) {
-            return static_cast<int16_t>(v > 32767 ? 32767 : (v < -32767 ? -32767 : v));
-          };
-          if (lx != 0) {
-            rex::memory::store_and_swap<int16_t>(base + state_ptr + 8, clamp16(lx));
-          } else if (mouse_on && !cam_mode && mx != 0.0) {
-            rex::memory::store_and_swap<int16_t>(base + state_ptr + 8,
-                                                 clamp16(static_cast<int32_t>(mx * 32767.0)));
-          }
-          // Mouse "pull" (my positive) = stick pulled = negative LY, matching
-          // the pitch_up fallback key.
-          if (ly != 0) {
-            rex::memory::store_and_swap<int16_t>(base + state_ptr + 10, clamp16(ly));
-          } else if (mouse_on && !cam_mode && my != 0.0) {
-            rex::memory::store_and_swap<int16_t>(base + state_ptr + 10,
-                                                 clamp16(static_cast<int32_t>(-my * 32767.0)));
-          }
-          if (rx != 0) {
-            rex::memory::store_and_swap<int16_t>(base + state_ptr + 12, clamp16(rx));
-          } else if (mouse_on && cam_mode && mx != 0.0) {
-            rex::memory::store_and_swap<int16_t>(base + state_ptr + 12,
-                                                 clamp16(static_cast<int32_t>(mx * 32767.0)));
-          }
-          if (ry != 0) {
-            rex::memory::store_and_swap<int16_t>(base + state_ptr + 14, clamp16(ry));
-          } else if (mouse_on && cam_mode && my != 0.0) {
-            rex::memory::store_and_swap<int16_t>(base + state_ptr + 14,
-                                                 clamp16(static_cast<int32_t>(my * 32767.0)));
-          }
-          static int s_lines = 0;
-          static uint32_t s_last = 0;
-          const uint32_t sig = btn | (lt << 16) | (rt << 24) | ((lx != 0) << 30) |
-                               ((ly != 0) << 31);
-          if (REXCVAR_GET(ac6_kbm_log) && sig != s_last && s_lines < 100) {
-            s_last = sig;
-            ++s_lines;
-            KbmLog(fmt::format("xinput inject FLIGHT btn=0x{:04X} lt={} rt={} lx={} ly={} "
-                               "mouse={} cam={} mx={:.2f} my={:.2f}",
-                               btn, lt, rt, lx, ly, mouse_on, cam_mode, mx, my));
-          }
+      }
+      // AC7-style camera control key: while held, the mouse drives the
+      // camera (right stick) instead of pitch/roll.
+      bool cam_mode = false;
+      for (VirtualKey vk : g_config.flight_keys[CameraControlAction()]) {
+        if (KeyAllowed(gate, vk) && KeyHeld(vk)) {
+          cam_mode = true;
+          break;
         }
+      }
+
+      // Mouse steering: runs every flight poll while the game owns the
+      // pointer (maintains capture/recenter); keyboard keys override the
+      // mouse per axis, pad stick wins when both idle. With the camera key
+      // held, mx/my are the held camera deflection instead. If a visible
+      // overlay owns the pointer (cursor hovering it while free), steering
+      // does not acquire - the cursor stays live for the overlay until it
+      // moves off, exactly like a desktop window under the pointer.
+      double mx = 0.0, my = 0.0;
+      bool mouse_on = false;
+      if (gate.mouse_ok()) {
+        mouse_on = MouseSteerPoll(cam_mode, mx, my);
       } else {
         MouseSteerRelease();
-        const uint32_t kb = GatherXInputBits();
-        if (kb != 0) {
-          const uint16_t cur = rex::memory::load_and_swap<uint16_t>(base + state_ptr + 4);
-          rex::memory::store_and_swap<uint16_t>(base + state_ptr + 4,
-                                                static_cast<uint16_t>(cur | kb));
-          static int s_lines = 0;
-          static uint32_t s_last = 0;
-          if (REXCVAR_GET(ac6_kbm_log) && kb != s_last && s_lines < 100) {
-            s_last = kb;
-            ++s_lines;
-            KbmLog(fmt::format("xinput inject wButtons 0x{:04X}", kb));
-          }
+      }
+
+      const bool any = btn || lt || rt || lx != 0 || ly != 0 || rx != 0 || ry != 0 ||
+                       (mouse_on && (mx != 0.0 || my != 0.0));
+      if (any) {
+        const uint16_t cur = rex::memory::load_and_swap<uint16_t>(base + state_ptr + 4);
+        rex::memory::store_and_swap<uint16_t>(base + state_ptr + 4,
+                                              static_cast<uint16_t>(cur | btn));
+        auto max_u8 = [&](uint32_t off, uint8_t v) {
+          uint8_t c = *(base + state_ptr + off);
+          if (v > c) *(base + state_ptr + off) = v;
+        };
+        max_u8(6, lt);
+        max_u8(7, rt);
+        auto clamp16 = [](int32_t v) {
+          return static_cast<int16_t>(v > 32767 ? 32767 : (v < -32767 ? -32767 : v));
+        };
+        if (lx != 0) {
+          rex::memory::store_and_swap<int16_t>(base + state_ptr + 8, clamp16(lx));
+        } else if (mouse_on && !cam_mode && mx != 0.0) {
+          rex::memory::store_and_swap<int16_t>(base + state_ptr + 8,
+                                               clamp16(static_cast<int32_t>(mx * 32767.0)));
+        }
+        // Mouse "pull" (my positive) = stick pulled = negative LY, matching
+        // the pitch_up fallback key.
+        if (ly != 0) {
+          rex::memory::store_and_swap<int16_t>(base + state_ptr + 10, clamp16(ly));
+        } else if (mouse_on && !cam_mode && my != 0.0) {
+          rex::memory::store_and_swap<int16_t>(base + state_ptr + 10,
+                                               clamp16(static_cast<int32_t>(-my * 32767.0)));
+        }
+        if (rx != 0) {
+          rex::memory::store_and_swap<int16_t>(base + state_ptr + 12, clamp16(rx));
+        } else if (mouse_on && cam_mode && mx != 0.0) {
+          rex::memory::store_and_swap<int16_t>(base + state_ptr + 12,
+                                               clamp16(static_cast<int32_t>(mx * 32767.0)));
+        }
+        if (ry != 0) {
+          rex::memory::store_and_swap<int16_t>(base + state_ptr + 14, clamp16(ry));
+        } else if (mouse_on && cam_mode && my != 0.0) {
+          rex::memory::store_and_swap<int16_t>(base + state_ptr + 14,
+                                               clamp16(static_cast<int32_t>(my * 32767.0)));
+        }
+        static int s_lines = 0;
+        static uint32_t s_last = 0;
+        const uint32_t sig = btn | (lt << 16) | (rt << 24) | ((lx != 0) << 30) |
+                             ((ly != 0) << 31);
+        if (REXCVAR_GET(ac6_kbm_log) && sig != s_last && s_lines < 100) {
+          s_last = sig;
+          ++s_lines;
+          KbmLog(fmt::format("xinput inject FLIGHT btn=0x{:04X} lt={} rt={} lx={} ly={} "
+                             "mouse={} cam={} mx={:.2f} my={:.2f}",
+                             btn, lt, rt, lx, ly, mouse_on, cam_mode, mx, my));
+        }
+      }
+    } else {
+      MouseSteerRelease();
+      const uint32_t kb = GatherXInputBits(gate);
+      if (kb != 0) {
+        const uint16_t cur = rex::memory::load_and_swap<uint16_t>(base + state_ptr + 4);
+        rex::memory::store_and_swap<uint16_t>(base + state_ptr + 4,
+                                              static_cast<uint16_t>(cur | kb));
+        static int s_lines = 0;
+        static uint32_t s_last = 0;
+        if (REXCVAR_GET(ac6_kbm_log) && kb != s_last && s_lines < 100) {
+          s_last = kb;
+          ++s_lines;
+          KbmLog(fmt::format("xinput inject wButtons 0x{:04X}", kb));
         }
       }
     }
@@ -1299,24 +1348,45 @@ PPC_FUNC_IMPL(rex_sub_82211E28) {
     DumpMaskTables(base, singleton, s_fifth_inst);
   }
 
-  const uint32_t kb_mirror = GatherMirrorBits();
+  const uint32_t kb_mirror = GatherMirrorBits(gate);
+
+  // Gate transitions (capped): one line whenever input ownership changes -
+  // the direct log evidence for the overlay open/close and hover checks.
+  if (REXCVAR_GET(ac6_kbm_log)) {
+    static int s_gate_lines = 0;
+    static uint32_t s_gate_last = 0xFF;
+    const uint32_t sig = (gate.fg_ok << 0) | (gate.capture_mouse << 1) |
+                         (gate.capture_keyboard << 2) | (gate.want_text << 3) |
+                         (gate.steer_owns_pointer << 4);
+    if (sig != s_gate_last && s_gate_lines < 200) {
+      s_gate_last = sig;
+      ++s_gate_lines;
+      KbmLog(fmt::format(
+          "gate change: fg={} capMouse={} capKb={} text={} steerOwn={} -> keys={} mouse={}",
+          gate.fg_ok, gate.capture_mouse, gate.capture_keyboard, gate.want_text,
+          gate.steer_owns_pointer, gate.keys_ok(), gate.mouse_ok()));
+    }
+  }
 
   // Heartbeat: proves the hook runs, shows the gate, and shows raw key
   // detection INDEPENDENT of the gate (so a closed gate is visible too).
   if (REXCVAR_GET(ac6_kbm_log) && (call == 5 || (call % 3000) == 0)) {
+    GateState raw;  // all-open gate: rawMirror = physical key detection
+    raw.fg_ok = true;
     KbmLog(fmt::format(
         "alive call={} inst=0x{:08X} singleton=0x{:08X} fifth@0x{:08X} dt={:.4f} "
-        "gate[fg={} imgui={} text={} capture={} open={}] targets=[{}] rawMirror=0x{:X} "
-        "flight={}",
-        call, inst, singleton, s_fifth_inst, dt, gate.fg_ok, gate.imgui_ctx, gate.want_text,
-        gate.want_capture, gate.open(), fmt::join(g_config.menu_instances, ","), kb_mirror,
-        FlightActive()));
+        "gate[fg={} capMouse={} capKb={} text={} steerOwn={} keys={} mouse={}] targets=[{}] "
+        "rawMirror=0x{:X} gatedMirror=0x{:X} flight={}",
+        call, inst, singleton, s_fifth_inst, dt, gate.fg_ok, gate.capture_mouse,
+        gate.capture_keyboard, gate.want_text, gate.steer_owns_pointer, gate.keys_ok(),
+        gate.mouse_ok(), fmt::join(g_config.menu_instances, ","), GatherMirrorBits(raw),
+        kb_mirror, FlightActive()));
   }
 
   if (!FlightActive()) {
     for (int target : g_config.menu_instances) {
       if (target == idx && idx != 2) {
-        InjectMenu(base, inst, dt, gate.open(), kb_mirror);
+        InjectMenu(base, inst, dt, kb_mirror);
         break;
       }
     }
