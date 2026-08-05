@@ -19,6 +19,7 @@
 REXCVAR_DECLARE(bool, audio_deep_trace);
 REXCVAR_DECLARE(bool, audio_xma_loop_guard);
 REXCVAR_DECLARE(bool, audio_xma_preserve_timeline);
+REXCVAR_DECLARE(bool, audio_xma_header_straddle_fix);
 
 namespace rex::audio {
 
@@ -517,6 +518,35 @@ kPacketInfo XmaContext::GetPacketInfo(uint8_t* packet, uint32_t frame_offset) {
 
   while (true) {
     if (stream.BitsRemaining() < kBitsPerFrameHeader) {
+      // A frame whose 15-bit header STRADDLES the packet boundary is real.
+      // The chain only reaches this point when the previous frame's
+      // continuation bit promised another frame (or the packet's declared
+      // first-frame offset points here), and the encoder's own seek ledger
+      // confirms it: the straddled size field, read across the boundary,
+      // equals the next packet's first_frame_offset minus the 32-bit packet
+      // header on every occurrence in AC6's demopacks. Treating <15
+      // remaining bits as end-of-chain mislabelled the previous frame "last
+      // in packet", so Decode()'s advance jumped to the next packet's
+      // first_frame_offset - exactly PAST the straddled frame's continuation
+      // - and one whole 512-sample frame vanished silently (~1 per stream
+      // per 14 s in AC6 cutscene premixes, at stream-specific positions).
+      // The streams of a multi-stream voice drifted apart in 512-sample
+      // steps and the coherent premix combed on the stereo fold: the
+      // long-reported robotic cutscene echo.
+      //
+      // Counting the frame is the whole fix: current_frame_size_ = 0 routes
+      // Decode() into its existing cross-packet path, whose combined
+      // two-payload bitstream reads the straddled header and copies the full
+      // frame. (BitsRemaining() == 0 exactly - a header starting precisely
+      // at the payload junction - keeps the old behaviour; no occurrence
+      // exists in the packs and the read offset cannot represent it.)
+      if (REXCVAR_GET(audio_xma_header_straddle_fix) && stream.BitsRemaining() > 0) {
+        if (stream.offset_bits() == frame_offset) {
+          packet_info.current_frame_ = packet_info.frame_count_;
+          packet_info.current_frame_size_ = 0;
+        }
+        packet_info.frame_count_++;
+      }
       break;
     }
 

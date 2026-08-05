@@ -70,6 +70,20 @@ REXCVAR_DEFINE_BOOL(audio_xma_loop_guard, true, "Audio",
                     "machinery on every input buffer swap, truncating/"
                     "skipping subframes of the stream (confirmed firing on "
                     "AC6 cutscene streams via the deep-trace counter).");
+REXCVAR_DEFINE_BOOL(audio_xma_header_straddle_fix, true, "Audio",
+                    "Decode XMA frames whose 15-bit frame header straddles a "
+                    "2 KiB packet boundary. The frame walk treated "
+                    "fewer-than-15 remaining bits as end-of-chain, but the "
+                    "straddled frame is real: the encoder's own seek ledger "
+                    "confirms it on every occurrence (its size field, read "
+                    "across the boundary, equals the next packet's "
+                    "first-frame offset minus the packet header). Without "
+                    "this, one whole 512-sample frame is silently dropped per "
+                    "occurrence, so the parallel streams of a multi-stream "
+                    "voice drift apart in 512-sample steps and the premix "
+                    "combs on the stereo fold - the long-reported doubled/"
+                    "robotic cutscene dialogue. Off restores the legacy "
+                    "walk for A/B.");
 REXCVAR_DEFINE_BOOL(audio_xma_preserve_timeline, true, "Audio",
                     "When the XMA decoder backend rejects a damaged frame, emit that "
                     "frame's worth of silence instead of dropping it. The input read "
