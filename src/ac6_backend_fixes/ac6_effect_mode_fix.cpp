@@ -79,7 +79,8 @@ REXCVAR_DEFINE_BOOL(
 // degrades to __builtin_debugtrap() unless ppc_config.h was included first,
 // which it is not in this translation unit - it would trap on the first
 // corrected frame.
-PPC_EXTERN_FUNC(rex_sub_820B25D0);  // vtbl[+0x100] DRAW   (mode 2)
+PPC_EXTERN_FUNC(rex_sub_820B25D0);  // CX360EffectManager vtbl[+0x100] DRAW  (mode 2)
+PPC_EXTERN_FUNC(rex_sub_822B0AD8);  // CAce6EffectManager vtbl[+0x100] DRAW  (mode 2)
 PPC_EXTERN_FUNC(rex_sub_822B2E20);  // UPDATE, f1 = dt     (mode 0)
 PPC_EXTERN_FUNC(rex_sub_822B0848);  // f1 = dt             (mode 1)
 
@@ -90,7 +91,11 @@ namespace {
 
 constexpr uint32_t kEffModeOffset = 0xA1E84;
 constexpr uint32_t kEffDispatcher = 0x822B3248;
-constexpr uint32_t kEffDraw = 0x820B25D0;
+// The two manager classes share the dispatcher at vtbl[+0x04] but have
+// DIFFERENT draws at vtbl[+0x100]. Only these two reference the dispatcher, so
+// the set is closed.
+constexpr uint32_t kEffDrawX360 = 0x820B25D0;  // CX360EffectManager
+constexpr uint32_t kEffDrawAce6 = 0x822B0AD8;  // CAce6EffectManager
 
 // Submissions are matched to dispatches by the exact (job, arg) pair rather
 // than positionally. The pool has PER-THREAD queues, so dispatch order is not
@@ -126,6 +131,9 @@ struct EffModeTable {
   //                    a third component, e.g. the target thread index)
   uint64_t key_collisions = 0;
   uint64_t key_conflicts = 0;
+  // A mode-2 dispatch whose vtbl[+0x100] matches neither known draw. Falls
+  // through to the original racy path, so it must never be silent.
+  uint64_t unknown_draw = 0;
 };
 
 EffModeTable g_modefix;
@@ -223,9 +231,10 @@ PPC_FUNC_IMPL(rex_sub_822B3248) {
           if (g_modefix.corrections <= 8 || (g_modefix.corrections & 0xFF) == 0) {
             REXLOG_INFO(
                 "[AC6-MODEFIX] mode word reads {} but this job was submitted with {} "
-                "(corrected {}, in-order {}, unmatched {}, dropped {}, key conflicts {})",
+                "(corrected {}, in-order {}, unmatched {}, dropped {}, key conflicts {}, "
+                "unmodelled draws {})",
                 now, want, g_modefix.corrections, g_modefix.matched, g_modefix.unmatched,
-                g_modefix.dropped, g_modefix.key_conflicts);
+                g_modefix.dropped, g_modefix.key_conflicts, g_modefix.unknown_draw);
           }
         } else {
           ++g_modefix.matched;
@@ -234,14 +243,39 @@ PPC_FUNC_IMPL(rex_sub_822B3248) {
 
       const uint32_t dt_bits = ctx.r4.u32;
       if (want == 2) {
+        // BOTH manager classes share the dispatcher at vtbl[+0x04], but they do
+        // NOT share the draw at vtbl[+0x100]:
+        //     CX360EffectManager (vtable 0x8205829C) -> 0x820B25D0
+        //     CAce6EffectManager (vtable 0x82057BDC) -> 0x822B0AD8
+        // An earlier revision only knew the first, so a CAce6EffectManager job
+        // failed the check and fell through to the original - the racy path -
+        // silently, because nothing counted it. That is a real escape hatch and
+        // it is how a flicker survived on a tester's machine.
         const uint32_t vt = rex::memory::load_and_swap<uint32_t>(base + self);
-        // Only take the direct path when the slot really is the draw we
-        // decoded. A different vtable means a class we have not modelled, and
-        // guessing there would be worse than the bug.
-        if (vt >= 0x82000000u && vt < 0x82A00000u &&
-            rex::memory::load_and_swap<uint32_t>(base + vt + 0x100) == kEffDraw) {
+        const uint32_t draw = (vt >= 0x82000000u && vt < 0x82A00000u)
+                                  ? rex::memory::load_and_swap<uint32_t>(base + vt + 0x100)
+                                  : 0u;
+        if (draw == kEffDrawX360) {
           rex_sub_820B25D0(ctx, base);  // r3 = this, r4 = arg already in place
           return;
+        }
+        if (draw == kEffDrawAce6) {
+          rex_sub_822B0AD8(ctx, base);
+          return;
+        }
+        // Still unmodelled: fall through to the original rather than guess -
+        // but COUNT it. Only two classes reference the dispatcher, so this
+        // should be unreachable; if it ever fires, the escape hatch is open
+        // again and we want to know instead of losing flickers to it.
+        {
+          std::lock_guard<std::mutex> lk(g_modefix.mu);
+          ++g_modefix.unknown_draw;
+          if (g_modefix.unknown_draw <= 8) {
+            REXLOG_WARN(
+                "[AC6-MODEFIX] unmodelled draw slot: this={:08X} vtable={:08X} "
+                "vtbl[+0x100]={:08X} - falling through to the racy path ({} so far)",
+                self, vt, draw, g_modefix.unknown_draw);
+          }
         }
       } else if (want == 0 || want == 1) {
         float dt = 0.0f;
