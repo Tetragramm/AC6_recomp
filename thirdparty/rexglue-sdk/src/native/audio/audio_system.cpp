@@ -19,47 +19,6 @@ REXCVAR_DEFINE_BOOL(audio_trace_render_driver_verbose, false, "Audio",
                     "Trace render-driver activity");
 REXCVAR_DEFINE_BOOL(audio_deep_trace, false, "Audio",
                     "Enable verbose runtime audio tracing");
-REXCVAR_DEFINE_BOOL(audio_cutscene_downmix, true, "Audio",
-                    "Master switch for the cutscene-specific stereo fold-down "
-                    "(fronts-only fold while the demo sequencer is active - "
-                    "removes the doubled/combed dialogue caused by summing the "
-                    "cutscene mixer's six decorrelated near-copies to stereo). "
-                    "false = the original summing fold everywhere; the "
-                    "audio_downmix_cutscene_* cvars then have no effect. "
-                    "Gameplay audio is identical either way.");
-REXCVAR_DEFINE_DOUBLE(audio_downmix_center_gain, 0.70710678, "Audio",
-                      "Front-center gain in the 6ch-to-stereo fold-down (was a "
-                      "compile-time constant; default unchanged). Normalization "
-                      "follows the live gains. Read continuously.");
-REXCVAR_DEFINE_DOUBLE(audio_downmix_surround_gain, 0.5, "Audio",
-                      "Rear-channel gain in the 6ch-to-stereo fold-down. See "
-                      "audio_downmix_center_gain.");
-REXCVAR_DEFINE_DOUBLE(audio_downmix_lfe_gain, 0.0, "Audio",
-                      "LFE gain in the 6ch-to-stereo fold-down. See "
-                      "audio_downmix_center_gain.");
-REXCVAR_DEFINE_DOUBLE(audio_downmix_cutscene_center_gain, 0.0, "Audio",
-                      "Front-center fold-down gain used ONLY while an in-engine "
-                      "cutscene is playing (demo sequencer active); negative = "
-                      "inherit audio_downmix_center_gain. AC6's cutscene mixer "
-                      "spreads the premix across ALL six speaker slots as "
-                      "decorrelated near-copies of one mix; the fronts alone "
-                      "carry the complete mix, so the cutscene fold takes only "
-                      "them - center and surround default to 0 here.");
-REXCVAR_DEFINE_DOUBLE(audio_downmix_cutscene_surround_gain, 0.0, "Audio",
-                      "Rear-channel fold-down gain during in-engine cutscenes; "
-                      "negative = inherit. See audio_downmix_cutscene_center_gain.");
-REXCVAR_DEFINE_DOUBLE(audio_downmix_cutscene_lfe_gain, -1.0, "Audio",
-                      "LFE fold-down gain during in-engine cutscenes; negative = "
-                      "inherit. See audio_downmix_cutscene_center_gain.");
-REXCVAR_DEFINE_DOUBLE(audio_downmix_cutscene_trim, 0.933, "Audio",
-                      "Extra output gain on the cutscene fold (ramped in with "
-                      "the cutscene gains). Default 0.933 = the measured RMS "
-                      "ratio of the fronts-only fold vs the stock summing fold "
-                      "(-0.6 dB), so cutscene loudness matches the original "
-                      "baseline; 1.0 = no trim.");
-REXCVAR_DEFINE_DOUBLE(audio_downmix_cutscene_ramp_ms, 250.0, "Audio",
-                      "Slew time between the base fold and the cutscene gains "
-                      "when the demo-sequencer signal engages or releases.");
 REXCVAR_DEFINE_BOOL(audio_xma_loop_guard, true, "Audio",
                     "Require a real loop window (loop_start < loop_end, "
                     "read_offset >= loop_end) before engaging XMA loop "

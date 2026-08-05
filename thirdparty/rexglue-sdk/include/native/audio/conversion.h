@@ -3,39 +3,12 @@
 
 #pragma once
 
-#include <algorithm>
-#include <atomic>
-#include <chrono>
 #include <cmath>
 #include <cstdint>
 
 #include <native/audio/render_driver_frame_layout.h>
-#include <rex/cvar.h>
 #include <rex/platform.h>
 #include <rex/types.h>
-
-REXCVAR_DECLARE(bool, audio_cutscene_downmix);
-REXCVAR_DECLARE(double, audio_downmix_center_gain);
-REXCVAR_DECLARE(double, audio_downmix_surround_gain);
-REXCVAR_DECLARE(double, audio_downmix_lfe_gain);
-REXCVAR_DECLARE(double, audio_downmix_cutscene_center_gain);
-REXCVAR_DECLARE(double, audio_downmix_cutscene_surround_gain);
-REXCVAR_DECLARE(double, audio_downmix_cutscene_lfe_gain);
-REXCVAR_DECLARE(double, audio_downmix_cutscene_trim);
-REXCVAR_DECLARE(double, audio_downmix_cutscene_ramp_ms);
-
-namespace rex::audio {
-
-// Wall-clock ms of the last in-engine cutscene sequencer tick, stamped by the
-// demo-tick hook (ac6_cutscene_resync). Lets the stereo fold-down apply
-// cutscene-specific gains without reaching into game code. INT64_MIN = never.
-inline std::atomic<int64_t> g_last_cinematic_audio_tick_ms{INT64_MIN};
-
-inline void NotifyCinematicAudioTick(int64_t now_ms) {
-  g_last_cinematic_audio_tick_ms.store(now_ms, std::memory_order_relaxed);
-}
-
-}  // namespace rex::audio
 
 namespace rex::audio::conversion {
 
@@ -46,81 +19,6 @@ inline constexpr float kStereoDownmixPeakHeadroom = 0.92f;
 inline constexpr float kStereoDownmixNormalize =
     1.0f / (1.0f + kStereoDownmixCenterGain + kStereoDownmixSurroundGain +
             kStereoDownmixLfeGain);
-
-// Live fold-down gains for the path AC6 actually plays through (the AMD64
-// planar fold below; the other variants keep the compile-time constants).
-// The base gains default to those constants; the cutscene set applies while
-// the demo sequencer is ticking, because AC6's cutscene mixer submits its premix
-// spread across ALL six speaker slots as decorrelated near-copies of one mix
-// (measured: equal RMS on every channel, inter-channel correlation 0.69-0.94
-// at exactly lag 0, identical structure across scenes). Real speakers
-// separate the copies acoustically; an electrical 6-to-2 sum combs them -
-// heard as doubled dialogue. The fronts alone carry the complete mix, so the
-// cutscene defaults fold only the fronts. Gameplay audio (discrete channels)
-// is bit-identical to the old constants.
-struct StereoDownmixGains {
-  float center;
-  float surround;
-  float lfe;
-  float normalize;
-};
-
-inline StereoDownmixGains GetStereoDownmixGains() {
-  // The cutscene gains engage while demo-wrapper ticks are fresh; f slews
-  // over ramp_ms so fold changes never step. Known cosmetic (accepted): the
-  // wrapper keeps ticking through the gallery's menu->scene transitions, so
-  // the gallery's front-weighted transition SFX plays through the
-  // fronts-only fold hot; campaign flows are unaffected.
-  const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                             std::chrono::steady_clock::now().time_since_epoch())
-                             .count();
-  const int64_t last_tick =
-      g_last_cinematic_audio_tick_ms.load(std::memory_order_relaxed);
-  const bool engaged = REXCVAR_GET(audio_cutscene_downmix) &&
-                       last_tick != INT64_MIN && (now_ms - last_tick) <= 250;
-  static float f_state = 0.0f;  // 0 = base fold, 1 = full cutscene gains
-  static int64_t f_last_ms = INT64_MIN;
-  const double ramp = std::max(1.0, REXCVAR_GET(audio_downmix_cutscene_ramp_ms));
-  float step = 1.0f;
-  if (f_last_ms != INT64_MIN && now_ms >= f_last_ms) {
-    step = float(std::min(1.0, double(now_ms - f_last_ms) / ramp));
-  }
-  f_last_ms = now_ms;
-  const float target = engaged ? 1.0f : 0.0f;
-  if (target > f_state) {
-    f_state = std::min(target, f_state + step);
-  } else {
-    f_state = std::max(target, f_state - step);
-  }
-  const float f = f_state;
-  auto clamp_gain = [](double v) {
-    return std::min(2.0f, std::max(0.0f, float(v)));
-  };
-  auto blend = [&](double cutscene_value, double base_value) {
-    const float base = clamp_gain(base_value);
-    const float cut =
-        cutscene_value >= 0.0 ? clamp_gain(cutscene_value) : base;
-    return base + (cut - base) * f;
-  };
-  StereoDownmixGains gains;
-  gains.center = blend(REXCVAR_GET(audio_downmix_cutscene_center_gain),
-                       REXCVAR_GET(audio_downmix_center_gain));
-  gains.surround = blend(REXCVAR_GET(audio_downmix_cutscene_surround_gain),
-                         REXCVAR_GET(audio_downmix_surround_gain));
-  gains.lfe = blend(REXCVAR_GET(audio_downmix_cutscene_lfe_gain),
-                    REXCVAR_GET(audio_downmix_lfe_gain));
-  // Normalization follows the live gains so loudness stays consistent at any
-  // setting; at the stock base gains this equals the old fixed constant, so
-  // gameplay output is bit-identical. The near-copy cutscene mixes are
-  // self-correcting under it (fold of N unity-ish copies divided by the gain
-  // sum lands at the same level whichever channels fold); the measured
-  // residual vs the old fold is +0.6 dB, cancelled by the default trim.
-  gains.normalize = 1.0f / (1.0f + gains.center + gains.surround + gains.lfe);
-  const float trim = std::min(
-      2.0f, std::max(0.0f, float(REXCVAR_GET(audio_downmix_cutscene_trim))));
-  gains.normalize *= 1.0f + (trim - 1.0f) * f;
-  return gains;
-}
 
 inline float SanitizeGuestAudioSample(float sample) {
   if (!std::isfinite(sample)) {
@@ -172,11 +70,10 @@ inline void sequential_6_BE_to_interleaved_2_LE(float* output, const float* inpu
 
   const __m128i byte_swap_shuffle =
       _mm_set_epi8(12, 13, 14, 15, 8, 9, 10, 11, 4, 5, 6, 7, 0, 1, 2, 3);
-  const StereoDownmixGains live_gains = GetStereoDownmixGains();
-  const __m128 center_gain = _mm_set1_ps(live_gains.center);
-  const __m128 surround_gain = _mm_set1_ps(live_gains.surround);
-  const __m128 lfe_gain = _mm_set1_ps(live_gains.lfe);
-  const __m128 normalize = _mm_set1_ps(live_gains.normalize);
+  const __m128 center_gain = _mm_set1_ps(kStereoDownmixCenterGain);
+  const __m128 surround_gain = _mm_set1_ps(kStereoDownmixSurroundGain);
+  const __m128 lfe_gain = _mm_set1_ps(kStereoDownmixLfeGain);
+  const __m128 normalize = _mm_set1_ps(kStereoDownmixNormalize);
   const __m128 peak_headroom = _mm_set1_ps(kStereoDownmixPeakHeadroom);
   const __m128 sign_mask = _mm_set1_ps(-0.0f);
 

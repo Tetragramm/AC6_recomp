@@ -31,7 +31,6 @@
 
 #include <native/audio/audio_client.h>
 #include <native/audio/audio_system.h>
-#include <native/audio/conversion.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/ppc.h>
@@ -121,12 +120,6 @@ void ExecWithResync(PPCContext& ctx, uint8_t* base,
     g_session.site = site;
   }
   g_session.last_exec_ms = now_ms;
-
-  // Stamp the cinematic-audio gate for the stereo fold-down (conversion.h):
-  // the demo wrappers tick only while an in-engine cutscene plays, so their
-  // freshness is the "cutscene audio active" signal. Unconditional - the
-  // stamp is independent of whether the resync behavior itself is enabled.
-  rex::audio::NotifyCinematicAudioTick(now_ms);
 
   uint64_t audio_samples = 0;
   const bool clock_ok = ReadAudioClockSamples(ctx, &audio_samples);
