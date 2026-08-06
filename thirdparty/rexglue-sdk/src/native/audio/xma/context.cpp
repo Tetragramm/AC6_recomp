@@ -1,4 +1,4 @@
-﻿/**
+/**
  * ReXGlue native audio runtime
  * Part of the AC6 Recompilation project
  */
@@ -17,7 +17,6 @@
 #include <native/stream.h>
 
 REXCVAR_DECLARE(bool, audio_deep_trace);
-REXCVAR_DECLARE(bool, audio_xma_loop_guard);
 REXCVAR_DECLARE(bool, audio_xma_preserve_timeline);
 REXCVAR_DECLARE(bool, audio_xma_header_straddle_fix);
 REXCVAR_DECLARE(bool, audio_xma_loop_end_guard);
@@ -345,31 +344,7 @@ void XmaContext::UpdateLoopStatus(XMA_CONTEXT_DATA* data) {
   const uint32_t loop_start = std::max(kBitsPerPacketHeader, data->loop_start);
   const uint32_t loop_end = std::max(kBitsPerPacketHeader, data->loop_end);
 
-  if (REXCVAR_GET(audio_xma_loop_guard)) {
-    // Xenia master's TrySetupNextLoop guard (PR #1808, debugged on Ace
-    // Combat 6): streamed voices can carry degenerate loop metadata
-    // (loop_count=0xff, loop_start == loop_end == 0). The clamps above turn
-    // that into start == end == kBitsPerPacketHeader, and SwapInputBuffer
-    // resets the read offset to exactly kBitsPerPacketHeader, so without a
-    // real-window check every buffer swap re-fires the loop machinery -
-    // the frame output limit truncates that frame and the loop-start skip
-    // drops subframes. Require loop_start < loop_end (raw values) and use
-    // master's read_offset >= loop_end trigger.
-    if (data->loop_start >= data->loop_end ||
-        data->input_buffer_read_offset < loop_end) {
-      if (data->loop_start >= data->loop_end &&
-          data->input_buffer_read_offset == loop_end && IsDeepTraceEnabled()) {
-        REXAPU_DEBUG(
-            "XmaContext {}: loop guard suppressed degenerate loop fire "
-            "(loop_start={} loop_end={} loop_count={} read_offset={})",
-            id(), static_cast<uint32_t>(data->loop_start),
-            static_cast<uint32_t>(data->loop_end),
-            static_cast<uint32_t>(data->loop_count),
-            static_cast<uint32_t>(data->input_buffer_read_offset));
-      }
-      return;
-    }
-  } else if (data->input_buffer_read_offset != loop_end) {
+  if (data->input_buffer_read_offset != loop_end) {
     return;
   }
 

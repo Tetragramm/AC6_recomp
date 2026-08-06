@@ -19,12 +19,9 @@ REXCVAR_DEFINE_BOOL(audio_trace_render_driver_verbose, false, "Audio",
                     "Trace render-driver activity");
 REXCVAR_DEFINE_BOOL(audio_deep_trace, false, "Audio",
                     "Enable verbose runtime audio tracing");
-// The four audio_xma_* guards below are correctness fixes debugged on Ace
+// The audio_xma_* guards below are correctness fixes debugged on Ace
 // Combat 6 (details in the commits introducing each). All default on; off
 // restores the legacy behaviour for A/B comparison.
-REXCVAR_DEFINE_BOOL(audio_xma_loop_guard, true, "AC6/Fixes",
-                    "Guard XMA looping against degenerate loop metadata that "
-                    "truncates streamed voices. Off = legacy behaviour for A/B.");
 REXCVAR_DEFINE_BOOL(audio_xma_header_straddle_fix, true, "AC6/Fixes",
                     "Decode XMA frames whose header straddles a packet boundary. "
                     "Off = legacy walk, which drops a frame per occurrence and "
