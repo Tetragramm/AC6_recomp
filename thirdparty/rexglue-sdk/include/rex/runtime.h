@@ -110,6 +110,13 @@ class Runtime {
   const std::filesystem::path& user_data_root() const { return user_data_root_; }
   const std::filesystem::path& update_data_root() const { return update_data_root_; }
 
+  // Optional disc image mounted as the game volume (call before Setup).
+  // When set together with an existing game_data_root, the loose directory is
+  // mounted as a layered top (loose files win, the image fills the gaps);
+  // when game_data_root is empty or missing, the image alone backs game:.
+  void set_game_image_path(const std::filesystem::path& path) { game_image_path_ = path; }
+  const std::filesystem::path& game_image_path() const { return game_image_path_; }
+
   // Set the app context for presentation (call before Setup)
   void set_app_context(ui::WindowedAppContext* context) {
     app_context_ = context;
@@ -161,6 +168,7 @@ class Runtime {
   std::filesystem::path game_data_root_;
   std::filesystem::path user_data_root_;
   std::filesystem::path update_data_root_;
+  std::filesystem::path game_image_path_;
 
   ui::WindowedAppContext* app_context_ = nullptr;
   ui::Window* display_window_ = nullptr;

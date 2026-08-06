@@ -104,11 +104,24 @@ Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
     normalized_path = resolved_path;
   }
 
-  // Find the device.
-  auto it = std::find_if(devices_.cbegin(), devices_.cend(), [&](const auto& d) {
-    return rex::string::utf8_starts_with_case(normalized_path, d->mount_path());
-  });
-  if (it == devices_.cend()) {
+  // Find the device. Registration order decides priority; a device marked
+  // layered() lets a resolution miss fall through to the next device with a
+  // matching mount path (loose files win, an image mounted below fills the
+  // gaps). Non-layered devices are terminal, the historical behaviour.
+  Device* device = nullptr;
+  Entry* entry = nullptr;
+  for (const auto& d : devices_) {
+    if (!rex::string::utf8_starts_with_case(normalized_path, d->mount_path())) {
+      continue;
+    }
+    device = d.get();
+    auto relative_path = normalized_path.substr(device->mount_path().size());
+    entry = device->ResolvePath(relative_path);
+    if (entry || !device->layered()) {
+      break;
+    }
+  }
+  if (!device) {
     REXFS_WARN("VFS: '{}' -> [no device]", path);
     // Supress logging the error for ShaderDumpxe:\CompareBackEnds as this is
     // not an actual problem nor something we care about.
@@ -117,10 +130,6 @@ Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
     }
     return nullptr;
   }
-
-  const auto& device = *it;
-  auto relative_path = normalized_path.substr(device->mount_path().size());
-  auto* entry = device->ResolvePath(relative_path);
 
   if (entry) {
     if (had_symlink) {
@@ -221,7 +230,9 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
     }
 
     // If the cached entry does not exist on host anymore, invalidate it.
-    if (parent_entry) {
+    // Only applies when the entry actually lives on the same host device as
+    // the parent (a layered lower-level entry is not backed by that host dir).
+    if (parent_entry && entry->device() == parent_entry->device()) {
       const auto* host_path_entry = dynamic_cast<const HostPathEntry*>(parent_entry);
       if (host_path_entry) {
         const auto file_path = host_path_entry->host_path() / rex::to_path(entry->name());
@@ -231,6 +242,15 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
         }
       }
     }
+  }
+
+  // Layered mounts: the parent directory may resolve on the top layer while
+  // the requested child exists only in a lower layer. Retry with a full-path
+  // resolution, which walks the layers. Inert unless the parent's device
+  // opted into layering.
+  if (!entry && !root_entry && parent_entry && parent_entry->device() &&
+      parent_entry->device()->layered()) {
+    entry = ResolvePath(path);
   }
 
   // Check if exists (if we need it to), or that it doesn't (if it shouldn't).

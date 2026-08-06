@@ -5,6 +5,9 @@ add_library(rexfilesystem STATIC
     device.cpp
     entry.cpp
     virtual_file_system.cpp
+    devices/disc_image_device.cpp
+    devices/disc_image_entry.cpp
+    devices/disc_image_file.cpp
     devices/host_path_device.cpp
     devices/host_path_entry.cpp
     devices/host_path_file.cpp

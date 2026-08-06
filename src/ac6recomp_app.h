@@ -36,6 +36,10 @@ class Ac6recompApp : public rex::ReXApp {
   }
 
  protected:
+  // Ace Combat 6 title id: selects the right .iso when several are present
+  // and rejects wrong/corrupt images with a clear message.
+  uint32_t OnGetExpectedTitleId() const override { return 0x4E4D07D1; }
+
   void OnPreSetup(rex::RuntimeConfig& config) override {
     REXLOG_INFO("Ac6recompApp::OnPreSetup");
     rex::ReXApp::OnPreSetup(config);

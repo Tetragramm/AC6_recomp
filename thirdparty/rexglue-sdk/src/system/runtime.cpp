@@ -13,6 +13,7 @@
 #include <native/filesystem/devices/host_path_device.h>
 #include <native/filesystem/devices/null_device.h>
 #include <native/filesystem/vfs.h>
+#include <rex/filesystem/devices/disc_image_device.h>
 #include <rex/graphics/graphics_system.h>
 #include <rex/input/input_system.h>
 #include <rex/logging.h>
@@ -222,29 +223,58 @@ uint8_t* Runtime::virtual_membase() const {
 }
 
 bool Runtime::SetupVfs() {
-  if (game_data_root_.empty()) {
+  const bool have_image = !game_image_path_.empty();
+  if (game_data_root_.empty() && !have_image) {
     REXSYS_WARN("Runtime::SetupVfs: No game_data_root specified, skipping VFS setup");
     return true;
   }
 
-  auto abs_game_root = std::filesystem::absolute(game_data_root_);
-  if (!std::filesystem::exists(abs_game_root)) {
-    REXSYS_ERROR("Runtime::SetupVfs: game_data_root does not exist: {}", abs_game_root.string());
-    return false;
+  auto mount_path = "\\Device\\Harddisk0\\Partition1";
+
+  // Loose directory first: with an image below it, loose files always win and
+  // the image only fills the gaps (layered). Without an image this is the
+  // historical single-device path, bit for bit.
+  if (!game_data_root_.empty()) {
+    auto abs_game_root = std::filesystem::absolute(game_data_root_);
+    if (!std::filesystem::exists(abs_game_root)) {
+      if (!have_image) {
+        REXSYS_ERROR("Runtime::SetupVfs: game_data_root does not exist: {}",
+                     rex::path_to_utf8(abs_game_root));
+        return false;
+      }
+      // Image-only launch; the missing loose directory is fine.
+    } else {
+      auto device =
+          std::make_unique<rex::filesystem::HostPathDevice>(mount_path, abs_game_root, true);
+      if (!device->Initialize()) {
+        REXSYS_ERROR("Runtime::SetupVfs: Failed to initialize host path device");
+        return false;
+      }
+      device->set_layered(have_image);
+      if (!file_system_->RegisterDevice(std::move(device))) {
+        REXSYS_ERROR("Runtime::SetupVfs: Failed to register host path device");
+        return false;
+      }
+      REXSYS_INFO("  Mounted {} at {}{}", rex::path_to_utf8(abs_game_root), mount_path,
+                  have_image ? " (loose layer, overrides image)" : "");
+    }
   }
 
-  // Mount game_data_root as \Device\Harddisk0\Partition1
-  auto mount_path = "\\Device\\Harddisk0\\Partition1";
-  auto device = std::make_unique<rex::filesystem::HostPathDevice>(mount_path, abs_game_root, true);
-  if (!device->Initialize()) {
-    REXSYS_ERROR("Runtime::SetupVfs: Failed to initialize host path device");
-    return false;
+  // Disc image below the loose layer (or alone).
+  if (have_image) {
+    auto image_device =
+        std::make_unique<rex::filesystem::DiscImageDevice>(mount_path, game_image_path_);
+    if (!image_device->Initialize()) {
+      REXSYS_ERROR("Runtime::SetupVfs: Failed to mount disc image: {}",
+                   rex::path_to_utf8(game_image_path_));
+      return false;
+    }
+    if (!file_system_->RegisterDevice(std::move(image_device))) {
+      REXSYS_ERROR("Runtime::SetupVfs: Failed to register disc image device");
+      return false;
+    }
+    REXSYS_INFO("  Mounted {} at {}", rex::path_to_utf8(game_image_path_), mount_path);
   }
-  if (!file_system_->RegisterDevice(std::move(device))) {
-    REXSYS_ERROR("Runtime::SetupVfs: Failed to register host path device");
-    return false;
-  }
-  REXSYS_INFO("  Mounted {} at {}", abs_game_root.string(), mount_path);
 
   // Register symbolic links for game: and D:
   file_system_->RegisterSymbolicLink("game:", mount_path);
@@ -260,7 +290,7 @@ bool Runtime::SetupVfs() {
           std::make_unique<rex::filesystem::HostPathDevice>(update_mount, abs_update_root, true);
       if (update_device->Initialize() && file_system_->RegisterDevice(std::move(update_device))) {
         file_system_->RegisterSymbolicLink("update:", update_mount);
-        REXSYS_INFO("  Mounted {} at update:", abs_update_root.string());
+        REXSYS_INFO("  Mounted {} at update:", rex::path_to_utf8(abs_update_root));
       }
     }
   }

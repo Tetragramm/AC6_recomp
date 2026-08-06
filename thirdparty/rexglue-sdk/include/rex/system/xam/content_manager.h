@@ -119,6 +119,9 @@ static_assert_size(XCONTENT_AGGREGATE_DATA, 0x148);
 
 class ContentPackage {
  public:
+  // package_path may be an extracted folder (mounted as a host-path device,
+  // the historical behaviour) or a raw STFS/LIVE container file (mounted
+  // directly through the STFS device, no extraction required).
   ContentPackage(KernelState* kernel_state, const std::string_view root_name,
                  const XCONTENT_AGGREGATE_DATA& data, const std::filesystem::path& package_path);
   ~ContentPackage();
@@ -129,7 +132,13 @@ class ContentPackage {
 
   const std::filesystem::path& package_path() const { return package_path_; }
 
-  uint32_t GetPackageLicense() const { return license_; }
+  // The .header sidecar wins when present; a directly-mounted container falls
+  // back to the license bits carried in its own STFS header.
+  uint32_t GetPackageLicense() const { return license_ ? license_ : container_license_; }
+
+  bool is_container() const { return is_container_; }
+  // False when a container file failed to mount (corrupt/truncated package).
+  bool device_mounted() const { return device_mounted_; }
 
  private:
   KernelState* kernel_state_;
@@ -138,6 +147,18 @@ class ContentPackage {
   std::filesystem::path package_path_;
   XCONTENT_AGGREGATE_DATA content_data_;
   uint32_t license_ = 0;
+  uint32_t container_license_ = 0;
+  bool is_container_ = false;
+  bool device_mounted_ = false;
+};
+
+// A raw content container discovered on disk, mountable without extraction.
+struct DiscoveredContainer {
+  std::filesystem::path path;
+  XContentType content_type;
+  uint32_t title_id = 0;
+  std::u16string display_name;
+  std::string source;  // short label for the startup report ("dlc", "content root")
 };
 
 class ContentManager {
@@ -183,6 +204,15 @@ class ContentManager {
   // and writes a .header file for XAM enumeration.
   X_RESULT InstallContent(const std::filesystem::path& package_path);
 
+  // Scans for raw content containers - a dlc folder (recursive, so a flat
+  // dump and Xenia's content-directory layout both work) plus container files
+  // dropped straight into the content root - and logs one line per package
+  // found. Only containers for the running title are indexed, so call after
+  // the module is loaded. Containers take priority over an ambient extracted
+  // install: the user placed them next to the exe, so they win - same rule as
+  // the assets folder (and Windows' local-DLL search order).
+  void DiscoverContainers(const std::filesystem::path& dlc_dir);
+
  private:
   std::filesystem::path ResolvePackageRoot(uint64_t xuid, XContentType content_type,
                                            uint32_t title_id = -1);
@@ -197,6 +227,15 @@ class ContentManager {
   ContentPackage* DetachPackage(std::unordered_map<string::string_key_case, ContentPackage*,
                                                    string::string_key_case::Hash>::iterator it);
 
+  // Where a package's data actually lives: a discovered container if one
+  // exists (containers take priority), else the extracted folder / container
+  // file at the canonical package path, else empty.
+  std::filesystem::path ResolvePackageDataPath(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data);
+  const DiscoveredContainer* FindContainer(const std::string_view file_name,
+                                           XContentType content_type) const;
+  void DiscoverContainersInDir(const std::filesystem::path& dir, const char* source,
+                               bool recursive, uint32_t title_id);
+
   KernelState* kernel_state_;
   std::filesystem::path root_path_;
 
@@ -204,6 +243,10 @@ class ContentManager {
   rex::thread::global_critical_region global_critical_region_;
   std::unordered_map<string::string_key_case, ContentPackage*, string::string_key_case::Hash>
       open_packages_;
+  // Discovered raw containers, keyed by the (42-char-truncated) file name the
+  // game sees in enumeration results.
+  std::unordered_map<string::string_key_case, DiscoveredContainer, string::string_key_case::Hash>
+      containers_;
 };
 
 }  // namespace xam

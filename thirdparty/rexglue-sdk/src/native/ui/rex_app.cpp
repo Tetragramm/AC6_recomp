@@ -36,12 +36,43 @@
 #include <rex/ui/keybinds.h>
 #include <rex/version.h>
 
+#include <rex/filesystem/devices/disc_image_device.h>
+#include <rex/system/util/xex2_info.h>
+
+#include <fmt/format.h>
 #include <imgui.h>
+
+#include <algorithm>
+#include <cctype>
+
+#if REX_PLATFORM_WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 
 #include <filesystem>
 
 REXCVAR_DEFINE_STRING(user_data_root, "", "Runtime", "Override user data path");
 REXCVAR_DEFINE_STRING(update_data_root, "", "Runtime", "Override update data path");
+
+REXCVAR_DEFINE_BOOL(iso_direct, true, "Runtime",
+                    "Allow mounting the game directly from a disc image (.iso). The loose "
+                    "assets folder always takes priority when present; set false to ignore "
+                    "disc images entirely.");
+REXCVAR_DEFINE_STRING(game_iso, "", "Runtime",
+                      "Path to the game's disc image (.iso). Empty = automatic: use the "
+                      "assets folder if present, else scan for a matching .iso next to the "
+                      "executable.");
+
+REXCVAR_DEFINE_BOOL(dlc_containers, true, "Runtime",
+                    "Mount DLC content containers (STFS/LIVE packages) directly from the dlc "
+                    "folder and the content root, no extraction needed. Containers take "
+                    "priority over extracted package folders of the same name.");
+REXCVAR_DEFINE_STRING(dlc_dir, "", "Runtime",
+                      "Override the DLC container folder. Empty = 'dlc' next to the "
+                      "executable.");
 
 REXCVAR_DEFINE_BOOL(use_shader_disk_cache, true, "GPU",
                     "Pre-compile the game's GPU pipelines from a persistent on-disk cache at "
@@ -52,6 +83,138 @@ REXCVAR_DEFINE_BOOL(use_shader_disk_cache, true, "GPU",
 
 namespace rex {
 
+namespace {
+
+// A fatal setup problem the user must fix (missing/wrong game data). The log
+// carries the details; the box exists so a double-clicked exe does not just
+// silently vanish.
+void ShowFatalMessageBox(const std::string& title, const std::string& message) {
+#if REX_PLATFORM_WIN32
+  auto wtitle = rex::string::to_utf16(title);
+  auto wmessage = rex::string::to_utf16(message);
+  MessageBoxW(nullptr, reinterpret_cast<const wchar_t*>(wmessage.c_str()),
+              reinterpret_cast<const wchar_t*>(wtitle.c_str()), MB_OK | MB_ICONERROR);
+#else
+  (void)title;
+  (void)message;
+#endif
+}
+
+// Result of probing a candidate disc image: does it parse as a disc, does it
+// contain a readable default.xex, and which title is it for.
+struct ImageProbe {
+  bool readable = false;
+  uint32_t title_id = 0;
+  std::string reason;
+};
+
+// Reads the title id out of a xex2 image's execution-info optional header.
+// All offsets are validated against the buffer; a malformed header simply
+// fails the probe instead of crashing.
+bool ReadXexTitleId(const std::vector<uint8_t>& buf, uint32_t* out_title_id) {
+  if (buf.size() < sizeof(xex2_header)) {
+    return false;
+  }
+  const auto* header = reinterpret_cast<const xex2_header*>(buf.data());
+  if (header->magic != 0x58455832) {  // 'XEX2'
+    return false;
+  }
+  const uint32_t header_count = header->header_count;
+  if (header_count > 1024 || 0x18 + size_t(header_count) * 8 > buf.size()) {
+    return false;
+  }
+  for (uint32_t i = 0; i < header_count; i++) {
+    const xex2_opt_header& opt = header->headers[i];
+    if (opt.key != XEX_HEADER_EXECUTION_INFO) {
+      continue;
+    }
+    const uint32_t offset = opt.offset;
+    if (offset + sizeof(xex2_opt_execution_info) > buf.size()) {
+      return false;
+    }
+    const auto* info = reinterpret_cast<const xex2_opt_execution_info*>(buf.data() + offset);
+    *out_title_id = info->title_id;
+    return true;
+  }
+  return false;
+}
+
+// Mounts a candidate image standalone (no VFS registration) and reads the
+// title id from its default.xex.
+ImageProbe ProbeGameImage(const std::filesystem::path& path) {
+  ImageProbe probe;
+  rex::filesystem::DiscImageDevice device("", path);
+  if (!device.Initialize()) {
+    probe.reason = "not a readable Xbox 360 disc image (or a damaged dump)";
+    return probe;
+  }
+  auto* entry = device.ResolvePath("default.xex");
+  if (!entry) {
+    probe.reason = "image contains no default.xex";
+    return probe;
+  }
+  rex::filesystem::File* file = nullptr;
+  if (XFAILED(entry->Open(rex::filesystem::FileAccess::kFileReadData, &file)) || !file) {
+    probe.reason = "could not open default.xex inside the image";
+    return probe;
+  }
+  std::vector<uint8_t> buf(std::min<size_t>(entry->size(), 64 * 1024));
+  size_t bytes_read = 0;
+  auto status = file->ReadSync(std::span<uint8_t>(buf.data(), buf.size()), 0, &bytes_read);
+  file->Destroy();
+  if (XFAILED(status) || bytes_read != buf.size()) {
+    probe.reason = "could not read default.xex inside the image";
+    return probe;
+  }
+  uint32_t title_id = 0;
+  if (!ReadXexTitleId(buf, &title_id)) {
+    probe.reason = "default.xex inside the image has no readable title id";
+    return probe;
+  }
+  probe.readable = true;
+  probe.title_id = title_id;
+  return probe;
+}
+
+// Scans a directory (non-recursive) for *.iso files, probes each in name
+// order, and returns the first whose title id matches (any title if
+// expected_title_id is 0). Rejects are logged, not fatal.
+std::filesystem::path ScanForGameImage(const std::filesystem::path& dir,
+                                       uint32_t expected_title_id) {
+  std::vector<std::filesystem::path> candidates;
+  std::error_code ec;
+  for (auto it = std::filesystem::directory_iterator(dir, ec);
+       !ec && it != std::filesystem::directory_iterator(); it.increment(ec)) {
+    if (!it->is_regular_file(ec)) {
+      continue;
+    }
+    auto ext = rex::path_to_utf8(it->path().extension());
+    std::transform(ext.begin(), ext.end(), ext.begin(),
+                   [](unsigned char c) { return char(std::tolower(c)); });
+    if (ext == ".iso") {
+      candidates.push_back(it->path());
+    }
+  }
+  std::sort(candidates.begin(), candidates.end());
+  for (const auto& candidate : candidates) {
+    auto probe = ProbeGameImage(candidate);
+    if (!probe.readable) {
+      REXLOG_INFO("Game source: ignoring {}: {}", rex::path_to_utf8(candidate.filename()),
+                  probe.reason);
+      continue;
+    }
+    if (expected_title_id && probe.title_id != expected_title_id) {
+      REXLOG_INFO("Game source: ignoring {}: title id {:08X} (expected {:08X})",
+                  rex::path_to_utf8(candidate.filename()), probe.title_id, expected_title_id);
+      continue;
+    }
+    return candidate;
+  }
+  return {};
+}
+
+}  // namespace
+
 // --- ReXApp ---
 
 ReXApp::~ReXApp() = default;
@@ -60,6 +223,119 @@ ReXApp::ReXApp(ui::WindowedAppContext& ctx, std::string_view name, PPCImageInfo 
                std::string_view usage)
     : WindowedApp(ctx, name, usage), ppc_info_(ppc_info) {
   AddPositionalOption("game_directory");
+}
+
+bool ReXApp::ResolveGameSource(const std::filesystem::path& exe_dir,
+                               std::filesystem::path& out_image) {
+  out_image.clear();
+  const uint32_t expected_title_id = OnGetExpectedTitleId();
+  const bool iso_direct_enabled = REXCVAR_GET(iso_direct);
+
+  const std::string app_name(GetName());
+  // path_to_utf8 throughout: path::string() converts through the ANSI
+  // codepage on Windows, which garbles non-ASCII file names in the log and
+  // in the (UTF-8-consuming) message box.
+  auto reject_image = [&](const std::filesystem::path& path, const std::string& reason) {
+    REXLOG_ERROR("Game source: rejected image {}: {}", rex::path_to_utf8(path), reason);
+    auto message = fmt::format(
+        "The disc image was rejected:\n\n{}\n\n{}\n\n"
+        "Provide your own legally obtained copy of the game.",
+        rex::path_to_utf8(path), reason);
+    ShowFatalMessageBox(app_name, message);
+    return false;
+  };
+  auto check_expected_title = [&](const ImageProbe& probe, const std::filesystem::path& path,
+                                  std::string& reason_out) {
+    if (!probe.readable) {
+      reason_out = probe.reason;
+      return false;
+    }
+    if (expected_title_id && probe.title_id != expected_title_id) {
+      reason_out = fmt::format("image is for title id {:08X}, this game expects {:08X}",
+                               probe.title_id, expected_title_id);
+      return false;
+    }
+    return true;
+  };
+
+  // The game_directory argument may point straight at a disc image file.
+  if (!game_data_root_.empty() && std::filesystem::is_regular_file(game_data_root_)) {
+    auto image_path = game_data_root_;
+    std::string reason;
+    if (!iso_direct_enabled) {
+      return reject_image(image_path, "iso_direct is disabled in the config");
+    }
+    if (!check_expected_title(ProbeGameImage(image_path), image_path, reason)) {
+      return reject_image(image_path, reason);
+    }
+    game_data_root_.clear();
+    out_image = image_path;
+    REXLOG_INFO("Game source: iso: {}", rex::path_to_utf8(image_path));
+    return true;
+  }
+
+  const bool have_loose = std::filesystem::is_directory(game_data_root_) &&
+                          std::filesystem::exists(game_data_root_ / "default.xex");
+
+  if (iso_direct_enabled) {
+    const std::string iso_cvar = REXCVAR_GET(game_iso);
+    if (!iso_cvar.empty()) {
+      // An explicit config path must be honoured or fail loudly, never
+      // silently fall back. to_path: the toml string is UTF-8, not the ANSI
+      // codepage a bare path construction would assume on Windows.
+      std::filesystem::path image_path = rex::to_path(iso_cvar);
+      std::string reason;
+      if (!std::filesystem::is_regular_file(image_path)) {
+        return reject_image(image_path, "game_iso does not point at a file");
+      }
+      if (!check_expected_title(ProbeGameImage(image_path), image_path, reason)) {
+        return reject_image(image_path, reason);
+      }
+      out_image = image_path;
+    } else {
+      out_image = ScanForGameImage(exe_dir, expected_title_id);
+    }
+  }
+
+  if (have_loose) {
+    // Loose assets are the primary source, exactly as before; an image below
+    // only fills per-file gaps.
+    REXLOG_INFO("Game source: assets: {}",
+                rex::path_to_utf8(std::filesystem::absolute(game_data_root_)));
+    if (!out_image.empty()) {
+      REXLOG_INFO("Game source: iso underlay: {} (loose files override the image)",
+                  rex::path_to_utf8(out_image));
+    }
+    return true;
+  }
+
+  if (!out_image.empty()) {
+    REXLOG_INFO("Game source: iso: {}", rex::path_to_utf8(std::filesystem::absolute(out_image)));
+    std::error_code ec;
+    if (std::filesystem::is_directory(game_data_root_) &&
+        !std::filesystem::is_empty(game_data_root_, ec) && !ec) {
+      // A partial assets folder on top of an image: the modding path.
+      REXLOG_INFO("Game source: loose overlay: {} (loose files override the image)",
+                  rex::path_to_utf8(std::filesystem::absolute(game_data_root_)));
+    } else {
+      game_data_root_.clear();
+    }
+    return true;
+  }
+
+  // Neither an assets folder nor a usable image: name both options clearly.
+  auto assets_hint = game_data_root_.empty() ? (exe_dir / "assets") : game_data_root_;
+  REXLOG_ERROR("Game source: none found - expected game files at {} or a .iso next to {}",
+               rex::path_to_utf8(assets_hint), rex::path_to_utf8(exe_dir));
+  auto message = fmt::format(
+      "No game data was found.\n\n"
+      "Provide your own legally obtained copy of the game in one of two ways:\n\n"
+      "1. Extract the game's files into:\n    {}\n\n"
+      "2. Place the game's disc image (.iso) next to the executable:\n    {}\n\n"
+      "Advanced: set game_iso = \"path/to/image.iso\" in {}.toml.",
+      rex::path_to_utf8(assets_hint), rex::path_to_utf8(exe_dir), app_name);
+  ShowFatalMessageBox(app_name, message);
+  return false;
 }
 
 bool ReXApp::OnInitialize() {
@@ -127,16 +403,25 @@ bool ReXApp::OnInitialize() {
   }
 
   REXLOG_INFO("{} starting", GetName());
-  REXLOG_INFO("  Game directory: {}", game_data_root_.string());
+
+  // Resolve where the game's data comes from. Runs after LoadConfig so the
+  // game_iso / iso_direct toml overrides apply.
+  std::filesystem::path game_image;
+  if (!ResolveGameSource(exe_dir, game_image)) {
+    return false;
+  }
   if (!user_data_root_.empty()) {
-    REXLOG_INFO("  User data:      {}", user_data_root_.string());
+    REXLOG_INFO("  User data:      {}", rex::path_to_utf8(user_data_root_));
   }
   if (!update_data_root_.empty()) {
-    REXLOG_INFO("  Update data:    {}", update_data_root_.string());
+    REXLOG_INFO("  Update data:    {}", rex::path_to_utf8(update_data_root_));
   }
 
   // Create runtime
   runtime_ = std::make_unique<rex::Runtime>(game_data_root_, user_data_root_, update_data_root_);
+  if (!game_image.empty()) {
+    runtime_->set_game_image_path(game_image);
+  }
   runtime_->set_app_context(&app_context());
 
   // Build runtime config with default platform backends
@@ -170,6 +455,15 @@ bool ReXApp::OnInitialize() {
   if (XFAILED(status)) {
     REXLOG_ERROR("Failed to load XEX: {:08X}", status);
     return false;
+  }
+
+  // Discover raw DLC containers now that the title id is known. Logs one
+  // line per package found; extracted folders keep priority.
+  if (REXCVAR_GET(dlc_containers)) {
+    const std::string dlc_dir_cvar = REXCVAR_GET(dlc_dir);
+    const std::filesystem::path dlc_dir =
+        dlc_dir_cvar.empty() ? (exe_dir / "dlc") : rex::to_path(dlc_dir_cvar);
+    runtime_->kernel_state()->content_manager()->DiscoverContainers(dlc_dir);
   }
 
   // Initialize rexcrt heap after LoadXexImage to avoid guest memory writes

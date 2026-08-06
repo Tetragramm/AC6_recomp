@@ -102,6 +102,11 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   /// Override to adjust game/user/update data paths programmatically.
   virtual void OnConfigurePaths(PathConfig& paths) { (void)paths; }
 
+  /// Expected xex title id used to select a disc image when several are
+  /// present (and to reject wrong/corrupt images with a clear message).
+  /// Return 0 to accept any image that contains a readable default.xex.
+  virtual uint32_t OnGetExpectedTitleId() const { return 0; }
+
   // --- Accessors for subclass use ---
   Runtime* runtime() const { return runtime_.get(); }
   ui::Window* window() const { return window_.get(); }
@@ -119,6 +124,12 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   // WindowedApp overrides
   bool OnInitialize() override;
   void OnDestroy() override;
+
+  // Resolves where the game's data comes from: the loose assets directory
+  // (always first), else a user-supplied disc image. On success out_image is
+  // the image to mount below the loose layer (empty = loose only). On failure
+  // a clear, actionable message has been shown and logged.
+  bool ResolveGameSource(const std::filesystem::path& exe_dir, std::filesystem::path& out_image);
 
   // WindowListener overrides
   void OnClosing(ui::UIEvent& e) override;

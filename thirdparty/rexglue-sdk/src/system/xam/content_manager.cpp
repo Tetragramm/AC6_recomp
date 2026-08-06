@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <queue>
@@ -20,6 +21,7 @@
 #include <rex/filesystem.h>
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/filesystem/devices/stfs_container_device.h>
+#include <rex/logging.h>
 #include <rex/string.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/content_device.h>
@@ -60,10 +62,31 @@ ContentPackage::ContentPackage(KernelState* kernel_state, const std::string_view
   content_data_ = data;
 
   auto fs = kernel_state_->file_system();
-  auto device =
-      std::make_unique<rex::filesystem::HostPathDevice>(device_path_, package_path, false);
-  device->Initialize();
-  fs->RegisterDevice(std::move(device));
+  std::error_code ec;
+  if (std::filesystem::is_regular_file(package_path, ec)) {
+    // A raw STFS/LIVE container: mount it directly, no extraction step.
+    is_container_ = true;
+    auto device =
+        std::make_unique<rex::filesystem::StfsContainerDevice>(device_path_, package_path);
+    if (device->Initialize()) {
+      for (size_t i = 0; i < 0x10; i++) {
+        if (device->header().header.licenses[i].license_flags) {
+          container_license_ |= device->header().header.licenses[i].license_bits;
+        }
+      }
+      fs->RegisterDevice(std::move(device));
+      device_mounted_ = true;
+    } else {
+      REXSYS_ERROR("ContentPackage: failed to mount container {}", rex::path_to_utf8(package_path));
+    }
+  } else {
+    // An extracted folder: the historical path, unchanged.
+    auto device =
+        std::make_unique<rex::filesystem::HostPathDevice>(device_path_, package_path, false);
+    device->Initialize();
+    fs->RegisterDevice(std::move(device));
+    device_mounted_ = true;
+  }
   fs->RegisterSymbolicLink(root_name_ + ":", device_path_);
 }
 
@@ -165,7 +188,7 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
   auto file_infos = rex::filesystem::ListFiles(package_root);
   for (const auto& file_info : file_infos) {
     if (file_info.type != rex::filesystem::FileInfo::Type::kDirectory) {
-      // Directories only.
+      // Directories only; raw container files are handled below.
       continue;
     }
 
@@ -184,22 +207,78 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
     }
   }
 
+  // Discovered raw containers take priority over an ambient extracted install
+  // for the same package name - the user placed them next to the exe, so they
+  // win, same rule as the assets folder (and Windows' local-DLL search order).
+  // A container replaces its extracted twin in the listing; unique names
+  // simply append.
+  if (!containers_.empty() && title_id == kernel_state_->title_id()) {
+    for (const auto& [key, container] : containers_) {
+      if (container.content_type != content_type) {
+        continue;
+      }
+      XCONTENT_AGGREGATE_DATA content_data;
+      content_data.device_id = device_id;
+      content_data.content_type = content_type;
+      content_data.set_display_name(container.display_name.empty()
+                                        ? rex::path_to_utf16(container.path.filename())
+                                        : container.display_name);
+      content_data.set_file_name(key.view());
+      content_data.title_id = title_id;
+      content_data.xuid = xuid;
+      auto existing = std::find_if(result.begin(), result.end(), [&](const auto& data) {
+        return rex::string::utf8_equal_case(data.file_name(), key.view());
+      });
+      if (existing != result.end()) {
+        *existing = content_data;
+      } else {
+        result.emplace_back(std::move(content_data));
+      }
+    }
+  }
+
   return result;
+}
+
+const DiscoveredContainer* ContentManager::FindContainer(const std::string_view file_name,
+                                                         XContentType content_type) const {
+  auto it = containers_.find(string::string_key_case(file_name));
+  if (it == containers_.end() || it->second.content_type != content_type) {
+    return nullptr;
+  }
+  return &it->second;
+}
+
+std::filesystem::path ContentManager::ResolvePackageDataPath(uint64_t xuid,
+                                                             const XCONTENT_AGGREGATE_DATA& data) {
+  // A container the user placed (the dlc folder, or dropped into the content
+  // root) takes priority over an ambient extracted install - same rule as the
+  // assets folder and Windows' local-DLL search order.
+  if (const auto* container = FindContainer(data.file_name(), data.content_type)) {
+    return container->path;
+  }
+  // Else the canonical package path - an extracted folder, or a container
+  // file sitting at the package's canonical place in the content root.
+  auto package_path = ResolvePackagePath(xuid, data);
+  std::error_code ec;
+  if (std::filesystem::exists(package_path, ec)) {
+    return package_path;
+  }
+  return {};
 }
 
 std::unique_ptr<ContentPackage> ContentManager::ResolvePackage(
     const std::string_view root_name, uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) {
-  auto package_path = ResolvePackagePath(xuid, data);
-  if (!std::filesystem::exists(package_path)) {
+  auto data_path = ResolvePackageDataPath(xuid, data);
+  if (data_path.empty()) {
     return nullptr;
   }
-  auto package = std::make_unique<ContentPackage>(kernel_state_, root_name, data, package_path);
+  auto package = std::make_unique<ContentPackage>(kernel_state_, root_name, data, data_path);
   return package;
 }
 
 bool ContentManager::ContentExists(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) {
-  auto path = ResolvePackagePath(xuid, data);
-  return std::filesystem::exists(path);
+  return !ResolvePackageDataPath(xuid, data).empty();
 }
 
 X_RESULT ContentManager::WriteContentHeaderFile(uint64_t xuid, XCONTENT_AGGREGATE_DATA data,
@@ -308,12 +387,15 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name, uint64_t 
     }
   }
 
-  auto package_path = ResolvePackagePath(xuid, data);
-  if (!std::filesystem::exists(package_path)) {
+  auto package = ResolvePackage(root_name, xuid, data);
+  if (!package) {
     return X_ERROR_FILE_NOT_FOUND;
   }
-  auto package = ResolvePackage(root_name, xuid, data);
-  assert_not_null(package);
+  if (!package->device_mounted()) {
+    // A corrupt/truncated container must read as "content missing", not as an
+    // empty package that succeeds and then mysteriously has no files.
+    return X_ERROR_FILE_NOT_FOUND;
+  }
   package->LoadPackageLicenseMask(ResolvePackageHeaderPath(
       data.file_name(), xuid, kernel_state_->title_id(), data.content_type));
   content_license = package->GetPackageLicense();
@@ -397,6 +479,18 @@ X_RESULT ContentManager::DeleteContent(uint64_t xuid, const XCONTENT_AGGREGATE_D
     return X_ERROR_ACCESS_DENIED;
   }
 
+  // Never delete a directly-mounted container: it is the user's only copy of
+  // that package, not something this port installed.
+  {
+    std::error_code ec;
+    auto data_path = ResolvePackageDataPath(xuid, data);
+    if (!data_path.empty() && std::filesystem::is_regular_file(data_path, ec)) {
+      REXSYS_WARN("ContentManager: refusing to delete container-backed content {}",
+                  rex::path_to_utf8(data_path));
+      return X_ERROR_ACCESS_DENIED;
+    }
+  }
+
   auto package_path = ResolvePackagePath(xuid, data);
   std::error_code ec;
   auto dir_removed = std::filesystem::remove_all(package_path, ec);
@@ -442,6 +536,17 @@ X_RESULT ContentManager::UnmountAndDeleteContent(uint64_t xuid,
     }
   }
   delete package;
+
+  // Never delete a directly-mounted container (the user's only copy).
+  {
+    std::error_code ec;
+    auto data_path = ResolvePackageDataPath(xuid, data);
+    if (!data_path.empty() && std::filesystem::is_regular_file(data_path, ec)) {
+      REXSYS_WARN("ContentManager: refusing to delete container-backed content {}",
+                  rex::path_to_utf8(data_path));
+      return X_ERROR_ACCESS_DENIED;
+    }
+  }
 
   // Delete phase: remove package directory and .header file
   auto package_path = ResolvePackagePath(xuid, data);
@@ -666,6 +771,135 @@ X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_pat
 
   // Write .header file
   return WriteContentHeaderFile(0, content_data, license_mask);
+}
+
+// Xbox 360 title update content type. Deliberately not mounted: this port
+// statically recompiles the base executable at build time, so a TU's
+// executable delta patch cannot apply and is not needed. Content sets in the
+// wild usually ship one; that is normal and harmless.
+static constexpr uint32_t kTitleUpdateContentType = 0x000B0000;
+
+void ContentManager::DiscoverContainersInDir(const std::filesystem::path& dir, const char* source,
+                                             bool recursive, uint32_t title_id) {
+  std::error_code ec;
+  if (dir.empty() || !std::filesystem::is_directory(dir, ec) || ec) {
+    return;
+  }
+
+  auto handle_file = [&](const std::filesystem::path& path) {
+    auto header = rex::filesystem::StfsContainerDevice::ReadPackageHeader(path);
+    if (!header) {
+      // Not an STFS/LIVE/PIRS container (thumbnails, .header sidecars, ...).
+      REXSYS_DEBUG("ContentManager: ignoring non-container file {}", rex::path_to_utf8(path));
+      return;
+    }
+    const uint32_t container_title = header->metadata.execution_info.title_id;
+    if (container_title != title_id) {
+      REXSYS_DEBUG("ContentManager: ignoring container for another title ({:08X}): {}",
+                   container_title, rex::path_to_utf8(path));
+      return;
+    }
+    const XContentType content_type = header->metadata.content_type;
+    if (uint32_t(content_type) == kTitleUpdateContentType) {
+      REXSYS_DEBUG("ContentManager: title update package present (not used by this port): {}",
+                   rex::path_to_utf8(path.filename()));
+      return;
+    }
+    if (content_type != XContentType::kMarketplaceContent) {
+      REXSYS_DEBUG("ContentManager: ignoring container of content type {:08X}: {}",
+                   uint32_t(content_type), rex::path_to_utf8(path));
+      return;
+    }
+
+    // Key = the file name enumeration hands to the game (42-char field).
+    auto key_name = rex::path_to_utf8(path.filename());
+    if (key_name.size() > 42) {
+      key_name.resize(42);
+    }
+    if (containers_.count(string::string_key_case(key_name))) {
+      REXSYS_DEBUG("ContentManager: duplicate container name {}, keeping the first found",
+                   key_name);
+      return;
+    }
+
+    DiscoveredContainer container;
+    container.path = path;
+    container.content_type = content_type;
+    container.title_id = container_title;
+    container.display_name = header->metadata.display_name(XLanguage::kEnglish);
+    container.source = source;
+    containers_.insert({string::string_key_case::create(key_name), std::move(container)});
+  };
+
+  if (recursive) {
+    for (auto it = std::filesystem::recursive_directory_iterator(
+             dir, std::filesystem::directory_options::skip_permission_denied, ec);
+         !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+      if (it->is_regular_file(ec)) {
+        handle_file(it->path());
+      }
+    }
+  } else {
+    for (auto it = std::filesystem::directory_iterator(
+             dir, std::filesystem::directory_options::skip_permission_denied, ec);
+         !ec && it != std::filesystem::directory_iterator(); it.increment(ec)) {
+      if (it->is_regular_file(ec)) {
+        handle_file(it->path());
+      }
+    }
+  }
+}
+
+void ContentManager::DiscoverContainers(const std::filesystem::path& dlc_dir) {
+  const uint32_t title_id = kernel_state_->title_id();
+  containers_.clear();
+
+  // The dlc folder next to the exe: recursive, so a flat dump, an unzipped
+  // content set, and Xenia's content-directory layout all work unchanged.
+  DiscoverContainersInDir(dlc_dir, "dlc", true, title_id);
+  // Containers dropped straight into the content root's marketplace folder.
+  DiscoverContainersInDir(ResolvePackageRoot(0, XContentType::kMarketplaceContent, title_id),
+                          "content root", false, title_id);
+
+  // Startup report, one line per package: "did my DLC install work?" becomes
+  // a log grep instead of a guess. Containers take priority, so a folder with
+  // a same-named container is the overridden one.
+  size_t folder_count = 0;
+  auto package_root = ResolvePackageRoot(0, XContentType::kMarketplaceContent, title_id);
+  auto file_infos = rex::filesystem::ListFiles(package_root);
+  for (const auto& file_info : file_infos) {
+    if (file_info.type != rex::filesystem::FileInfo::Type::kDirectory) {
+      continue;
+    }
+    auto name = rex::path_to_utf8(file_info.name);
+    std::string display;
+    XCONTENT_AGGREGATE_DATA content_data;
+    if (XSUCCEEDED(ReadContentHeaderFile(name, 0, title_id, XContentType::kMarketplaceContent,
+                                         content_data))) {
+      display = rex::string::to_utf8(content_data.display_name());
+    }
+    const bool overridden =
+        FindContainer(name, XContentType::kMarketplaceContent) != nullptr;
+    REXSYS_INFO("DLC: \"{}\" [{}] - extracted folder{}", display.empty() ? name : display, name,
+                overridden ? " (overridden by a container)" : "");
+    folder_count++;
+  }
+
+  std::vector<const decltype(containers_)::value_type*> sorted_containers;
+  sorted_containers.reserve(containers_.size());
+  for (const auto& entry : containers_) {
+    sorted_containers.push_back(&entry);
+  }
+  std::sort(sorted_containers.begin(), sorted_containers.end(),
+            [](const auto* a, const auto* b) { return a->first.view() < b->first.view(); });
+  for (const auto* entry : sorted_containers) {
+    const auto& container = entry->second;
+    REXSYS_INFO("DLC: \"{}\" [{}] - container ({}): {}",
+                rex::string::to_utf8(container.display_name), entry->first.view(),
+                container.source, rex::path_to_utf8(container.path));
+  }
+  REXSYS_INFO("DLC: {} extracted folder(s), {} container(s) mounted with priority", folder_count,
+              containers_.size());
 }
 
 }  // namespace xam

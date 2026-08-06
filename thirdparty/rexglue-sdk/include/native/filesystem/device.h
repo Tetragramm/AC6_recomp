@@ -24,6 +24,13 @@ class Device {
   const std::string& mount_path() const { return mount_path_; }
   virtual bool is_read_only() const { return true; }
 
+  // Layered mounts: when true, a path that this device fails to resolve falls
+  // through to the next registered device whose mount path also matches
+  // (registration order = priority, so earlier devices win). Default false =
+  // this device is terminal for its mount, exactly the historical behaviour.
+  bool layered() const { return layered_; }
+  void set_layered(bool layered) { layered_ = layered; }
+
   virtual void Dump(string::StringBuffer* string_buffer) = 0;
   virtual Entry* ResolvePath(const std::string_view path) = 0;
 
@@ -39,6 +46,7 @@ class Device {
  protected:
   rex::thread::global_critical_region global_critical_region_;
   std::string mount_path_;
+  bool layered_ = false;
 };
 
 }  // namespace rex::filesystem
