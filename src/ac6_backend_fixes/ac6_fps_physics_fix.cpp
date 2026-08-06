@@ -159,10 +159,27 @@ void BlendFieldDelta(uint8_t* base, uint32_t ea, float pre, double ratio, const 
   }
 }
 
+// Player aircraft chain (static RE): [[[0x826E4E54]+0x29FC4]+0x1008] = player
+// actor (null until spawned); the flight model is the POINTER at actor+4912 -
+// the slot every ground-state writer and the actor's own vtable dispatch
+// load. Used to scope the master-update heartbeat below to the player.
+uint32_t PlayerFlightModel(uint8_t* base) {
+  const uint32_t sys = rex::memory::load_and_swap<uint32_t>(base + 0x826E4E54);
+  if (sys == 0) return 0;
+  const uint32_t mgr = rex::memory::load_and_swap<uint32_t>(base + sys + 0x29FC4);
+  if (mgr == 0) return 0;
+  const uint32_t actor = rex::memory::load_and_swap<uint32_t>(base + mgr + 0x1008);
+  if (actor == 0) return 0;
+  return rex::memory::load_and_swap<uint32_t>(base + actor + 4912);
+}
+
 }  // namespace
 
 PPC_EXTERN_FUNC(__imp__rex_sub_823046A0);  // flight-model force step
 PPC_EXTERN_FUNC(__imp__rex_sub_82329B40);  // flight-model input shaping
+PPC_EXTERN_FUNC(__imp__rex_sub_82305278);  // flight-model alternate (ground) force step
+PPC_EXTERN_FUNC(__imp__rex_sub_82329488);  // derived flight-model master update (vt 0x8200FBC0+60)
+PPC_EXTERN_FUNC(__imp__rex_sub_82306620);  // base flight-model master update (vt 0x8200F2A8+60)
 
 // KB+M context switch (ac6_kbm_input.cpp): the force step is the reliable
 // "flight sim is stepping" heartbeat (runs per frame for every aircraft,
@@ -207,6 +224,77 @@ PPC_FUNC_IMPL(rex_sub_82329B40) {
   static bool s_logged = false;
   BlendFieldDelta(base, self + kTriggerCommandOffset, pre, ratio, "trigger-command(+1456)",
                   s_logged);
+}
+
+// Flight-model alternate force step (0x82305278): the ground variant,
+// dispatched via vtable+156 instead of the main step while the mode word
+// [this+332] has bit 0x40 set - the player actor's ground-contact state
+// (landed / taxiing). The KB+M flight heartbeat must fire from BOTH force
+// steps: on the ground only this one runs, and without it the flight key set
+// suspended while landed (WASD fell through to menu keys, throttle dead on
+// the runway). Pause behavior is preserved: both steps dispatch from the
+// same master update, which halts with the sim, so the pause menu still gets
+// the menu key set exactly as before. A ground 30-vs-60 A/B showed no
+// framerate-dependent taxi acceleration, so unlike the main step this one
+// needs no accumulator blend - the wrapper is a pass-through.
+PPC_FUNC_IMPL(rex_sub_82305278) {
+  PPC_FUNC_PROLOGUE();
+
+  ac6KbmNotifyFlightStep();
+  __imp__rex_sub_82305278(ctx, base);
+}
+
+// Flight-model master updates: run once per frame per aircraft from the actor
+// update (the player driver rex_sub_82233FB0 calls vtable+60 unconditionally)
+// and dispatch the force steps off the mode word inside. There are TWO
+// implementations behind vtable+60 - 0x82306620 in the base-class vtable
+// (0x8200F2A8, force steps by ADDRESS in its slots) and 0x82329488 in the
+// derived vtable (0x8200FBC0, force steps behind thunks); field logs showed
+// the player's aircraft dispatching the BASE one, so both are wrapped
+// identically for standstill KB+M coverage: a PARKED aircraft is deactivated
+// (mode bit 0x80, cleared only once rolling) and steps neither force step, so
+// the flight heartbeat must come from here. PLAYER-scoped: the chain is null
+// outside a spawned player, so AI and front-end objects can never hold the
+// flight context open. Pause safety is field-proven: pausing mid-flight halts
+// the force-step heartbeat, and in flight the mode word has neither skip bit
+// set, so if this update kept running while paused it would dispatch the main
+// step and the heartbeat would never halt - it does, so it halts with the
+// sim. Like the rest of this file, none of it is gated on the physics fix:
+// with the unlock off the wrappers are pass-throughs that still notify.
+static void MasterUpdateEnter(uint8_t* base, uint32_t self) {
+  if (self != 0 && self == PlayerFlightModel(base)) {
+    ac6KbmNotifyFlightStep();
+  }
+}
+
+PPC_FUNC_IMPL(rex_sub_82329488) {
+  PPC_FUNC_PROLOGUE();
+
+  MasterUpdateEnter(base, ctx.r3.u32);
+  __imp__rex_sub_82329488(ctx, base);
+}
+
+PPC_FUNC_IMPL(rex_sub_82306620) {
+  PPC_FUNC_PROLOGUE();
+
+  MasterUpdateEnter(base, ctx.r3.u32);
+  __imp__rex_sub_82306620(ctx, base);
+}
+
+PPC_EXTERN_FUNC(__imp__rex_sub_82233208);  // player-actor ground-state maintainer
+
+// Belt-and-braces standstill heartbeat: rex_sub_82233208 maintains the ground
+// state (sets/clears mode bit 0x40) and is bl-called from the player-actor
+// physics driver right after the master update, so the strong override
+// capture is direct-call-guaranteed even if some third vtable dispatches yet
+// another master-update variant. It only exists on the player actor (sole
+// call site is the player driver rex_sub_82233FB0), so no scoping check is
+// needed, and it halts with the sim like the rest of the driver chain.
+PPC_FUNC_IMPL(rex_sub_82233208) {
+  PPC_FUNC_PROLOGUE();
+
+  ac6KbmNotifyFlightStep();
+  __imp__rex_sub_82233208(ctx, base);
 }
 
 // Mid-asm hook (registered in ac6recomp_config.toml at 0x82304F40, the

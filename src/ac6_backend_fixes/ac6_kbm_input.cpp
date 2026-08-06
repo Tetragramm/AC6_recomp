@@ -1241,11 +1241,15 @@ PPC_FUNC_IMPL(rex_sub_82390CE0) {
   }
 }
 
-// Primary flight heartbeat, called from the fps-physics force-step wrapper
-// (rex_sub_823046A0 in ac6_fps_physics_fix.cpp) - proven to run per frame for
-// every aircraft in a mission and to halt when the sim halts. The sampler
-// hook below turned out to be control-mode dependent (never fired in the
-// M2 round-1 field test), so it stays only as a secondary signal.
+// Primary flight heartbeat, called from the fps-physics wrappers in
+// ac6_fps_physics_fix.cpp: the main force step rex_sub_823046A0 (airborne),
+// the alternate step rex_sub_82305278 (rolling on the ground, mode bit 0x40),
+// and - player-scoped - the master updates plus the ground-state maintainer,
+// which still tick at a full standstill where the deactivated model (bit
+// 0x80) steps neither. All of them halt when the sim halts, so menus and
+// pause still fall back to the menu key set. The sampler hook below turned
+// out to be control-mode dependent (never fired in the M2 round-1 field
+// test), so it stays only as a secondary signal.
 void ac6KbmNotifyFlightStep() {
   g_last_flight_ms.store(NowMs(), std::memory_order_relaxed);
 }
