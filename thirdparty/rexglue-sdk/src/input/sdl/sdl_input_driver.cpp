@@ -10,6 +10,7 @@
  */
 
 #include <array>
+#include <atomic>
 #include <filesystem>
 
 #include <rex/assert.h>
@@ -24,6 +25,22 @@ REXCVAR_DEFINE_STRING(hid_mappings_file, "gamecontrollerdb.txt", "Input",
                       "Path to SDL gamecontroller mappings file");
 
 namespace rex::input::sdl {
+
+namespace {
+// Gamepad events whose instance id is not in our controller table are expected
+// around hot-plug: the device failed to open, or was opened and immediately
+// closed for lack of a free slot while SDL had already buffered events for it.
+// Dropping such an event is always safe. Log a few so field reports name the
+// instance id, without per-event spam.
+void WarnOrphanEvent(const char* handler, SDL_JoystickID instance_id) {
+  static std::atomic<uint32_t> dropped{0};
+  const uint32_t n = dropped.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (n <= 4 || (n & 0xFF) == 0) {
+    REXLOG_WARN("SDL {}: dropped event for unknown gamepad instance {} ({} dropped so far).",
+                handler, instance_id, n);
+  }
+}
+}  // namespace
 
 SDLInputDriver::SDLInputDriver(rex::ui::Window* window, size_t window_z_order)
     : InputDriver(window, window_z_order),
@@ -437,7 +454,11 @@ void SDLInputDriver::OnControllerDeviceAddedLocked(const SDL_Event& event) {
   // Open the controller.
   const auto controller = SDL_OpenGamepad(event.cdevice.which);
   if (!controller) {
-    assert_always();
+    // Transient open failures are real on hot-plug (e.g. a Bluetooth pad that
+    // reconnects before the stack has settled). The device is simply not
+    // added; it gets a fresh chance on its next SDL_EVENT_GAMEPAD_ADDED.
+    REXLOG_WARN("SDL OnControllerDeviceAdded: SDL_OpenGamepad failed for device {}: {}",
+                event.cdevice.which, SDL_GetError());
     return;
   }
   REXLOG_INFO(
@@ -501,7 +522,10 @@ void SDLInputDriver::OnControllerDeviceRemovedLocked(const SDL_Event& event) {
 
 void SDLInputDriver::OnControllerDeviceAxisMotionLocked(const SDL_Event& event) {
   auto idx = GetControllerIndexFromInstanceID(event.gaxis.which);
-  assert(idx);
+  if (!idx) {
+    WarnOrphanEvent("OnControllerDeviceAxisMotion", event.gaxis.which);
+    return;
+  }
   auto& pad = controllers_.at(*idx).state.gamepad;
   switch (event.gaxis.axis) {
     case SDL_GAMEPAD_AXIS_LEFTX:
@@ -523,8 +547,9 @@ void SDLInputDriver::OnControllerDeviceAxisMotionLocked(const SDL_Event& event) 
       pad.right_trigger = static_cast<uint8_t>(event.gaxis.value >> 7);
       break;
     default:
-      assert_always();
-      break;
+      // A newer SDL version may have added new axes.
+      REXLOG_INFO("SDL HID: Unknown axis was moved: {}.", event.gaxis.axis);
+      return;
   }
   controllers_.at(*idx).state_changed = true;
 }
@@ -566,7 +591,10 @@ void SDLInputDriver::OnControllerDeviceButtonChangedLocked(const SDL_Event& even
   static_assert(SDL_GAMEPAD_BUTTON_DPAD_RIGHT == 14);
 
   auto idx = GetControllerIndexFromInstanceID(event.gdevice.which);
-  assert(idx);
+  if (!idx) {
+    WarnOrphanEvent("OnControllerDeviceButtonChanged", event.gdevice.which);
+    return;
+  }
   auto& controller = controllers_.at(*idx);
 
   uint16_t xbuttons = controller.state.gamepad.buttons;
