@@ -83,6 +83,15 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
 
   // --- Virtual hooks for customization ---
 
+  /// Called right after the config file (cvars) was loaded - or would have
+  /// been, when none exists - and before ANYTHING consumes cvar values
+  /// (logging setup, game source resolution, runtime/graphics setup, window
+  /// creation all come later). This is the place for app-level config
+  /// presets and session defaults (rex::cvar::SetSessionDefault): here they
+  /// see the user's real config values, unlike the app-create path, which
+  /// runs before the config file is parsed.
+  virtual void OnConfigLoaded() {}
+
   /// Called before Runtime::Setup(). Override to modify backend config.
   virtual void OnPreSetup(RuntimeConfig& config) {}
 

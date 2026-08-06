@@ -28,41 +28,22 @@ REXCVAR_DEFINE_BOOL(ac6_unlock_fps, true, "AC6",
 REXCVAR_DEFINE_BOOL(ac6_cutscene_clamp, true, "AC6",
                     "Suspend the 60fps unlock during in-engine cutscenes so they "
                     "play at native ~30fps instead of double speed");
-REXCVAR_DEFINE_BOOL(ac6_dynamic_vblank, true, "AC6",
-                    "With the FPS unlock active, pace frame-locked content (menus, "
-                    "cutscenes, pause) at the native 60Hz guest vblank while gameplay "
-                    "free-runs at the configured rate. Gameplay is detected via the "
-                    "world-compositor draw heartbeat; cutscenes via the cinematic "
-                    "hooks.");
-REXCVAR_DEFINE_DOUBLE(ac6_fps_target, 60.0, "AC6",
-                      "The rate the simulation + presentation run at under the FPS unlock. "
-                      ">0 = that exact rate (clamped to 30..ac6_max_sim_fps). "
-                      "0 = AUTO: the largest rate <= ac6_max_sim_fps that evenly divides your "
-                      "monitor's refresh, so frames land on refresh boundaries instead of "
-                      "beating against them (240Hz->60, 144Hz->48, 120Hz->60, 60Hz->60). "
-                      "Pick a target that divides your refresh; auto does this for you. "
-                      "Mirrors PA's native PC engine, which has no separate cap and simply "
-                      "runs the (dt-correct) sim at the display rate.");
-REXCVAR_DEFINE_DOUBLE(ac6_max_sim_fps, 60.0, "AC6",
-                      "Ceiling on the simulation/pacing rate. AC6's physics is only validated "
-                      "to 60fps; above it, fixed-step assumptions surface (untested regime). "
-                      "Both ac6_fps_target and the auto (refresh-matched) target are clamped to "
-                      "this. Raise only once the >60 regime has been validated.");
-REXCVAR_DEFINE_BOOL(ac6_dt_snap, true, "AC6",
-                    "With the FPS unlock active, snap the per-frame simulation delta to the "
-                    "EXACT pacing target when the real frame time is within ~1ms of it, so "
-                    "the fixed-step integrator sees a constant step. Removes the residual "
-                    "per-frame delta jitter that a fixed-step sim turns into visible shake; "
-                    "genuine slowdowns fall through to the precision path.");
-REXCVAR_DEFINE_DOUBLE(ac6_min_sim_fps, 20.0, "AC6",
-                      "Lowest framerate the simulation runs at true speed before the "
-                      "game's frame-delta clamp forces slow motion. The stock game floors "
-                      "at 30 (below 30fps it plays in slow motion); this lowers the floor "
-                      "(default 20) so a sub-30fps dip runs at correct speed - just "
-                      "choppier - instead of slowing down and rubber-banding on recovery. "
-                      "Set 30 for stock behavior. Active with the FPS unlock; drives the "
-                      "frame-delta clamp and the physics step cap together so dynamics "
-                      "stay consistent with the kinematics.");
+REXCVAR_DEFINE_BOOL(ac6_dynamic_vblank, true, "AC6/Enhancements",
+                    "Pace menus and cutscenes at the native 60Hz vblank while "
+                    "gameplay runs at the target rate.");
+REXCVAR_DEFINE_DOUBLE(ac6_fps_target, 60.0, "AC6/Enhancements",
+                      "Target framerate under the FPS unlock. 0 = auto: the highest "
+                      "rate up to ac6_max_sim_fps that evenly divides your monitor's "
+                      "refresh rate.");
+REXCVAR_DEFINE_DOUBLE(ac6_max_sim_fps, 60.0, "AC6/Enhancements",
+                      "Ceiling on the simulation rate. The game's physics is only "
+                      "validated to 60fps; raise only for testing.");
+REXCVAR_DEFINE_BOOL(ac6_dt_snap, true, "AC6/Enhancements",
+                    "Snap the simulation step to the pacing target when within ~1ms "
+                    "of it, removing residual micro-stutter and shake.");
+REXCVAR_DEFINE_DOUBLE(ac6_min_sim_fps, 20.0, "AC6/Enhancements",
+                      "Lowest framerate the game runs at true speed before slow "
+                      "motion kicks in. Stock behaviour is 30.");
 
 using Clock = std::chrono::steady_clock;
 

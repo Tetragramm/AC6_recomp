@@ -379,6 +379,10 @@ bool ReXApp::OnInitialize() {
     rex::cvar::LoadConfig(config_path);
   }
 
+  // App-level config presets / session defaults: cvars hold their final
+  // user-config values and nothing has consumed them yet.
+  OnConfigLoaded();
+
   // Logging setup from CVARs
   std::string log_file_cvar = REXCVAR_GET(log_file);
   std::string log_level_str = REXCVAR_GET(log_level);

@@ -67,14 +67,17 @@
 #include <windows.h>
 #endif
 
-REXCVAR_DEFINE_BOOL(ac6_kbm_enabled, false, "AC6/KBM",
-                    "Enable keyboard+mouse input (default off; set true in ac6recomp.toml)");
-REXCVAR_DEFINE_BOOL(ac6_kbm_log, false, "AC6/KBM",
-                    "Log KBM diagnostics to the game log (info level)");
-REXCVAR_DEFINE_STRING(ac6_kbm_config, "ac6_input.toml", "AC6/KBM",
-                      "Path to the keyboard+mouse binding config");
-REXCVAR_DEFINE_BOOL(ac6_kbm_padless, true, "AC6/KBM",
-                    "Present a synthetic pad on slot 0 when no controller is connected");
+REXCVAR_DEFINE_BOOL(ac6_kbm_enabled, false, "AC6/Enhancements",
+                    "Enable keyboard and mouse controls.");
+REXCVAR_DEFINE_BOOL(ac6_kbm_log, false, "AC6/Enhancements",
+                    "Log keyboard and mouse input diagnostics.")
+    .debug_only();
+REXCVAR_DEFINE_STRING(ac6_kbm_config, "ac6_input.toml", "AC6/Enhancements",
+                      "Path to the keyboard and mouse bindings file. Edits to the "
+                      "file are picked up live.");
+REXCVAR_DEFINE_BOOL(ac6_kbm_padless, true, "AC6/Enhancements",
+                    "Provide a virtual controller when none is connected, so "
+                    "keyboard and mouse work on their own.");
 
 // The SDK's own mnk virtual-pad driver (input/mnk) - forced off while our
 // KB+M is enabled so two keyboard mappers never fight over the same pad.

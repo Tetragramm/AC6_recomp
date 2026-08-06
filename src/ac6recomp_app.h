@@ -20,6 +20,11 @@
 
 REXCVAR_DECLARE(std::string, ac6_graphics_backend);
 
+// Defined in main.cpp: the config preset suite (session defaults + fix
+// payload expansion) and its post-logging summary lines.
+void ApplyAc6ConfigPresets();
+void LogAc6ConfigPresetSummary();
+
 class Ac6recompApp : public rex::ReXApp {
  public:
   using rex::ReXApp::ReXApp;
@@ -40,9 +45,15 @@ class Ac6recompApp : public rex::ReXApp {
   // and rejects wrong/corrupt images with a clear message.
   uint32_t OnGetExpectedTitleId() const override { return 0x4E4D07D1; }
 
+  // Runs right after the toml is parsed and before anything consumes cvars:
+  // the one place presets can both see the user's real values and still act
+  // before logging/window/graphics read the results.
+  void OnConfigLoaded() override { ApplyAc6ConfigPresets(); }
+
   void OnPreSetup(rex::RuntimeConfig& config) override {
     REXLOG_INFO("Ac6recompApp::OnPreSetup");
     rex::ReXApp::OnPreSetup(config);
+    LogAc6ConfigPresetSummary();
 
     const std::string requested_backend = REXCVAR_GET(ac6_graphics_backend);
 #if REX_HAS_VULKAN

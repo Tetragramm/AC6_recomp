@@ -67,13 +67,9 @@
 #include <rex/ppc.h>
 
 REXCVAR_DEFINE_BOOL(
-    ac6_effect_mode_fix, false, "AC6",
-    "Fix the one-frame effects/clouds flicker under host CPU pressure. The effect update "
-    "and the effect draw are two async worker jobs sharing one vtable slot, told apart only "
-    "by a plain-store mode word with no per-job copy; when a host stall lets the second "
-    "submit's write land first, both jobs draw and the effect + cloud passes are emitted "
-    "twice. This snapshots the mode at submit and dispatches from the snapshot. Off by "
-    "default.");
+    ac6_effect_mode_fix, false, "AC6/Fixes",
+    "Fix the one-frame effects/clouds flicker under heavy CPU load by "
+    "snapshotting the effect job mode at submit. Off by default.");
 
 // Dispatch targets, called directly. NOT via PPC_CALL_INDIRECT_FUNC: that macro
 // degrades to __builtin_debugtrap() unless ppc_config.h was included first,

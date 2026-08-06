@@ -164,10 +164,21 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
 
   auto& registry = rex::cvar::GetRegistry();
 
-  // Collect sorted unique category paths.
+  // Debug-only cvars (diagnostics, one-shot investigation switches) are
+  // hidden unless the developer toggle is on; they stay settable from the
+  // config file and the console.
+  auto entry_visible = [&](const rex::cvar::FlagEntry& entry) -> bool {
+    return show_developer_ || !entry.is_debug_only;
+  };
+
+  // Collect sorted unique category paths (of visible entries only, so a
+  // category that holds nothing but developer cvars does not show an empty
+  // page).
   std::set<std::string> category_set;
   for (auto& entry : registry) {
-    category_set.insert(entry.category);
+    if (entry_visible(entry)) {
+      category_set.insert(entry.category);
+    }
   }
 
   // Build tree: for each category path like "Input/Keybinds/Controller",
@@ -296,6 +307,9 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
 
   ImGui::BeginChild("##cvars", ImVec2(0, -30.0f), false);
   for (auto& entry : registry) {
+    if (!entry_visible(entry)) {
+      continue;
+    }
     // Filter by category (unless searching).
     if (!searching) {
       if (!category_matches(entry.category)) {
@@ -386,7 +400,10 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
         }
         ImGui::SameLine();
         if (ImGui::SmallButton("Reset##v")) {
-          rex::cvar::SetFlagByName(entry.name, entry.default_value);
+          // ResetToDefault, not SetFlagByName: reset means "back to stock,
+          // forget my choice" - the flag stops being user-owned and the next
+          // save drops it from the config.
+          rex::cvar::ResetToDefault(entry.name);
         }
       }
 
@@ -419,7 +436,7 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
     } else {
       // Non-keybind CVARs: colored label on left, value widget on right
       ImGui::TextColored(LifecycleColor(entry.lifecycle), "%-20s", entry.name.c_str());
-      if (ImGui::IsItemHovered()) {
+      if (ImGui::IsItemHovered() && ImGui::BeginTooltip()) {
         const char* lifecycle_label = "";
         switch (entry.lifecycle) {
           case rex::cvar::Lifecycle::kHotReload:
@@ -432,11 +449,24 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
             lifecycle_label = "Read-only - set at initialization only";
             break;
         }
+        // Wrap: without a wrap position a long description renders as one
+        // screen-wide line.
+        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 28.0f);
         if (!entry.description.empty()) {
-          ImGui::SetTooltip("%s\n[%s]", entry.description.c_str(), lifecycle_label);
-        } else {
-          ImGui::SetTooltip("[%s]", lifecycle_label);
+          ImGui::TextUnformatted(entry.description.c_str());
         }
+        ImGui::TextDisabled("[%s]", lifecycle_label);
+        if (entry.has_session_default && !entry.session_driver.empty()) {
+          if (entry.user_set) {
+            ImGui::TextDisabled("Default '%s' comes from %s; your setting overrides it.",
+                                entry.session_default.c_str(), entry.session_driver.c_str());
+          } else {
+            ImGui::TextDisabled("Set to '%s' by %s.", entry.session_default.c_str(),
+                                entry.session_driver.c_str());
+          }
+        }
+        ImGui::PopTextWrapPos();
+        ImGui::EndTooltip();
       }
       ImGui::SameLine(240.0f);
 
@@ -497,6 +527,18 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
           rex::cvar::SetFlagByName(entry.name, buf);
         }
       }
+
+      // A cvar driven by another cvar (fix master switch, performance mode)
+      // says so inline, so a user editing it can tell where the value came
+      // from and what wins.
+      if (entry.has_session_default && !entry.session_driver.empty()) {
+        ImGui::SameLine();
+        if (entry.user_set) {
+          ImGui::TextDisabled("(overrides %s)", entry.session_driver.c_str());
+        } else {
+          ImGui::TextDisabled("(set by %s)", entry.session_driver.c_str());
+        }
+      }
     }
 
     if (read_only)
@@ -506,13 +548,15 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
   }
   ImGui::EndChild();
 
-  // Bottom bar: Save button.
+  // Bottom bar: Save button + developer toggle.
   ImGui::Separator();
   if (ImGui::Button("Save to config")) {
     rex::cvar::SaveConfig(config_path_);
   }
   ImGui::SameLine();
   ImGui::TextDisabled("(%s)", config_path_.filename().string().c_str());
+  ImGui::SameLine();
+  ImGui::Checkbox("Show developer settings", &show_developer_);
 
   ImGui::End();
 }

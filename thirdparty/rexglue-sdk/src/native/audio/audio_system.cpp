@@ -19,53 +19,24 @@ REXCVAR_DEFINE_BOOL(audio_trace_render_driver_verbose, false, "Audio",
                     "Trace render-driver activity");
 REXCVAR_DEFINE_BOOL(audio_deep_trace, false, "Audio",
                     "Enable verbose runtime audio tracing");
-REXCVAR_DEFINE_BOOL(audio_xma_loop_guard, true, "Audio",
-                    "Require a real loop window (loop_start < loop_end, "
-                    "read_offset >= loop_end) before engaging XMA loop "
-                    "handling, as in current Xenia master (PR #1808, debugged "
-                    "on Ace Combat 6). Off: legacy behavior, where streamed "
-                    "voices carrying degenerate loop metadata (loop_count="
-                    "0xff, loop_start == loop_end == 0) re-fire the loop "
-                    "machinery on every input buffer swap, truncating/"
-                    "skipping subframes of the stream (confirmed firing on "
-                    "AC6 cutscene streams via the deep-trace counter).");
-REXCVAR_DEFINE_BOOL(audio_xma_header_straddle_fix, true, "Audio",
-                    "Decode XMA frames whose 15-bit frame header straddles a "
-                    "2 KiB packet boundary. The frame walk treated "
-                    "fewer-than-15 remaining bits as end-of-chain, but the "
-                    "straddled frame is real: the encoder's own seek ledger "
-                    "confirms it on every occurrence (its size field, read "
-                    "across the boundary, equals the next packet's "
-                    "first-frame offset minus the packet header). Without "
-                    "this, one whole 512-sample frame is silently dropped per "
-                    "occurrence, so the parallel streams of a multi-stream "
-                    "voice drift apart in 512-sample steps and the premix "
-                    "combs on the stereo fold - the long-reported doubled/"
-                    "robotic cutscene dialogue. Off restores the legacy "
-                    "walk for A/B.");
-REXCVAR_DEFINE_BOOL(audio_xma_loop_end_guard, true, "Audio",
-                    "Apply the degenerate-loop guard (see "
-                    "audio_xma_loop_guard) to the loop-end frame test as "
-                    "well. That test is evaluated before the loop-status "
-                    "update, so the guard there never reaches it: with "
-                    "loop_count > 0 and loop_start >= loop_end (metadata "
-                    "AC6's streamed voices carry), the clamped loop_end "
-                    "equals a voice's starting read offset for the stream "
-                    "that begins at packet 0, arming the frame output limit "
-                    "and silently discarding 384 samples of that stream's "
-                    "first frame - permanently offsetting one context of a "
-                    "multi-stream voice from its siblings. Off restores the "
-                    "legacy behavior for A/B.");
-REXCVAR_DEFINE_BOOL(audio_xma_preserve_timeline, true, "Audio",
-                    "When the XMA decoder backend rejects a damaged frame, emit that "
-                    "frame's worth of silence instead of dropping it. The input read "
-                    "offset advances past the frame either way, so dropping the output "
-                    "silently shortens the stream's timeline by 512 samples per damaged "
-                    "frame - which would permanently desynchronize multi-stream sources "
-                    "(5.1 premixes carried as parallel stereo streams, e.g. AC6's "
-                    "cutscene mixes). Robustness fix - no in-game trigger is known in "
-                    "AC6 (instrumented runs decode every frame). On by default; off "
-                    "restores the legacy drop behavior.");
+// The four audio_xma_* guards below are correctness fixes debugged on Ace
+// Combat 6 (details in the commits introducing each). All default on; off
+// restores the legacy behaviour for A/B comparison.
+REXCVAR_DEFINE_BOOL(audio_xma_loop_guard, true, "AC6/Fixes",
+                    "Guard XMA looping against degenerate loop metadata that "
+                    "truncates streamed voices. Off = legacy behaviour for A/B.");
+REXCVAR_DEFINE_BOOL(audio_xma_header_straddle_fix, true, "AC6/Fixes",
+                    "Decode XMA frames whose header straddles a packet boundary. "
+                    "Off = legacy walk, which drops a frame per occurrence and "
+                    "combs multi-stream cutscene dialogue.");
+REXCVAR_DEFINE_BOOL(audio_xma_loop_end_guard, true, "AC6/Fixes",
+                    "Apply the degenerate-loop guard to the loop-end frame test "
+                    "too, keeping multi-stream voices aligned from their first "
+                    "frame. Off = legacy behaviour for A/B.");
+REXCVAR_DEFINE_BOOL(audio_xma_preserve_timeline, true, "AC6/Fixes",
+                    "Emit silence for XMA frames the decoder rejects instead of "
+                    "dropping them, preserving multi-stream timing. Off = legacy "
+                    "drop behaviour.");
 
 namespace rex::audio {
 

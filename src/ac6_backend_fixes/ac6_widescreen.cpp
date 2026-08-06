@@ -50,29 +50,12 @@
 #include "../render_hooks.h"
 #include "ac6_widescreen.h"
 
-REXCVAR_DEFINE_BOOL(ac6_widescreen, false, "AC6",
-                    "Arbitrary aspect ratio (hor+), in-mission only. The target aspect "
-                    "is derived from the actual window size (re-checked continuously; "
-                    "a live resize adapts). While the game's mode task is the mission "
-                    "(gameplay, in-engine cutscenes, pause), cameras are patched from "
-                    "16:9 to the window aspect, the presenter fills the window, and "
-                    "the 2D layer is pre-squeezed at draw time for a crisp 16:9 HUD "
-                    "(the game-placed target-marker shader stays full-width by design; "
-                    "its art is squared by narrowing the geometry). Everywhere else "
-                    "(menus, hangar, briefing, FMV, attract) and at 16:9-or-narrower "
-                    "windows, cameras stay 16:9 and the presentation letterboxes - "
-                    "vanilla. While enabled the feature drives the presenter's "
-                    "letterbox decision itself; it never writes the present_letterbox "
-                    "cvar, so nothing leaks into a saved config.");
-REXCVAR_DEFINE_BOOL(ac6_widescreen_cinematics, true, "AC6",
-                    "With ac6_widescreen: render in-engine cinematics wide too, even "
-                    "outside the mission mode task (detected via the demo-manager "
-                    "cinematic signal, the same one the cutscene frame-rate clamp "
-                    "uses - so ac6_cutscene_clamp=false disables this detection). "
-                    "Cinematics are staged and framed for 16:9, so widening can "
-                    "expose things outside that frame (set edges, actors popping in "
-                    "at the frustum border). Off = cinematics letterbox at 16:9 "
-                    "as staged.");
+REXCVAR_DEFINE_BOOL(ac6_widescreen, false, "AC6/Enhancements",
+                    "Ultrawide support (hor+), in missions only. The aspect follows "
+                    "the window size; menus and the front end stay vanilla 16:9.");
+REXCVAR_DEFINE_BOOL(ac6_widescreen_cinematics, true, "AC6/Enhancements",
+                    "With ultrawide on, render in-engine cinematics wide too. They "
+                    "are staged for 16:9, so widening can expose set edges.");
 // Read (never written) only to report it in the activation log.
 REXCVAR_DECLARE(bool, present_letterbox);
 

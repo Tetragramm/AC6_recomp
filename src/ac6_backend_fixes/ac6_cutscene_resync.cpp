@@ -36,23 +36,13 @@
 #include <rex/ppc.h>
 #include <rex/system/kernel_state.h>
 
-REXCVAR_DEFINE_BOOL(ac6_cutscene_resync, true, "AC6",
-                    "Keep in-engine cutscene video locked to its audio. Audio "
-                    "is the master clock and is never altered; after a render "
-                    "hitch (or under sustained slow rendering) the cutscene "
-                    "timeline catches up by running extra sequencer ticks - a "
-                    "bounded frame-skip, like every film player's audio-master "
-                    "sync. No effect on normal full-speed playback (catch-up "
-                    "engages only past 2 ticks of drift; verified extras=0 in "
-                    "steady state, injected-hitch recovery in 3 frames, and "
-                    "sustained 14fps @ 5x draw scale staying locked).");
-REXCVAR_DEFINE_INT32(ac6_cutscene_resync_max_ticks, 3, "AC6",
-                     "Max extra cutscene sequencer ticks per rendered frame "
-                     "while catching up (ac6_cutscene_resync). Also sets the "
-                     "slowest sustained render rate that stays in sync: N "
-                     "extras holds sync down to 30/(1+N) fps (3 -> 7.5 fps). "
-                     "Low = gentle brief fast-forward after a stall; 0 = "
-                     "uncapped, one hard jump-cut.");
+REXCVAR_DEFINE_BOOL(ac6_cutscene_resync, true, "AC6/Fixes",
+                    "Keep cutscene video locked to its audio after render hitches "
+                    "by letting the timeline catch up (a bounded frame-skip).");
+REXCVAR_DEFINE_INT32(ac6_cutscene_resync_max_ticks, 3, "AC6/Fixes",
+                     "Max catch-up cutscene sequencer ticks per rendered frame "
+                     "during resync. 0 = uncapped (one hard jump-cut).")
+    .debug_only();
 
 PPC_EXTERN_FUNC(__imp__rex_sub_82184460);  // CAce6DemoManager::Exec ("DD")
 PPC_EXTERN_FUNC(__imp__rex_sub_821856F8);  // CX360DemoManagerEM::Exec ("EM")

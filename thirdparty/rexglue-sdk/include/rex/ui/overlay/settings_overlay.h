@@ -30,6 +30,9 @@ class SettingsDialog : public ImGuiDialog {
 
  private:
   bool visible_ = false;
+  // Show debug-only cvars (diagnostics, investigation switches). Off by
+  // default so players see the curated surface; toggled in the bottom bar.
+  bool show_developer_ = false;
   std::filesystem::path config_path_;
   char search_buf_[128] = {};
   std::string selected_category_;

@@ -276,6 +276,11 @@ TEST_CASE("cvar ListFlagsByLifecycle", "[cvar]") {
 }
 
 TEST_CASE("cvar reset and diff utilities", "[cvar]") {
+  // ResetToDefault honors a session default when one is in force; start from
+  // a clean slate so a session default left by another test case (random
+  // execution order) cannot change what "default" means here.
+  rex::cvar::testing::ResetAllForTesting();
+
   SECTION("HasNonDefaultValue detects changes") {
     REXCVAR_SET(test_int32_flag, 42);  // Reset to default
     CHECK_FALSE(rex::cvar::HasNonDefaultValue("test_int32_flag"));
@@ -316,20 +321,157 @@ TEST_CASE("cvar testing utilities", "[cvar]") {
   }
 }
 
-TEST_CASE("cvar TOML serialization", "[cvar]") {
+TEST_CASE("cvar TOML serialization persists user-set flags only", "[cvar]") {
   rex::cvar::testing::ResetAllForTesting();
 
-  REXCVAR_SET(test_int32_flag, 999);
-  REXCVAR_SET(test_string_flag, "custom");
+  // User-intent path (config load / console / settings UI): persisted.
+  REQUIRE(rex::cvar::SetFlagByName("test_int32_flag", "999"));
+  REQUIRE(rex::cvar::SetFlagByName("test_string_flag", "custom"));
+
+  // Code write (REXCVAR_SET): session state, never persisted.
+  REXCVAR_SET(test_bool_flag, true);
 
   auto toml = rex::cvar::SerializeToTOML();
 
-  // Should contain modified flags
   CHECK(toml.find("test_int32_flag = 999") != std::string::npos);
   CHECK(toml.find("test_string_flag = \"custom\"") != std::string::npos);
-
-  // Should not contain flags at default
   CHECK(toml.find("test_bool_flag") == std::string::npos);
+
+  SECTION("a user-set flag persists even at its default value") {
+    REQUIRE(rex::cvar::SetFlagByName("test_int32_flag", "42"));  // == default
+    auto toml2 = rex::cvar::SerializeToTOML();
+    CHECK(toml2.find("test_int32_flag = 42") != std::string::npos);
+  }
+}
+
+TEST_CASE("cvar user-set tracking", "[cvar]") {
+  rex::cvar::testing::ResetAllForTesting();
+
+  SECTION("IsUserSet reflects how the value was set") {
+    CHECK_FALSE(rex::cvar::IsUserSet("test_int32_flag"));
+
+    REXCVAR_SET(test_int32_flag, 7);
+    CHECK_FALSE(rex::cvar::IsUserSet("test_int32_flag"));
+
+    REQUIRE(rex::cvar::SetFlagByName("test_int32_flag", "8"));
+    CHECK(rex::cvar::IsUserSet("test_int32_flag"));
+  }
+
+  SECTION("LoadConfig marks flags user-set; save round-trips exactly the file") {
+    auto config_path = std::filesystem::temp_directory_path() / "test_user_set.toml";
+    {
+      std::ofstream file(config_path);
+      file << "test_int32_flag = 500\n";
+      file << "test_bool_flag = true\n";
+    }
+    rex::cvar::LoadConfig(config_path);
+    std::filesystem::remove(config_path);
+
+    CHECK(rex::cvar::IsUserSet("test_int32_flag"));
+    CHECK(rex::cvar::IsUserSet("test_bool_flag"));
+
+    auto toml = rex::cvar::SerializeToTOML();
+    CHECK(toml == "test_bool_flag = true\ntest_int32_flag = 500\n");
+  }
+
+  SECTION("failed sets do not mark user-set") {
+    CHECK_FALSE(rex::cvar::SetFlagByName("test_ranged_flag", "100"));
+    CHECK_FALSE(rex::cvar::IsUserSet("test_ranged_flag"));
+  }
+}
+
+TEST_CASE("cvar session defaults", "[cvar]") {
+  rex::cvar::testing::ResetAllForTesting();
+
+  SECTION("applies when the user has not set the flag") {
+    REQUIRE(rex::cvar::SetSessionDefault("test_int32_flag", "77"));
+    CHECK(REXCVAR_GET(test_int32_flag) == 77);
+    CHECK_FALSE(rex::cvar::IsUserSet("test_int32_flag"));
+    // Never serialized.
+    CHECK(rex::cvar::SerializeToTOML().find("test_int32_flag") == std::string::npos);
+  }
+
+  SECTION("recorded but not applied over a user-set value") {
+    REQUIRE(rex::cvar::SetFlagByName("test_int32_flag", "8"));
+    CHECK_FALSE(rex::cvar::SetSessionDefault("test_int32_flag", "77"));
+    CHECK(REXCVAR_GET(test_int32_flag) == 8);
+
+    auto* info = rex::cvar::GetFlagInfo("test_int32_flag");
+    REQUIRE(info != nullptr);
+    CHECK(info->has_session_default);
+    CHECK(info->session_default == "77");
+  }
+
+  SECTION("user value wins even when it equals the registered default") {
+    REQUIRE(rex::cvar::SetFlagByName("test_int32_flag", "42"));  // == default
+    CHECK_FALSE(rex::cvar::SetSessionDefault("test_int32_flag", "77"));
+    CHECK(REXCVAR_GET(test_int32_flag) == 42);
+  }
+
+  SECTION("driver is recorded for UI display") {
+    REQUIRE(rex::cvar::SetSessionDefault("test_string_flag", "driven", "test_bool_flag"));
+    auto* info = rex::cvar::GetFlagInfo("test_string_flag");
+    REQUIRE(info != nullptr);
+    CHECK(info->session_driver == "test_bool_flag");
+  }
+
+  SECTION("constraints still validate") {
+    CHECK_FALSE(rex::cvar::SetSessionDefault("test_ranged_flag", "100"));
+    CHECK(REXCVAR_GET(test_ranged_flag) == 5);
+  }
+
+  SECTION("ResetToDefault returns to the session default and drops the save line") {
+    REQUIRE(rex::cvar::SetSessionDefault("test_int32_flag", "77"));
+    REQUIRE(rex::cvar::SetFlagByName("test_int32_flag", "8"));
+    CHECK(rex::cvar::SerializeToTOML().find("test_int32_flag") != std::string::npos);
+
+    rex::cvar::ResetToDefault("test_int32_flag");
+    CHECK(REXCVAR_GET(test_int32_flag) == 77);
+    CHECK_FALSE(rex::cvar::IsUserSet("test_int32_flag"));
+    CHECK(rex::cvar::SerializeToTOML().find("test_int32_flag") == std::string::npos);
+  }
+}
+
+TEST_CASE("cvar saves preserve the user's value over later code forcing", "[cvar]") {
+  rex::cvar::testing::ResetAllForTesting();
+
+  // The user chooses a value (toml / settings UI)...
+  REQUIRE(rex::cvar::SetFlagByName("test_int32_flag", "8"));
+  // ...then feature code forces the live value (enforcement, e.g.
+  // performance mode re-asserting a diagnostic off). The live value
+  // changes; the saved value must stay the user's choice.
+  REXCVAR_SET(test_int32_flag, 0);
+  CHECK(REXCVAR_GET(test_int32_flag) == 0);
+
+  auto toml = rex::cvar::SerializeToTOML();
+  CHECK(toml.find("test_int32_flag = 8") != std::string::npos);
+  CHECK(toml.find("test_int32_flag = 0") == std::string::npos);
+}
+
+TEST_CASE("cvar TOML serialization escapes string values", "[cvar]") {
+  rex::cvar::testing::ResetAllForTesting();
+
+  // A Windows path with backslashes and quotes: unescaped, this voids the
+  // whole config file with a parse error on the next load.
+  const std::string nasty = "C:\\Games\\ac6 \"test\".iso";
+  REQUIRE(rex::cvar::SetFlagByName("test_string_flag", nasty));
+
+  auto toml = rex::cvar::SerializeToTOML();
+  CHECK(toml.find("\\\\") != std::string::npos);
+
+  SECTION("serialized output round-trips through LoadConfig") {
+    auto config_path = std::filesystem::temp_directory_path() / "test_escape.toml";
+    {
+      std::ofstream file(config_path);
+      file << toml;
+    }
+    rex::cvar::testing::ResetAllForTesting();
+    CHECK(REXCVAR_GET(test_string_flag) == "default");
+
+    rex::cvar::LoadConfig(config_path);
+    std::filesystem::remove(config_path);
+    CHECK(REXCVAR_GET(test_string_flag) == nasty);
+  }
 }
 
 TEST_CASE("cvar metadata integration test", "[cvar][integration]") {
@@ -466,9 +608,10 @@ TEST_CASE("cvar ResetAllToDefaults", "[cvar]") {
 TEST_CASE("cvar SerializeToTOML with category filter", "[cvar]") {
   rex::cvar::testing::ResetAllForTesting();
 
-  // Modify flags in different categories
-  REXCVAR_SET(test_int32_flag, 123);           // Category: Test
-  REXCVAR_SET(test_category_flag, "changed");  // Category: TestCategory
+  // Modify flags in different categories (via the user path: serialization
+  // persists user-set flags only)
+  REQUIRE(rex::cvar::SetFlagByName("test_int32_flag", "123"));           // Category: Test
+  REQUIRE(rex::cvar::SetFlagByName("test_category_flag", "changed"));  // Category: TestCategory
 
   SECTION("Filter by category returns only that category") {
     auto test_toml = rex::cvar::SerializeToTOML("Test");
@@ -491,9 +634,9 @@ TEST_CASE("cvar SaveConfig", "[cvar]") {
   // Clean up any existing file
   std::filesystem::remove(save_path);
 
-  SECTION("SaveConfig writes modified flags to file") {
-    REXCVAR_SET(test_int32_flag, 777);
-    REXCVAR_SET(test_string_flag, "saved_value");
+  SECTION("SaveConfig writes user-set flags to file") {
+    REQUIRE(rex::cvar::SetFlagByName("test_int32_flag", "777"));
+    REQUIRE(rex::cvar::SetFlagByName("test_string_flag", "saved_value"));
 
     rex::cvar::SaveConfig(save_path);
 

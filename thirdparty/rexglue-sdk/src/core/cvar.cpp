@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cctype>
 #include <charconv>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -162,6 +163,60 @@ bool ValidateConstraints(const FlagEntry& entry, std::string_view value) {
   return true;
 }
 
+// Caller holds the registry mutex (recursive, so callbacks may re-enter).
+void InvokeChangeCallbacksLocked(std::string_view name, std::string_view value) {
+  auto& callbacks = GetCallbackStorage();
+  auto it = callbacks.find(std::string(name));
+  if (it != callbacks.end()) {
+    for (const auto& callback : it->second) {
+      callback(name, value);
+    }
+  }
+}
+
+// TOML basic-string escaping for serialized values. Without this a saved
+// Windows path ("C:\Games\ac6.iso") produces an invalid escape sequence,
+// the next LoadConfig hits a parse error, and the WHOLE config silently
+// reverts to defaults.
+std::string EscapeTomlBasicString(const std::string& s) {
+  std::string out;
+  out.reserve(s.size());
+  for (char c : s) {
+    switch (c) {
+      case '\\':
+        out += "\\\\";
+        break;
+      case '"':
+        out += "\\\"";
+        break;
+      case '\n':
+        out += "\\n";
+        break;
+      case '\r':
+        out += "\\r";
+        break;
+      case '\t':
+        out += "\\t";
+        break;
+      case '\b':
+        out += "\\b";
+        break;
+      case '\f':
+        out += "\\f";
+        break;
+      default:
+        if (static_cast<unsigned char>(c) < 0x20) {
+          char buf[8];
+          std::snprintf(buf, sizeof(buf), "\\u%04X", static_cast<unsigned char>(c));
+          out += buf;
+        } else {
+          out += c;
+        }
+    }
+  }
+  return out;
+}
+
 }  // namespace
 
 //=============================================================================
@@ -231,7 +286,7 @@ bool SetFlagByName(std::string_view name, std::string_view value) {
     return false;
   }
 
-  const auto& entry = GetRegistryStorage()[it->second];
+  auto& entry = GetRegistryStorage()[it->second];
 
   // Check lifecycle
   if (!g_lifecycle_override && entry.lifecycle == Lifecycle::kInitOnly && IsFinalized()) {
@@ -246,23 +301,68 @@ bool SetFlagByName(std::string_view name, std::string_view value) {
 
   bool success = entry.setter(value);
 
-  // Track pending restart flags
-  if (success && entry.lifecycle == Lifecycle::kRequiresRestart) {
-    MarkPendingRestart(name);
-  }
-
-  // Invoke registered callbacks
   if (success) {
-    auto& callbacks = GetCallbackStorage();
-    auto it = callbacks.find(std::string(name));
-    if (it != callbacks.end()) {
-      for (const auto& callback : it->second) {
-        callback(name, value);
-      }
+    // Every SetFlagByName caller is a user-intent path (config file load,
+    // console, settings UI), so the flag is now user-owned: SaveConfig
+    // persists it, session defaults no longer apply to it. The canonical
+    // value is captured so later code writes to the live value (REXCVAR_SET
+    // enforcement) cannot corrupt what gets saved.
+    entry.user_set = true;
+    entry.user_value = entry.getter();
+
+    // Track pending restart flags
+    if (entry.lifecycle == Lifecycle::kRequiresRestart) {
+      MarkPendingRestart(name);
     }
+
+    InvokeChangeCallbacksLocked(name, value);
   }
 
   return success;
+}
+
+bool SetSessionDefault(std::string_view name, std::string_view value, std::string_view driver) {
+  std::lock_guard lock(GetRegistryMutex());
+  auto it = GetRegistryIndex().find(std::string(name));
+  if (it == GetRegistryIndex().end()) {
+    REXLOG_WARN("SetSessionDefault: unknown flag '{}'", name);
+    return false;
+  }
+
+  auto& entry = GetRegistryStorage()[it->second];
+  if (entry.type == FlagType::Command) {
+    return false;
+  }
+  if (!ValidateConstraints(entry, value)) {
+    return false;
+  }
+
+  entry.has_session_default = true;
+  entry.session_default = std::string(value);
+  entry.session_driver = std::string(driver);
+
+  // A user-set value always wins: record the session default (for UI display)
+  // but leave the user's value in place.
+  if (entry.user_set) {
+    return false;
+  }
+
+  bool success = entry.setter(value);
+  if (success) {
+    // Deliberately no MarkPendingRestart: this is the value the app starts
+    // from, not a change the user needs to restart for.
+    InvokeChangeCallbacksLocked(name, value);
+  }
+  return success;
+}
+
+bool IsUserSet(std::string_view name) {
+  std::lock_guard lock(GetRegistryMutex());
+  auto it = GetRegistryIndex().find(std::string(name));
+  if (it == GetRegistryIndex().end()) {
+    return false;
+  }
+  return GetRegistryStorage()[it->second].user_set;
 }
 
 std::string GetFlagByName(std::string_view name) {
@@ -387,8 +487,17 @@ void ResetToDefault(std::string_view name) {
   if (it == GetRegistryIndex().end()) {
     return;
   }
-  const auto& entry = GetRegistryStorage()[it->second];
-  entry.setter(entry.default_value);
+  auto& entry = GetRegistryStorage()[it->second];
+  // Reset means "back to stock, forget my choice": the effective default is
+  // the session default when one is in force, and the flag stops being
+  // user-owned so the next SaveConfig drops it.
+  const std::string& target =
+      entry.has_session_default ? entry.session_default : entry.default_value;
+  if (entry.setter(target)) {
+    entry.user_set = false;
+    entry.user_value.clear();
+    InvokeChangeCallbacksLocked(name, target);
+  }
 }
 
 void ResetAllToDefaults() {
@@ -419,16 +528,31 @@ std::vector<std::string> ListModifiedFlags() {
   return result;
 }
 
+namespace {
+
+void AppendTomlLine(std::string& result, const FlagEntry& entry) {
+  // user_value, not getter(): the live value may be feature-forced (e.g.
+  // performance mode holding a diagnostic off); the save keeps the user's
+  // own choice.
+  if (entry.type == FlagType::String) {
+    result += entry.name + " = \"" + EscapeTomlBasicString(entry.user_value) + "\"\n";
+  } else {
+    result += entry.name + " = " + entry.user_value + "\n";
+  }
+}
+
+}  // namespace
+
 std::string SerializeToTOML() {
   std::lock_guard lock(GetRegistryMutex());
   std::string result;
   for (const auto& entry : GetRegistryStorage()) {
-    if (entry.getter() != entry.default_value) {
-      if (entry.type == FlagType::String) {
-        result += entry.name + " = \"" + entry.getter() + "\"\n";
-      } else {
-        result += entry.name + " = " + entry.getter() + "\n";
-      }
+    // Persist exactly what the user chose. Values written by presets or
+    // feature code (REXCVAR_SET / SetSessionDefault) are session state and
+    // must not outlive the code that applied them by leaking into the
+    // user's config.
+    if (entry.user_set) {
+      AppendTomlLine(result, entry);
     }
   }
   return result;
@@ -438,12 +562,8 @@ std::string SerializeToTOML(std::string_view category) {
   std::lock_guard lock(GetRegistryMutex());
   std::string result;
   for (const auto& entry : GetRegistryStorage()) {
-    if (entry.category == category && entry.getter() != entry.default_value) {
-      if (entry.type == FlagType::String) {
-        result += entry.name + " = \"" + entry.getter() + "\"\n";
-      } else {
-        result += entry.name + " = " + entry.getter() + "\n";
-      }
+    if (entry.category == category && entry.user_set) {
+      AppendTomlLine(result, entry);
     }
   }
   return result;
@@ -568,7 +688,17 @@ ScopedLifecycleOverride::~ScopedLifecycleOverride() {
 }
 
 void ResetAllForTesting() {
-  ResetAllToDefaults();
+  {
+    std::lock_guard lock(GetRegistryMutex());
+    for (auto& entry : GetRegistryStorage()) {
+      entry.setter(entry.default_value);
+      entry.user_set = false;
+      entry.user_value.clear();
+      entry.has_session_default = false;
+      entry.session_default.clear();
+      entry.session_driver.clear();
+    }
+  }
   ClearPendingRestartFlags();
   g_finalized = false;
 }

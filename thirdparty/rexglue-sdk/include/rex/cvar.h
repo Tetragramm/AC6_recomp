@@ -146,6 +146,25 @@ struct FlagEntry {
   Constraints constraints;
   std::string default_value;
   bool is_debug_only = false;
+  // Set when the value came from the user - config file, console, or settings
+  // UI (SetFlagByName). Serialization persists exactly these entries: a saved
+  // config contains what the user chose, nothing else. Code writes via
+  // REXCVAR_SET and per-launch command-line/environment overrides do not mark
+  // this and are never persisted.
+  bool user_set = false;
+  // The last value the user set (canonical getter form), captured by
+  // SetFlagByName. Serialization writes THIS, not the live value: a feature
+  // that forces the live value (e.g. performance mode forcing a diagnostic
+  // off) must not corrupt what the user chose in their saved config.
+  std::string user_value;
+  // Session default (SetSessionDefault): the value the app wants this session
+  // when the user has not chosen one. Applied to the storage only when the
+  // user did not set the flag; never serialized. session_driver optionally
+  // names the cvar that drove it (e.g. a feature master switch) so settings
+  // UIs can show the relationship.
+  bool has_session_default = false;
+  std::string session_default;
+  std::string session_driver;
 };
 
 std::vector<FlagEntry>& GetRegistry();
@@ -198,6 +217,32 @@ void ResetToDefault(std::string_view name);
 void ResetAllToDefaults();
 bool HasNonDefaultValue(std::string_view name);
 std::vector<std::string> ListModifiedFlags();
+
+/**
+ * Apply a project/session default: the value a preset or feature wants this
+ * session when the user has not explicitly chosen one. Unlike REXCVAR_SET,
+ * this never clobbers a user-set value (config file, console, settings UI)
+ * and the value is never serialized into a saved config. `driver` optionally
+ * records the cvar that drove the value (a feature master switch such as
+ * ac6_fix_deswizzle) for display in settings UIs.
+ * Returns true if the value was applied to the flag, false if it was only
+ * recorded (a user-set value wins) or rejected (unknown flag, command flag,
+ * failed constraints).
+ */
+bool SetSessionDefault(std::string_view name, std::string_view value,
+                       std::string_view driver = {});
+
+/// Whether the flag was explicitly set by the user this session (config file,
+/// console, settings UI). Command-line and environment overrides do not
+/// count: they are per-launch and are not persisted by SaveConfig.
+bool IsUserSet(std::string_view name);
+
+/**
+ * Serialize user-set flags (see FlagEntry::user_set) as TOML lines. This is
+ * what SaveConfig writes: exactly the settings the user chose - loaded from
+ * their config file or changed in the console/settings UI - and none of the
+ * values that presets or feature code applied.
+ */
 std::string SerializeToTOML();
 std::string SerializeToTOML(std::string_view category);
 
