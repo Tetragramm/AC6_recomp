@@ -295,7 +295,12 @@ void WasapiAudioDriver::RenderThreadMain() {
     if (SUCCEEDED(hr) && audio_client2) {
       AudioClientProperties properties = {};
       properties.cbSize = sizeof(properties);
-      properties.eCategory = AudioCategory_GameMedia;
+      // GameEffects, not GameMedia: this single stream carries the entire
+      // premixed game output (SFX, dialogue, AND music — nuSound2 mixes
+      // guest-side). GameMedia is for a dedicated background-music substream
+      // and Windows auto-mutes it while a media app (Screenbox, modern Media
+      // Player) has an active music session.
+      properties.eCategory = AudioCategory_GameEffects;
       properties.Options = AUDCLNT_STREAMOPTIONS_NONE;
       audio_client2->SetClientProperties(&properties);
     }
