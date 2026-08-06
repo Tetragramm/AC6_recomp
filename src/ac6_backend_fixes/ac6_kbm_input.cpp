@@ -577,6 +577,43 @@ MouseSteer g_mouse;
 // ---- Host input gates -------------------------------------------------------
 // Input ownership follows desktop window-manager rules: the MOUSE belongs to
 // whatever is under the CURSOR, the KEYBOARD to whatever holds FOCUS. The
+// ---- Stale-key trust latch --------------------------------------------------
+// GetAsyncKeyState reports OS-level async state, which the game cannot clear
+// and which can wedge "down" without any real press: the classic case is
+// Alt-Tab residue, where Tab's key-UP is swallowed during the focus /
+// fullscreen transition and the OS reports Tab held until its next physical
+// press. Field-confirmed: a session-long phantom Tab forwarded as held
+// BACK/Y, engaging the target-focus camera - "camera dead on keyboard AND
+// pad". So a key only counts as held after a fresh up->down transition has
+// been observed by us: anything already down at module start, or down at the
+// moment the window regains foreground, is ignored (once per offender, with
+// a log line naming it) until released. The deliberate flip side: a key
+// genuinely held ACROSS an Alt-Tab is eaten until re-pressed - standard
+// game-input behavior. Applies to the GetAsyncKeyState path only; the wheel
+// pseudo-keys are synthetic and never wedge.
+#if defined(_WIN32)
+// bit0 = a fresh "up" was observed, the key is trusted; bit1 = wedge logged.
+constexpr uint8_t kKeyTrustUpSeen = 1;
+constexpr uint8_t kKeyTrustLogged = 2;
+std::atomic<uint8_t> g_key_trust[256] = {};
+std::atomic<bool> g_focus_was_ok{false};
+std::atomic<bool> g_focus_seen{false};  // picks the wedge log wording only
+
+// Called from QueryGate on every gate evaluation; on the unfocused->focused
+// edge, drop trust for every key physically down at that instant (their
+// up->down did not happen inside the focused session).
+void NoteFocusForKeyTrust(bool fg_ok) {
+  if (!g_focus_was_ok.exchange(fg_ok, std::memory_order_relaxed) && fg_ok) {
+    g_focus_seen.store(true, std::memory_order_relaxed);
+    for (int k = 1; k < 256; ++k) {
+      if (GetAsyncKeyState(k) & 0x8000) {
+        g_key_trust[k].store(0, std::memory_order_relaxed);
+      }
+    }
+  }
+}
+#endif
+
 // ImGuiDrawer publishes once per frame whether any visible overlay
 // window owns the pointer / the keyboard / an active text field - its ImGui
 // capture flags conjoined with overlay visibility, so a CLOSED overlay can
@@ -609,6 +646,7 @@ GateState QueryGate() {
     GetWindowThreadProcessId(fg, &pid);
     g.fg_ok = (pid == GetCurrentProcessId());
   }
+  NoteFocusForKeyTrust(g.fg_ok);
 #else
   g.fg_ok = true;
 #endif
@@ -647,7 +685,26 @@ bool KeyHeld(VirtualKey vk) {
     return NowMs() < g_wheel_down_until.load(std::memory_order_relaxed);
   }
 #if defined(_WIN32)
-  return (GetAsyncKeyState(static_cast<int>(vk)) & 0x8000) != 0;
+  const bool down = (GetAsyncKeyState(static_cast<int>(vk)) & 0x8000) != 0;
+  std::atomic<uint8_t>& trust = g_key_trust[static_cast<int>(vk) & 0xFF];
+  if (!down) {
+    // Fresh up: trusted from here on, and the wedge log is rearmed so a
+    // NEW wedge episode for the same key gets named again.
+    trust.store(kKeyTrustUpSeen, std::memory_order_relaxed);
+    return false;
+  }
+  const uint8_t t = trust.load(std::memory_order_relaxed);
+  if (t & kKeyTrustUpSeen) {
+    return true;
+  }
+  if (!(t & kKeyTrustLogged)) {
+    trust.store(t | kKeyTrustLogged, std::memory_order_relaxed);
+    KbmLog(fmt::format("key 0x{:02X} held {} - ignored until released",
+                       static_cast<int>(vk),
+                       g_focus_seen.load(std::memory_order_relaxed) ? "across focus gain"
+                                                                    : "at startup"));
+  }
+  return false;
 #else
   (void)vk;
   return false;
