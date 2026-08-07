@@ -644,7 +644,8 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
       trace_writer_.WriteMemoryRead(guest_index_base, guest_index_buffer_needed_bytes);
       CacheTransaction cache_transaction(
           *this, CacheKey(guest_index_base, guest_draw_vertex_count, guest_index_format,
-                          guest_index_endian, guest_primitive_reset_enabled, guest_primitive_type));
+                          guest_index_endian, guest_primitive_reset_enabled, guest_primitive_type,
+                          false, ac6_terrain_fan_hd_));
       if (cache_transaction.GetFoundResult()) {
         cacheable = *cache_transaction.GetFoundResult();
       } else {
@@ -696,7 +697,7 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
           }
           ConvertSinglePrimitiveRanges(
               host_indices, guest_indices, guest_primitive_type, PassthroughIndexTransform(),
-              single_primitive_ranges_.cbegin(), single_primitive_ranges_.cend());
+              single_primitive_ranges_.cbegin(), single_primitive_ranges_.cend(), ac6_terrain_fan_hd_);
         } else {
           // 32-bit indices - may need to pre-swap and pre-mask also if the host
           // doesn't support full 32-bit vertex indices.
@@ -727,32 +728,32 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
           if (full_32bit_vertex_indices_used_) {
             ConvertSinglePrimitiveRanges(
                 host_indices, guest_indices, guest_primitive_type, PassthroughIndexTransform(),
-                single_primitive_ranges_beginning, single_primitive_ranges_end);
+                single_primitive_ranges_beginning, single_primitive_ranges_end, ac6_terrain_fan_hd_);
           } else {
             switch (guest_index_endian) {
               case xenos::Endian::kNone:
                 ConvertSinglePrimitiveRanges(host_indices, guest_indices, guest_primitive_type,
                                              To24NonSwappingIndexTransform(),
                                              single_primitive_ranges_beginning,
-                                             single_primitive_ranges_end);
+                                             single_primitive_ranges_end, ac6_terrain_fan_hd_);
                 break;
               case xenos::Endian::k8in16:
                 ConvertSinglePrimitiveRanges(host_indices, guest_indices, guest_primitive_type,
                                              To24Swapping8In16IndexTransform(),
                                              single_primitive_ranges_beginning,
-                                             single_primitive_ranges_end);
+                                             single_primitive_ranges_end, ac6_terrain_fan_hd_);
                 break;
               case xenos::Endian::k8in32:
                 ConvertSinglePrimitiveRanges(host_indices, guest_indices, guest_primitive_type,
                                              To24Swapping8In32IndexTransform(),
                                              single_primitive_ranges_beginning,
-                                             single_primitive_ranges_end);
+                                             single_primitive_ranges_end, ac6_terrain_fan_hd_);
                 break;
               case xenos::Endian::k16in32:
                 ConvertSinglePrimitiveRanges(host_indices, guest_indices, guest_primitive_type,
                                              To24Swapping16In32IndexTransform(),
                                              single_primitive_ranges_beginning,
-                                             single_primitive_ranges_end);
+                                             single_primitive_ranges_end, ac6_terrain_fan_hd_);
                 break;
               default:
                 assert_unhandled_case(guest_index_endian);

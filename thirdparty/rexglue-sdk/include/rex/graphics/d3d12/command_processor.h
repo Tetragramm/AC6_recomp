@@ -696,6 +696,13 @@ class D3D12CommandProcessor : public CommandProcessor {
   std::atomic<bool> vertex_buffer_memory_invalidated_{false};
   void* vertex_buffer_memory_invalidation_callback_handle_ = nullptr;
 
+  // AC6 HD terrain: vertex fetch constant 95 of gated terrain draws is
+  // redirected to the synthetic full-density ring table (one game-global
+  // system-heap guest allocation); guest registers and memory stay untouched.
+  bool AC6TerrainHdEnsureRing();
+  bool ac6_hd_active_ = false;
+  uint32_t ac6_hd_ring_phys_ = 0;  // UINT32_MAX = allocation failed
+
   std::atomic<bool> pix_capture_requested_ = false;
   bool pix_capturing_;
 

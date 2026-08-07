@@ -170,6 +170,9 @@ class PrimitiveProcessor {
   // memory).
   bool Process(ProcessingResult& result_out);
 
+  // AC6: set by the command processor before Process() for terrain draws.
+  void SetAc6TerrainFanHd(bool enabled) { ac6_terrain_fan_hd_ = enabled; }
+
   // Invalidates the cache within the range.
   std::pair<uint32_t, uint32_t> MemoryInvalidationCallback(uint32_t physical_address_start,
                                                            uint32_t length, bool exact_range);
@@ -515,6 +518,33 @@ class PrimitiveProcessor {
     }
   }
 
+  // AC6: full-resolution ("HD") terrain fan emission. With the synthetic HD
+  // ring (see the D3D12 command processor), a terrain fan's 9 usable slots
+  // address the full 3x3 height samples of its 2x2-cell patch (row-major:
+  // slot k = sample (k / 3, k % 3)); this draws the patch as 2 triangles per
+  // cell (world-anchored diagonal, authored cw winding) - 24 output indices,
+  // the same count as the plain conversion. Only correct together with the
+  // synthetic ring - both are gated by the command processor.
+  template <typename Index, typename IndexTransform>
+  static void TriangleFanToListHdAc6(Index* dest, const Index* source,
+                                     const IndexTransform& index_transform) {
+    Index s[9];
+    for (uint32_t i = 0; i < 9; ++i) {
+      s[i] = index_transform(source[i]);
+    }
+    // Cells (r, c): tris (A, B, D) + (A, D, C) with A = 3r+c, B = A+3 (next
+    // row), C = A+1 (next column), D = A+4 (diagonal).
+    static constexpr uint8_t kHdPattern[8][3] = {
+        {0, 3, 4}, {0, 4, 1}, {1, 4, 5}, {1, 5, 2},
+        {3, 6, 7}, {3, 7, 4}, {4, 7, 8}, {4, 8, 5},
+    };
+    for (const auto& tri : kHdPattern) {
+      *(dest++) = s[tri[0]];
+      *(dest++) = s[tri[1]];
+      *(dest++) = s[tri[2]];
+    }
+  }
+
   static constexpr uint32_t GetLineLoopStripIndexCount(uint32_t loop_index_count) {
     // Even if 2 vertices are supplied, two lines are still drawn between them.
     // https://www.khronos.org/opengl/wiki/Primitive
@@ -595,14 +625,21 @@ class PrimitiveProcessor {
                                            xenos::PrimitiveType source_primitive_type,
                                            const IndexTransform& index_transform,
                                            PrimitiveRangeIterator ranges_beginning,
-                                           PrimitiveRangeIterator ranges_end) {
+                                           PrimitiveRangeIterator ranges_end,
+                                           bool ac6_hd_fans = false) {
     Index* dest_write_ptr = dest;
     switch (source_primitive_type) {
       case xenos::PrimitiveType::kTriangleFan:
         for (PrimitiveRangeIterator range_it = ranges_beginning; range_it != ranges_end;
              ++range_it) {
-          TriangleFanToList(dest_write_ptr, source + range_it->guest_offset,
-                            range_it->guest_index_count, index_transform);
+          if (ac6_hd_fans && range_it->guest_index_count == 10) {
+            // AC6 terrain fan - emit the full-resolution pattern.
+            TriangleFanToListHdAc6(dest_write_ptr, source + range_it->guest_offset,
+                                   index_transform);
+          } else {
+            TriangleFanToList(dest_write_ptr, source + range_it->guest_offset,
+                              range_it->guest_index_count, index_transform);
+          }
           dest_write_ptr += range_it->host_index_count;
         }
         break;
@@ -633,6 +670,9 @@ class PrimitiveProcessor {
   SharedMemory& shared_memory_;
 
   bool full_32bit_vertex_indices_used_ = false;
+  // AC6: per-draw request from the command processor to emit the
+  // full-resolution terrain fan pattern (see TriangleFanToListHdAc6).
+  bool ac6_terrain_fan_hd_ = false;
   bool convert_triangle_fans_to_lists_ = false;
   bool convert_line_loops_to_strips_ = false;
   bool convert_quad_lists_to_triangle_lists_ = false;
@@ -670,13 +710,15 @@ class PrimitiveProcessor {
       // index conversion used by non-kVertex host vertex shader types on
       // backends not supporting full 32-bit index fetch in this path.
       uint32_t non_vertex_32bit_dma_to_24bit : 1;  // 60
+      // Converted with the AC6 full-resolution terrain emission.
+      uint32_t ac6_fan_hd : 1;  // 61
     };
 
     CacheKey() : key(0) { static_assert_size(*this, sizeof(key)); }
     CacheKey(uint32_t base, uint32_t count, xenos::IndexFormat format, xenos::Endian endian,
              bool is_reset_enabled,
              xenos::PrimitiveType conversion_guest_primitive_type = xenos::PrimitiveType::kNone,
-             bool non_vertex_32bit_dma_to_24bit = false) {
+             bool non_vertex_32bit_dma_to_24bit = false, bool ac6_fan_hd = false) {
       // Clear unused bits, then set each field explicitly, not via the
       // initializer list (which causes `uint64_t key = 0;` to be ignored, and
       // also can't contain initializers for aliasing union members).
@@ -688,6 +730,7 @@ class PrimitiveProcessor {
       this->is_reset_enabled = is_reset_enabled;
       this->conversion_guest_primitive_type = conversion_guest_primitive_type;
       this->non_vertex_32bit_dma_to_24bit = non_vertex_32bit_dma_to_24bit;
+      this->ac6_fan_hd = ac6_fan_hd;
     }
 
     struct Hasher {

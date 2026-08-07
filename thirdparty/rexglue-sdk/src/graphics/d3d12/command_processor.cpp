@@ -211,6 +211,50 @@ void D3D12CommandProcessor::InvalidateGpuMemory() {
   }
 }
 
+bool D3D12CommandProcessor::AC6TerrainHdEnsureRing() {
+  if (ac6_hd_ring_phys_ == UINT32_MAX) {
+    return false;
+  }
+  if (ac6_hd_ring_phys_) {
+    return true;
+  }
+  // Build the synthetic ring: for each of the group's 4 fans (patch bases
+  // (0,0), (2,0), (0,2), (2,2) in (row, col) cells), slots (10f+1+k) mod 40
+  // hold sample k of the fan's full 3x3 grid (row-major; the +1 is the
+  // shader's ring phase). Slots 0/10/20/30 are never referenced. The ring is
+  // game-global - the authored one is byte-identical across maps.
+  static const uint16_t kPatchBase[4][2] = {{0, 0}, {2, 0}, {0, 2}, {2, 2}};
+  uint16_t entries[80] = {};
+  for (uint32_t f = 0; f < 4; ++f) {
+    for (uint32_t k = 0; k < 9; ++k) {
+      uint32_t slot = (10 * f + 1 + k) % 40;
+      entries[slot * 2 + 0] = uint16_t(kPatchBase[f][0] + k / 3);  // row
+      entries[slot * 2 + 1] = uint16_t(kPatchBase[f][1] + k % 3);  // col
+    }
+  }
+  memory::Memory* memory = kernel_state_->memory();
+  uint32_t ring_virt = memory->SystemHeapAlloc(sizeof(entries), 256, memory::kSystemHeapPhysical);
+  if (!ring_virt) {
+    REXGPU_ERROR("AC6 HD terrain: failed to allocate the synthetic ring table");
+    ac6_hd_ring_phys_ = UINT32_MAX;
+    return false;
+  }
+  uint32_t* ring_host = memory->TranslateVirtual<uint32_t*>(ring_virt);
+  const uint32_t* words = reinterpret_cast<const uint32_t*>(entries);
+  for (uint32_t i = 0; i < sizeof(entries) / sizeof(uint32_t); ++i) {
+    // Guest vertex fetch tables are 8-in-32 big-endian.
+    ring_host[i] = rex::byte_swap(words[i]);
+  }
+  ac6_hd_ring_phys_ = memory->GetPhysicalAddress(ring_virt);
+  if (ac6_hd_ring_phys_ == UINT32_MAX) {
+    REXGPU_ERROR("AC6 HD terrain: synthetic ring allocation has no physical address");
+    return false;
+  }
+  REXGPU_INFO("AC6 HD terrain: synthetic ring at guest 0x{:08X} (virtual 0x{:08X})",
+              ac6_hd_ring_phys_, ring_virt);
+  return true;
+}
+
 void D3D12CommandProcessor::InvalidateAllVertexBufferResidency() {
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
@@ -2736,6 +2780,29 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     return false;
   }
 
+  // AC6 HD terrain: the terrain vertex shader is fully data-driven, so a
+  // synthetic ring table (vertex fetch 95 redirect) plus a full-density fan
+  // emission make the unmodified shader draw every shipped height sample -
+  // no more T-junction cracks ("rifts"), and river beds render true.
+  {
+    bool ac6_hd = false;
+    if (REXCVAR_GET(ac6_terrain_hd) &&
+        primitive_type == xenos::PrimitiveType::kTriangleFan) {
+      uint64_t vs_ucode_hash = vertex_shader->ucode_data_hash();
+      ac6_hd = (vs_ucode_hash == UINT64_C(0x042F34FADAD3F370) ||
+                vs_ucode_hash == UINT64_C(0xD113DCDC8F6AC408)) &&
+               AC6TerrainHdEnsureRing();
+    }
+    if (ac6_hd != ac6_hd_active_) {
+      // The effective vertex fetch constant 95 changes without a guest
+      // register write - drop the residency shortcut and the uploaded copy.
+      ac6_hd_active_ = ac6_hd;
+      vertex_buffers_in_sync_[95 >> 6] &= ~(uint64_t(1) << (95 & 63));
+      cbuffer_binding_fetch_.up_to_date = false;
+    }
+    primitive_processor_->SetAc6TerrainFanHd(ac6_hd);
+  }
+
   // Process primitives.
   PrimitiveProcessor::ProcessingResult primitive_processing_result;
   if (!primitive_processor_->Process(primitive_processing_result)) {
@@ -3048,6 +3115,12 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
         continue;
       }
       xenos::xe_gpu_vertex_fetch_t vfetch_constant = regs.GetVertexFetch(vfetch_index);
+      if (ac6_hd_active_ && vfetch_index == 95) {
+        // AC6 HD terrain: request residency for the synthetic ring, not for
+        // the authored ring the guest fetch constant points to.
+        vfetch_constant.address = ac6_hd_ring_phys_ >> 2;
+        vfetch_constant.size = 40;
+      }
       switch (vfetch_constant.type) {
         case xenos::FetchConstantType::kVertex:
           break;
@@ -4806,6 +4879,13 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
       return false;
     }
     std::memcpy(fetch_constants, &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], kFetchConstantsSize);
+    if (ac6_hd_active_) {
+      // AC6 HD terrain: point vertex fetch constant 95 at the synthetic
+      // ring. Address bits only - type, endian and size stay authentic.
+      uint32_t* fetch_dwords = reinterpret_cast<uint32_t*>(fetch_constants);
+      fetch_dwords[95 * 2] =
+          (ac6_hd_ring_phys_ & ~uint32_t(3)) | (fetch_dwords[95 * 2] & uint32_t(3));
+    }
     cbuffer_binding_fetch_.up_to_date = true;
     current_graphics_root_up_to_date_ &= ~(1u << root_parameter_fetch_constants);
   }

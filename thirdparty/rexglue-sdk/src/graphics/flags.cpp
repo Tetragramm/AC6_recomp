@@ -31,6 +31,10 @@ REXCVAR_DEFINE_BOOL(use_fuzzy_alpha_epsilon, true, "GPU",
 REXCVAR_DEFINE_BOOL(vfetch_index_rounding_bias, false, "GPU/Shader",
                     "Apply small epsilon bias to vertex fetch indices before "
                     "flooring to fix black triangles caused by RCP precision");
+REXCVAR_DEFINE_BOOL(ac6_terrain_hd, true, "AC6/Enhancements",
+                    "Draw the terrain at the full shipped resolution (2x what "
+                    "the game draws), also removes the terrain cracks.")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(draw_resolution_scaled_texture_offsets, true, "GPU/Shader",
                     "Scale texture offsets with draw resolution");
 // The param_gen pair and the ac6_* hash lists below are consumed at shader
