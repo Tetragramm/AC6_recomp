@@ -209,6 +209,12 @@ void UnregisterBind(std::string_view name) {
 }
 
 bool ProcessKeyEvent(KeyEvent& e) {
+  // Auto-repeat never fires binds: every bind is a toggle-style action, so a
+  // held key would fire it once per repeat (fullscreen thrash, overlay
+  // flicker). Only the initial down transition counts.
+  if (e.prev_state()) {
+    return false;
+  }
   std::lock_guard lock(g_binds_mutex);
   for (auto& entry : g_binds) {
     if (!entry.callback)

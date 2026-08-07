@@ -498,6 +498,19 @@ bool ReXApp::OnInitialize() {
   window_->AddListener(this);
   window_->AddInputListener(this, 0);
 
+  // F11 toggles borderless fullscreen (rebindable via the bind_fullscreen
+  // cvar). The change is recorded through the same path as a settings-menu
+  // edit (SetFlagByName -> user_value), so "Save to config" persists it and
+  // the next launch starts in the chosen mode.
+  rex::ui::RegisterBind("bind_fullscreen", "F11", "Toggle fullscreen", [this] {
+    if (!window_) {
+      return;
+    }
+    bool new_fullscreen = !window_->IsFullscreen();
+    window_->SetFullscreen(new_fullscreen);
+    rex::cvar::SetFlagByName("fullscreen", new_fullscreen ? "true" : "false");
+  });
+
   // Attach window to input system so deferred drivers (e.g. MnK) can register
   if (runtime_ && runtime_->input_system()) {
     static_cast<rex::input::InputSystem*>(runtime_->input_system())->AttachWindow(window_.get());
@@ -609,6 +622,9 @@ void ReXApp::OnClosing(ui::UIEvent& e) {
 void ReXApp::OnDestroy() {
   // Notify subclass before cleanup
   OnShutdown();
+
+  // The fullscreen bind's callback captures this - drop it before teardown.
+  rex::ui::UnregisterBind("bind_fullscreen");
 
   // ImGui cleanup (reverse of setup)
   settings_overlay_.reset();
