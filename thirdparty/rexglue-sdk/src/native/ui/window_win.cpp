@@ -970,6 +970,22 @@ bool Win32Window::HandleKeyboard(UINT message, WPARAM wParam, LPARAM lParam,
     case WM_CHAR:
       OnKeyChar(e, destruction_receiver);
       break;
+    case WM_SYSCHAR:
+      // An unhandled WM_SYSCHAR reaching DefWindowProc on a window with no
+      // menu triggers the system "ding" (MessageBeep) for every Alt+key
+      // press. A menu-less window has no mnemonics to dispatch, so consume
+      // it. This also swallows Alt+Space's keyboard route to the system
+      // menu - standard for borderless games. Alt+F4 lives in
+      // WM_SYSKEYDOWN handling, which still reaches DefWindowProc.
+      if (!GetMenu(hwnd_)) {
+        static bool s_syschar_logged = false;
+        if (!s_syschar_logged) {
+          s_syschar_logged = true;
+          REXLOG_INFO("Win32Window: consuming WM_SYSCHAR (Alt+key) - system beep suppressed");
+        }
+        e.set_handled(true);
+      }
+      break;
     default:
       break;
   }
@@ -1228,6 +1244,15 @@ LRESULT Win32Window::WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lPar
         SetCursorIfFocusedOnClientArea(nullptr);
       }
       return 0;
+    } break;
+
+    case WM_MENUCHAR: {
+      // Belt to the WM_SYSCHAR braces above: if a system-char ever reaches
+      // menu processing on a menu-less window, answer "close the menu, no
+      // beep" instead of the default MNC_IGNORE ding.
+      if (!GetMenu(hwnd_)) {
+        return MAKELRESULT(0, MNC_CLOSE);
+      }
     } break;
 
     case WM_TABLET_QUERYSYSTEMGESTURESTATUS:
