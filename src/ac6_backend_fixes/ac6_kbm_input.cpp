@@ -78,6 +78,10 @@ REXCVAR_DEFINE_STRING(ac6_kbm_config, "ac6_input.toml", "AC6/Enhancements",
 REXCVAR_DEFINE_BOOL(ac6_kbm_padless, true, "AC6/Enhancements",
                     "Provide a virtual controller when none is connected, so "
                     "keyboard and mouse work on their own.");
+REXCVAR_DEFINE_DOUBLE(ac6_cursor_hide_seconds, 3.0, "AC6/Enhancements",
+                      "Hide the free mouse cursor after this many seconds without "
+                      "motion (0 = never hide).")
+    .range(0.0, 300.0);
 
 // The SDK's own mnk virtual-pad driver (input/mnk) - forced off while our
 // KB+M is enabled so two keyboard mappers never fight over the same pad.
@@ -732,8 +736,44 @@ std::atomic<bool> g_hide_cursor{false};
 WNDPROC g_orig_wndproc = nullptr;
 HWND g_subclassed_hwnd = nullptr;
 
+// Free-cursor idle hide (see CursorIdleHideTick below): hidden after
+// ac6_cursor_hide_seconds without motion, revealed on any real mouse input.
+std::atomic<bool> g_idle_hidden{false};
+std::atomic<int64_t> g_idle_last_motion_ms{0};
+
 LRESULT CALLBACK KbmWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
   if (msg == WM_SETCURSOR && g_hide_cursor.load(std::memory_order_relaxed)) {
+    SetCursor(nullptr);
+    return TRUE;
+  }
+  if (msg == WM_MOUSEMOVE) {
+    // WM_MOUSEMOVE is also sent for window-management reasons with the
+    // cursor unmoved (see the SDK's note in window_win.cpp), so only a
+    // POSITION CHANGE counts as real motion. Window-thread-only state.
+    static LPARAM s_last_move_lp = -1;
+    if (lp != s_last_move_lp) {
+      s_last_move_lp = lp;
+      if (g_idle_hidden.load(std::memory_order_relaxed)) {
+        // Restamp the idle clock so the poll tick cannot immediately
+        // re-hide. A motion event's own WM_SETCURSOR is sent BEFORE its
+        // WM_MOUSEMOVE lands (still hidden then), so nudge a fresh one -
+        // the arrow returns on THIS motion, not the next.
+        g_idle_last_motion_ms.store(NowMs(), std::memory_order_relaxed);
+        g_idle_hidden.store(false, std::memory_order_relaxed);
+        PostMessageW(hwnd, WM_SETCURSOR, reinterpret_cast<WPARAM>(hwnd), HTCLIENT);
+      }
+    }
+  } else if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN ||
+             msg == WM_XBUTTONDOWN || msg == WM_MOUSEWHEEL) {
+    if (g_idle_hidden.load(std::memory_order_relaxed)) {
+      g_idle_last_motion_ms.store(NowMs(), std::memory_order_relaxed);
+      g_idle_hidden.store(false, std::memory_order_relaxed);
+      PostMessageW(hwnd, WM_SETCURSOR, reinterpret_cast<WPARAM>(hwnd), HTCLIENT);
+    }
+  } else if (msg == WM_SETCURSOR && g_idle_hidden.load(std::memory_order_relaxed) &&
+             LOWORD(lp) == HTCLIENT) {
+    // Keep the cursor away over the client area while idle-hidden (window
+    // management re-sets it otherwise). Non-client keeps normal arrows.
     SetCursor(nullptr);
     return TRUE;
   }
@@ -759,8 +799,54 @@ void SetCursorHidden(bool hide, HWND hwnd) {
     if (hide) SetCursor(nullptr);
   }
 }
+
+// ---- Free-cursor idle hide --------------------------------------------------
+// The FREE cursor (no steering capture) disappears after
+// ac6_cursor_hide_seconds without motion and returns instantly on motion or
+// a button - menus and desktop-style contexts; the capture hiding above is
+// untouched. Never hides while an overlay is visible under the free cursor
+// (a vanishing pointer over the F4 menu is an anti-feature), while the
+// window is unfocused, or while capture owns the cursor. Runs on the input
+// poll; the subclass proc above answers WM_SETCURSOR while hidden and
+// reveals on real mouse input. Works for pad users too - not gated on
+// ac6_kbm_enabled.
+void CursorIdleHideTick() {
+  const double secs = REXCVAR_GET(ac6_cursor_hide_seconds);
+  const int64_t now = NowMs();
+  bool want_hide = false;
+  if (secs > 0.0 && !g_hide_cursor.load(std::memory_order_relaxed)) {
+    HWND fg = GetForegroundWindow();
+    DWORD pid = 0;
+    if (fg) GetWindowThreadProcessId(fg, &pid);
+    if (fg && pid == GetCurrentProcessId()) {
+      EnsureCursorSubclass(fg);
+      POINT p{};
+      if (GetCursorPos(&p)) {
+        static POINT s_last{};  // poll-thread only
+        static bool s_have_last = false;
+        if (!s_have_last || p.x != s_last.x || p.y != s_last.y) {
+          s_have_last = true;
+          s_last = p;
+          g_idle_last_motion_ms.store(now, std::memory_order_relaxed);
+        } else if (!rex::ui::ImGuiDrawer::DialogsVisible() &&
+                   now - g_idle_last_motion_ms.load(std::memory_order_relaxed) >=
+                       static_cast<int64_t>(secs * 1000.0)) {
+          want_hide = true;
+        }
+      }
+    }
+  }
+  if (g_idle_hidden.exchange(want_hide, std::memory_order_relaxed) != want_hide &&
+      g_subclassed_hwnd) {
+    // Nudge the window thread to apply the new state (hide, or re-arrow
+    // after an overlay opened / the cvar changed - no mouse motion needed).
+    PostMessageW(g_subclassed_hwnd, WM_SETCURSOR, reinterpret_cast<WPARAM>(g_subclassed_hwnd),
+                 HTCLIENT);
+  }
+}
 #else
 void SetCursorHidden(bool, void*) {}
+void CursorIdleHideTick() {}
 #endif
 
 // ---- Mouse steering (M3) -----------------------------------------------------
@@ -1135,6 +1221,13 @@ PPC_FUNC_IMPL(rex_sub_82390CE0) {
   const uint32_t user = ctx.r3.u32;
   const uint32_t state_ptr = ctx.r4.u32;
   __imp__rex_sub_82390CE0(ctx, base);
+
+  // Free-cursor idle hide rides the input poll (user 0 = once per poll
+  // round). Deliberately outside the ac6_kbm_enabled gate: pad users get
+  // the timeout too.
+  if (user == 0) {
+    CursorIdleHideTick();
+  }
 
   // Pad-less operation: when no controller is connected (0x48F), present a
   // neutral synthetic pad on slot 0; the injection below then supplies the

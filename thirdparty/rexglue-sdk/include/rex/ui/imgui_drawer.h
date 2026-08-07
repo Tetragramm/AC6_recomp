@@ -77,6 +77,10 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   static bool DialogsWantTextInput() {
     return dialogs_want_text_input_.load(std::memory_order_relaxed);
   }
+  // Whether any dialog window is visible at all, independent of input
+  // ownership - for policies that key off overlay PRESENCE (e.g. never
+  // auto-hiding the cursor while an overlay is on screen), not hover/focus.
+  static bool DialogsVisible() { return dialogs_visible_.load(std::memory_order_relaxed); }
 
  protected:
   void OnKeyDown(KeyEvent& e) override;
@@ -104,7 +108,8 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   bool IsDrawingDialogs() const { return dialog_loop_next_index_ != SIZE_MAX; }
   void DetachIfLastDialogRemoved();
 
-  void PublishDialogInputOwnership(bool capture_mouse, bool capture_keyboard, bool want_text_input);
+  void PublishDialogInputOwnership(bool any_visible, bool capture_mouse, bool capture_keyboard,
+                                   bool want_text_input);
 
   std::optional<ImGuiKey> VirtualKeyToImGuiKey(VirtualKey vkey);
 
@@ -142,10 +147,12 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   double frame_time_tick_frequency_;
   uint64_t last_frame_time_ticks_;
 
-  // See DialogsCaptureMouse()/DialogsCaptureKeyboard()/DialogsWantTextInput().
+  // See DialogsCaptureMouse()/DialogsCaptureKeyboard()/DialogsWantTextInput()/
+  // DialogsVisible().
   static std::atomic<bool> dialogs_capture_mouse_;
   static std::atomic<bool> dialogs_capture_keyboard_;
   static std::atomic<bool> dialogs_want_text_input_;
+  static std::atomic<bool> dialogs_visible_;
 };
 
 }  // namespace ui

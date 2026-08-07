@@ -37,9 +37,11 @@ static_assert(sizeof(ImmediateVertex) == sizeof(ImDrawVert), "Vertex types must 
 std::atomic<bool> ImGuiDrawer::dialogs_capture_mouse_{false};
 std::atomic<bool> ImGuiDrawer::dialogs_capture_keyboard_{false};
 std::atomic<bool> ImGuiDrawer::dialogs_want_text_input_{false};
+std::atomic<bool> ImGuiDrawer::dialogs_visible_{false};
 
-void ImGuiDrawer::PublishDialogInputOwnership(bool capture_mouse, bool capture_keyboard,
-                                              bool want_text_input) {
+void ImGuiDrawer::PublishDialogInputOwnership(bool any_visible, bool capture_mouse,
+                                              bool capture_keyboard, bool want_text_input) {
+  dialogs_visible_.store(any_visible, std::memory_order_relaxed);
   dialogs_capture_mouse_.store(capture_mouse, std::memory_order_relaxed);
   dialogs_capture_keyboard_.store(capture_keyboard, std::memory_order_relaxed);
   dialogs_want_text_input_.store(want_text_input, std::memory_order_relaxed);
@@ -370,12 +372,12 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
   if (!immediate_drawer_) {
     // A presenter has been attached, but an immediate drawer hasn't been
     // attached yet.
-    PublishDialogInputOwnership(false, false, false);
+    PublishDialogInputOwnership(false, false, false, false);
     return;
   }
 
   if (dialogs_.empty()) {
-    PublishDialogInputOwnership(false, false, false);
+    PublishDialogInputOwnership(false, false, false, false);
     return;
   }
 
@@ -425,7 +427,7 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
   // focus; clicking the game void releases it).
   const bool keyboard_owned =
       io.WantCaptureKeyboard || ImGui::IsWindowFocused(ImGuiFocusedFlags_AnyWindow);
-  PublishDialogInputOwnership(any_dialog_visible && io.WantCaptureMouse,
+  PublishDialogInputOwnership(any_dialog_visible, any_dialog_visible && io.WantCaptureMouse,
                               any_dialog_visible && keyboard_owned,
                               any_dialog_visible && io.WantTextInput);
 
@@ -684,7 +686,7 @@ void ImGuiDrawer::DetachIfLastDialogRemoved() {
   // properties.
   ClearInput();
   // No dialogs left: nothing can own input until the drawer reattaches.
-  PublishDialogInputOwnership(false, false, false);
+  PublishDialogInputOwnership(false, false, false, false);
 }
 
 }  // namespace ui
