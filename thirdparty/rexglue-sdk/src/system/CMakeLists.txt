@@ -35,6 +35,7 @@ set(REXSYSTEM_SOURCES
     xam/user_profile.cpp
 
     # Formerly rexruntime: module loading, CPU execution, thread state
+    diag_crash_handler.cpp
     ppc_types.cpp
     elf_module.cpp
     entry_table.cpp

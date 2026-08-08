@@ -16,6 +16,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -58,6 +59,40 @@ class LogCaptureSink : public spdlog::sinks::base_sink<std::mutex> {
   uint64_t generation() const {
     std::lock_guard lock(mutable_mutex_);
     return generation_;
+  }
+
+  // Crash-path tail copy: appends up to `max_lines` of the newest entries
+  // (oldest first) into `out`, one line each, without blocking - if either
+  // mutex is held by the crashed thread, returns 0 rather than deadlocking.
+  // No allocation: writes into the caller's buffer only.
+  size_t CopyTailForCrash(char* out, size_t out_size, size_t max_lines) {
+    if (!mutable_mutex_.try_lock())
+      return 0;
+    if (!base_sink<std::mutex>::mutex_.try_lock()) {
+      mutable_mutex_.unlock();
+      return 0;
+    }
+    size_t written = 0;
+    size_t available = count_;
+    size_t take = available < max_lines ? available : max_lines;
+    for (size_t i = available - take; i < available; ++i) {
+      const LogEntry& entry =
+          (count_ < kCapacity) ? buf_[i] : buf_[(write_pos_ + i) % kCapacity];
+      size_t need = entry.category.size() + entry.text.size() + 4;
+      if (written + need + 1 >= out_size)
+        break;
+      out[written++] = '[';
+      std::memcpy(out + written, entry.category.data(), entry.category.size());
+      written += entry.category.size();
+      out[written++] = ']';
+      out[written++] = ' ';
+      std::memcpy(out + written, entry.text.data(), entry.text.size());
+      written += entry.text.size();
+      out[written++] = '\n';
+    }
+    base_sink<std::mutex>::mutex_.unlock();
+    mutable_mutex_.unlock();
+    return written;
   }
 
  protected:

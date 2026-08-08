@@ -12,6 +12,7 @@
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
+#include <rex/diag/crash_handler.h>
 #include <rex/literals.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -321,6 +322,7 @@ X_STATUS XThread::Create() {
   params.create_suspended = true;
   thread_ = rex::thread::Thread::Create(params, [this]() {
     rex::initialize_seh_thread();
+    rex::diag::crash::PrepareCurrentThread();
     runtime::ThreadState::Bind(thread_state_.get());
 
     // Set thread ID override. This is used by logging.

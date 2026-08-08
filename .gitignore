@@ -45,3 +45,7 @@ New Text Document.txt
 ac6recomp.exe
 ac6recomp.toml
 extract-xiso.exe
+
+# Python bytecode cache (tools/*.py)
+__pycache__/
+*.pyc

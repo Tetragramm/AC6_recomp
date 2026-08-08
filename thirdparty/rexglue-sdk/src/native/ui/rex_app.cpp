@@ -12,6 +12,7 @@
 #include <rex/rex_app.h>
 
 #include <rex/cvar.h>
+#include <rex/diag/crash_handler.h>
 #include <rex/ui/flags.h>
 #include <rex/kernel/crt/heap.h>
 #include <rex/filesystem.h>
@@ -389,6 +390,32 @@ bool ReXApp::OnInitialize() {
   if (REXCVAR_GET(log_verbose) && log_level_str == "info") {
     log_level_str = "trace";
   }
+  // Crash reporting, installed before anything heavy runs so a fault during
+  // setup still produces a file. Crash files live beside the log, which is
+  // where a user already looks and what a bug report already asks for.
+  {
+    std::filesystem::path crash_dir;
+    if (log_file_cvar.empty()) {
+      crash_dir = exe_dir / "logs";
+    } else {
+      std::error_code crash_dir_ec;
+      crash_dir = std::filesystem::absolute(std::filesystem::path(log_file_cvar), crash_dir_ec)
+                      .parent_path();
+      if (crash_dir.empty())
+        crash_dir = std::filesystem::current_path();
+    }
+    std::error_code crash_dir_ec;
+    std::filesystem::create_directories(crash_dir, crash_dir_ec);
+
+    rex::diag::crash::InstallOptions crash_options;
+    crash_options.directory = crash_dir;
+    crash_options.app_name = std::string(GetName());
+    crash_options.build_title = REXGLUE_BUILD_TITLE;
+    crash_options.build_commit = REXGLUE_GIT_HASH;
+    crash_options.build_timestamp = REXGLUE_BUILD_TIMESTAMP;
+    rex::diag::crash::Install(crash_options);
+  }
+
   auto category_levels = rex::ParseCategoryLevelsFromConfig(config_path);
   auto log_config = rex::BuildLogConfig(log_file_cvar.empty() ? nullptr : log_file_cvar.c_str(),
                                         log_level_str, category_levels);
@@ -402,6 +429,10 @@ bool ReXApp::OnInitialize() {
   // Attach log capture sink to all loggers for the console overlay
   log_sink_ = std::make_shared<rex::LogCaptureSink>();
   rex::AddSink(log_sink_);
+  // The crash file embeds this ring buffer's tail: the log itself is replaced
+  // on the next launch, so the lines around a fault would otherwise be gone
+  // by the time anyone looks.
+  rex::diag::crash::SetLogTailSink(log_sink_.get());
   if (std::filesystem::exists(config_path)) {
     REXLOG_INFO("Loaded config: {}", config_path.filename().string());
   }
@@ -448,6 +479,14 @@ bool ReXApp::OnInitialize() {
     REXLOG_ERROR("Runtime setup failed: {:08X}", status);
     return false;
   }
+
+  // Guest-side crash reporting: the memory bounds classify a faulting address
+  // as guest vs host, and the generated function table lets a crash name
+  // rex_sub_* frames at runtime with no symbols shipped.
+  if (runtime_->memory()) {
+    rex::diag::crash::SetGuestMemoryBounds(runtime_->memory()->virtual_membase(), 0x11FFFFFFFull);
+  }
+  rex::diag::crash::SetGuestFunctionTable(ppc_info_.func_mappings);
 
   std::string xex_image = "game:\\default.xex";
 
@@ -620,6 +659,10 @@ void ReXApp::OnClosing(ui::UIEvent& e) {
 }
 
 void ReXApp::OnDestroy() {
+  // The shutdown path is running, so the atexit hook must not report this
+  // exit as unexpected.
+  rex::diag::crash::NotifyOrderlyShutdown();
+
   // Notify subclass before cleanup
   OnShutdown();
 
