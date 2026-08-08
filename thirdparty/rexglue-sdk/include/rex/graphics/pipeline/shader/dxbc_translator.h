@@ -1081,6 +1081,15 @@ class DxbcShaderTranslator : public ShaderTranslator {
   // alpha test, alpha to coverage, exponent bias, gamma, and also for ROV
   // writing).
   uint32_t system_temps_color_[4];
+  // Screen-space gradients of one interpolator, computed in the prologue where
+  // control flow is quad-uniform, so that a texture fetch buried inside
+  // translated guest control flow can use well-defined derivatives instead of
+  // recomputing undefined ones at the fetch site. UINT32_MAX when unused;
+  // hoisted_gradient_interpolator_ is the interpolator (and guest register)
+  // index they belong to.
+  uint32_t system_temp_hoisted_grad_h_;
+  uint32_t system_temp_hoisted_grad_v_;
+  uint32_t hoisted_gradient_interpolator_;
 
   // Memory export temporary registers are allocated if the shader writes any
   // eM# (current_shader().memexport_eM_written() != 0).

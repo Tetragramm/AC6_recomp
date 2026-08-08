@@ -726,6 +726,18 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
 
   uint32_t tfetch_index = instr.operands[1].storage_index;
 
+  // See ac6_fix_hoisted_fetch_gradients_hashes: use the prologue-computed
+  // gradients for this fetch if its coordinates are read straight from the guest
+  // register that the hoisted interpolator was loaded into. Requiring a plain,
+  // absolutely-addressed register read is what keeps the substitution honest -
+  // anything else and the gradients would not correspond to the coordinates.
+  bool use_hoisted_gradients =
+      is_pixel_shader() && system_temp_hoisted_grad_h_ != UINT32_MAX &&
+      hoisted_gradient_interpolator_ != UINT32_MAX &&
+      instr.operands[0].storage_source == InstructionStorageSource::kRegister &&
+      instr.operands[0].storage_addressing_mode == InstructionStorageAddressingMode::kAbsolute &&
+      instr.operands[0].storage_index == hoisted_gradient_interpolator_;
+
   // Whether to use gradients (implicit or explicit) for LOD calculation.
   bool use_computed_lod = instr.attributes.use_computed_lod &&
                           (is_pixel_shader() || instr.attributes.use_register_gradients);
@@ -1742,6 +1754,28 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
                        dxbc::Src::R(size_and_is_3d_temp, dxbc::Src::kZZZZ));
               a_.OpEndIf();
             }
+          } else if (use_hoisted_gradients) {
+            // This fetch sits inside translated guest control flow, where DXBC
+            // derivatives are undefined - a quad pixel that did not enter the
+            // block holds a stale coordinate, so the finite difference
+            // collapses, the LOD runs off to negative infinity, and the fetch
+            // clamps to the finest mip. On Xenos the guest's predication and
+            // jumps still let every pixel of the quad execute, so its
+            // derivatives are well defined; this restores that by using the
+            // gradients taken in the prologue, where the quad is uniform.
+            // Swizzled the way the coordinate operand is, so the components line
+            // up with coord_and_sampler_temp.
+            for (uint32_t i = 0; i < grad_component_count; ++i) {
+              uint32_t component =
+                  uint32_t(instr.operands[0].GetComponent(i)) - uint32_t(SwizzleSource::kX);
+              a_.OpMov(dxbc::Dest::R(grad_h_lod_temp, 1 << i),
+                       dxbc::Src::R(system_temp_hoisted_grad_h_).Select(component));
+              a_.OpMov(dxbc::Dest::R(grad_v_temp, 1 << i),
+                       dxbc::Src::R(system_temp_hoisted_grad_v_).Select(component));
+            }
+            a_.OpMul(dxbc::Dest::R(grad_h_lod_temp, grad_mask), dxbc::Src::R(grad_h_lod_temp),
+                     lod_src);
+            a_.OpMul(dxbc::Dest::R(grad_v_temp, grad_mask), dxbc::Src::R(grad_v_temp), lod_src);
           } else {
             // Coarse is according to the Direct3D 11.3 specification.
             a_.OpDerivRTXCoarse(dxbc::Dest::R(grad_h_lod_temp, grad_mask),

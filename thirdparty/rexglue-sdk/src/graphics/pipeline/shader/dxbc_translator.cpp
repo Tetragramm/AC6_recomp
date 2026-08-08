@@ -13,7 +13,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
+#include <string>
 #include <memory>
 
 #include <rex/assert.h>
@@ -36,6 +38,51 @@ REXCVAR_DECLARE(bool, param_gen_host_subpixel_restore);
 
 namespace rex::graphics {
 using namespace ucode;
+
+namespace {
+// Whether `hash` appears in a comma/space separated token list whose tokens are
+// "<hex-hash>:<index>[+<index>...]" (an optional "0x" prefix is accepted). Used
+// to opt individual guest shaders into a translation change at runtime, so
+// re-targeting needs no rebuild.
+bool UcodeHashInList(uint64_t hash, const std::string& list, uint32_t index) {
+  auto is_sep = [](char c) {
+    return c == ',' || c == ';' || c == ' ' || c == '\t' || c == '\n' || c == '\r';
+  };
+  size_t i = 0, n = list.size();
+  while (i < n) {
+    while (i < n && is_sep(list[i])) {
+      ++i;
+    }
+    size_t start = i;
+    while (i < n && !is_sep(list[i])) {
+      ++i;
+    }
+    if (i > start) {
+      std::string token = list.substr(start, i - start);
+      size_t colon = token.find(':');
+      if (colon == std::string::npos) {
+        continue;
+      }
+      if (std::strtoull(token.substr(0, colon).c_str(), nullptr, 16) != hash) {
+        continue;
+      }
+      size_t p = colon + 1;
+      while (p < token.size()) {
+        size_t e = token.find('+', p);
+        if (e == std::string::npos) {
+          e = token.size();
+        }
+        if (e > p && std::strtoul(token.substr(p, e - p).c_str(), nullptr, 10) == index) {
+          return true;
+        }
+        p = e + 1;
+      }
+      // The same hash may appear again with other indices - keep scanning.
+    }
+  }
+  return false;
+}
+}  // namespace
 
 // Notes about operands:
 //
@@ -640,11 +687,24 @@ void DxbcShaderTranslator::StartPixelShader() {
     if (i == param_gen_interpolator) {
       continue;
     }
+    bool interpolator_present =
+        i < xenos::kMaxInterpolators && (interpolator_mask & (UINT32_C(1) << i));
+    dxbc::Src interpolator_src(
+        interpolator_present
+            ? dxbc::Src::V1D(in_reg_ps_interpolators_ +
+                             rex::bit_count(interpolator_mask & ((UINT32_C(1) << i) - 1)))
+            : dxbc::Src::LF(0.0f));
     a_.OpMov(uses_register_dynamic_addressing ? dxbc::Dest::X(0, i) : dxbc::Dest::R(i),
-             (i < xenos::kMaxInterpolators && (interpolator_mask & (UINT32_C(1) << i)))
-                 ? dxbc::Src::V1D(in_reg_ps_interpolators_ +
-                                  rex::bit_count(interpolator_mask & ((UINT32_C(1) << i) - 1)))
-                 : dxbc::Src::LF(0.0f));
+             interpolator_src);
+    // Hoisted gradients (ac6_fix_hoisted_fetch_gradients_hashes): take this
+    // interpolator's derivatives HERE, in the prologue, where every pixel of the
+    // quad is running, so a fetch inside translated guest control flow can use a
+    // well-defined value instead of an undefined one computed at the fetch site.
+    if (interpolator_present && i == hoisted_gradient_interpolator_ &&
+        system_temp_hoisted_grad_h_ != UINT32_MAX) {
+      a_.OpDerivRTXCoarse(dxbc::Dest::R(system_temp_hoisted_grad_h_), interpolator_src);
+      a_.OpDerivRTYCoarse(dxbc::Dest::R(system_temp_hoisted_grad_v_), interpolator_src);
+    }
   }
 
   // Write the pixel parameters to the specified interpolator register
@@ -842,6 +902,9 @@ void DxbcShaderTranslator::StartTranslation() {
 
   // Allocate global system temporary registers that may also be used in the
   // epilogue.
+  system_temp_hoisted_grad_h_ = UINT32_MAX;
+  system_temp_hoisted_grad_v_ = UINT32_MAX;
+  hoisted_gradient_interpolator_ = UINT32_MAX;
   if (is_vertex_shader()) {
     system_temp_position_ = PushSystemTemp(0b1111);
     system_temp_point_size_edge_flag_kill_vertex_ = PushSystemTemp(0b0100);
@@ -879,6 +942,25 @@ void DxbcShaderTranslator::StartTranslation() {
     for (uint32_t i = 0; i < 4; ++i) {
       if (shader_writes_color_targets & (1 << i)) {
         system_temps_color_[i] = PushSystemTemp(0b1111);
+      }
+    }
+    // Registers for the hoisted gradients of one interpolator - see
+    // ac6_fix_hoisted_fetch_gradients_hashes. They have to live across the whole
+    // guest program, because the fetch that consumes them is buried inside its
+    // control flow.
+    if (!is_depth_only_pixel_shader_) {
+      const std::string& hoisted_grad_hashes =
+          REXCVAR_GET(ac6_fix_hoisted_fetch_gradients_hashes);
+      if (!hoisted_grad_hashes.empty()) {
+        uint64_t ucode_hash = current_shader().ucode_data_hash();
+        for (uint32_t i = 0; i < xenos::kMaxInterpolators; ++i) {
+          if (UcodeHashInList(ucode_hash, hoisted_grad_hashes, i)) {
+            hoisted_gradient_interpolator_ = i;
+            system_temp_hoisted_grad_h_ = PushSystemTemp();
+            system_temp_hoisted_grad_v_ = PushSystemTemp();
+            break;
+          }
+        }
       }
     }
   }
@@ -1127,6 +1209,14 @@ void DxbcShaderTranslator::CompleteShaderCode() {
     // system_temp_point_size_edge_flag_kill_vertex_.
     PopSystemTemp(2);
   } else if (is_pixel_shader()) {
+    if (system_temp_hoisted_grad_h_ != UINT32_MAX) {
+      // Release system_temp_hoisted_grad_v_ and system_temp_hoisted_grad_h_
+      // (pushed after system_temps_color_).
+      PopSystemTemp(2);
+      system_temp_hoisted_grad_h_ = UINT32_MAX;
+      system_temp_hoisted_grad_v_ = UINT32_MAX;
+      hoisted_gradient_interpolator_ = UINT32_MAX;
+    }
     // Release system_temps_color_.
     uint32_t shader_writes_color_targets = current_shader().writes_color_targets();
     for (int32_t i = 3; i >= 0; --i) {

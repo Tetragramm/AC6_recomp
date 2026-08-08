@@ -75,6 +75,30 @@ REXCVAR_DEFINE_STRING(ac6_densify_y_fetch_hashes, "", "AC6/Fixes",
                     "Normally driven by ac6_fix_dof.")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart)
     .debug_only();
+REXCVAR_DEFINE_STRING(ac6_fix_hoisted_fetch_gradients_hashes, "", "AC6/Fixes",
+                    "Token list \"<hash>:<interpolator index>\": compute that "
+                    "interpolator's screen-space gradients once in the pixel "
+                    "shader prologue, where the quad is uniform, and use them for "
+                    "any computed-LOD texture fetch in that shader whose "
+                    "coordinates come from the matching guest register.\n"
+                    "The guest predicates with \"(p0) exec\" and branches with "
+                    "\"jmp\", which on Xenos still let every pixel of the quad "
+                    "run - results are masked - so derivatives stay well defined. "
+                    "This translator turns both into real control flow, and DXBC "
+                    "derivatives inside non-uniform control flow are UNDEFINED: a "
+                    "quad pixel that did not enter the block holds a stale "
+                    "coordinate, so the gradient collapses, the LOD goes to "
+                    "negative infinity and the fetch clamps to the finest mip. "
+                    "Measured directly in AC6's ocean - the gradient the fetch "
+                    "receives reads zero along a mesh seam while the same "
+                    "quantity measured in the prologue is smooth.\n"
+                    "This restores hardware behaviour, so it is a fix rather than "
+                    "an enhancement. Which shaders it applies to stays a per-shader "
+                    "list rather than a blanket default, because the hazard is "
+                    "general rather than AC6-specific and widening it wants testing "
+                    "far beyond one ocean. Normally driven by ac6_fix_water_line.")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart)
+    .debug_only();
 REXCVAR_DEFINE_BOOL(ac6_flare_drop_quad2, true, "AC6/Fixes",
                     "Fix the faint rectangle around the sun by culling the lens "
                     "flare's spurious second billboard.")

@@ -18,6 +18,7 @@ REXCVAR_DECLARE(std::string, ac6_neutralize_deswizzle_hashes);
 REXCVAR_DECLARE(std::string, ac6_snap_guest_texel_hashes);
 REXCVAR_DECLARE(std::string, ac6_densify_x_fetch_hashes);
 REXCVAR_DECLARE(std::string, ac6_densify_y_fetch_hashes);
+REXCVAR_DECLARE(std::string, ac6_fix_hoisted_fetch_gradients_hashes);
 REXCVAR_DECLARE(bool, param_gen_integer_guest_position);
 REXCVAR_DECLARE(bool, param_gen_host_subpixel_restore);
 REXCVAR_DECLARE(std::string, log_level);
@@ -58,6 +59,9 @@ REXCVAR_DEFINE_BOOL(ac6_fix_deswizzle, true, "AC6/Fixes",
 REXCVAR_DEFINE_BOOL(ac6_fix_dof, true, "AC6/Fixes",
                     "Fix cutscene depth-of-field striping and ghosting at resolution "
                     "scale above 1x.")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(ac6_fix_water_line, true, "AC6/Fixes",
+                    "Fix the thin bright lines across open water.")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 #include "generated/ac6recomp_config.h"
@@ -192,6 +196,16 @@ void ApplyAc6FixDefaults() {
         rex::cvar::SetSessionDefault("ac6_densify_y_fetch_hashes", "5bd20f9d0d911687",
                                      "ac6_fix_dof");
     }
+    // Water pixel shader, interpolator 4 - the wave-normal UVs. Its fetches sit
+    // inside translated guest control flow, where DXBC derivatives are undefined,
+    // so the gradient collapses at the ocean mesh's seams and the lookup clamps
+    // to the finest mip. Hoisting the gradients to the prologue restores what the
+    // console computes. Not gated on draw scale: the seams are in the game's own
+    // vertex data, so this bites at 1x too.
+    if (REXCVAR_GET(ac6_fix_water_line)) {
+        rex::cvar::SetSessionDefault("ac6_fix_hoisted_fetch_gradients_hashes",
+                                     "35a80cb48a481624:4", "ac6_fix_water_line");
+    }
 }
 
 }  // namespace
@@ -227,16 +241,18 @@ void ApplyAc6PerformanceModeOverridesPublic() {
 void LogAc6ConfigPresetSummary() {
     REXLOG_ERROR("AC6 config: graphics mode={} capture={}", REXCVAR_GET(ac6_graphics_mode),
                  REXCVAR_GET(ac6_render_capture) ? "true" : "false");
-    REXLOG_ERROR("AC6 fixes: scaling={} deswizzle={} dof={} perf_mode={} unlock_fps={}",
+    REXLOG_ERROR("AC6 fixes: scaling={} deswizzle={} dof={} water_line={} perf_mode={} "
+                 "unlock_fps={}",
                  REXCVAR_GET(ac6_fix_scaling), REXCVAR_GET(ac6_fix_deswizzle),
-                 REXCVAR_GET(ac6_fix_dof), REXCVAR_GET(ac6_performance_mode),
-                 REXCVAR_GET(ac6_unlock_fps));
+                 REXCVAR_GET(ac6_fix_dof), REXCVAR_GET(ac6_fix_water_line),
+                 REXCVAR_GET(ac6_performance_mode), REXCVAR_GET(ac6_unlock_fps));
     REXLOG_ERROR("AC6 fix payloads: neutralize='{}' snap='{}' densify_x='{}' densify_y='{}' "
-                 "param_gen={}/{}",
+                 "hoisted_gradients='{}' param_gen={}/{}",
                  REXCVAR_GET(ac6_neutralize_deswizzle_hashes),
                  REXCVAR_GET(ac6_snap_guest_texel_hashes),
                  REXCVAR_GET(ac6_densify_x_fetch_hashes),
                  REXCVAR_GET(ac6_densify_y_fetch_hashes),
+                 REXCVAR_GET(ac6_fix_hoisted_fetch_gradients_hashes),
                  REXCVAR_GET(param_gen_integer_guest_position),
                  REXCVAR_GET(param_gen_host_subpixel_restore));
 }

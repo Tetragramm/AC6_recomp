@@ -35,6 +35,7 @@ REXCVAR_DECLARE(std::string, ac6_neutralize_deswizzle_hashes);
 REXCVAR_DECLARE(std::string, ac6_snap_guest_texel_hashes);
 REXCVAR_DECLARE(std::string, ac6_densify_x_fetch_hashes);
 REXCVAR_DECLARE(std::string, ac6_densify_y_fetch_hashes);
+REXCVAR_DECLARE(std::string, ac6_fix_hoisted_fetch_gradients_hashes);
 REXCVAR_DECLARE(std::string, readback_resolve);
 REXCVAR_DECLARE(bool, readback_resolve_half_pixel_offset);
 REXCVAR_DECLARE(bool, readback_memexport);
