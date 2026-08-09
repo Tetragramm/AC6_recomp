@@ -7,14 +7,183 @@ DEV TESTING BRANCH. THINGS WILL BREAK HERE
 
 A native PC port of **Ace Combat 6: Fires of Liberation** built on top of the [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk). The Xbox 360 PowerPC game code is statically recompiled to x86-64, while visible rendering currently remains authoritative in the vendored RexGlue/Xenia graphics backend.
 
-The AC6-specific graphics layer in this repo is now focused on:
+---
 
-- frame capture and diagnostics
-- swap-path inspection and overlay reporting
-- backend-fix routing for AC6-specific rendering issues
-- future selective override and modding hooks
+## Disclaimer
 
-The legacy AC6 replay renderer is still present as experimental tooling, but it is **not** the default render path and it does **not** hijack presentation unless `ac6_graphics_mode=legacy_replay_experimental` and `ac6_experimental_replay_present=true`.
+This project is an unofficial, non-commercial fan effort. It is **not affiliated with, endorsed by, or associated with** Bandai Namco Entertainment, Project Aces, or Microsoft. *Ace Combat 6: Fires of Liberation* and all related assets, characters, and trademarks are the property of their respective owners.
+
+**This repository contains source code only. It does not contain, and will never contain, any game data.** To use this software you must supply your own legally obtained copy of the game. No game files, disc images, DLC packages, title updates, or console keys are distributed here, and none may be committed to this repository.
+
+The software is provided as-is, without warranty of any kind. It is experimental: expect bugs, crashes, and visual or audio differences from the original console release. Do not redistribute builds bundled with game data.
+
+---
+
+## Features
+
+Everything listed here is on by default unless noted, and each fix can be turned off individually.
+See [Important console variables](#important-console-variables).
+
+- **60 FPS.** The game can now run up to 60 FPS, with the flight model corrected.
+- **High quality terrain.** Terrain is drawn at the full resolution shipped on the disc, twice what the console rendered. Cracks and seams that appear over mountains are also removed.
+- **Resolution scaling.** Render internally at 2× (1440p) or 3× (2160p) and beyond for a much sharper image.
+- **Ultrawide support.** Optional hor+ widescreen in missions and cutscenes.
+- **AC7-like keyboard and mouse controls.** Mouse steering, remappable bindings, live-reloaded from a config file. Controllers work out of the box, including a virtual pad when none is connected.
+- **Japanese language support.**
+- **Texture replacement modding** — see [Modding docs](#modding-docs).
+
+### Fixes
+
+*Most of the known issues with the recomp have been fixed. Please report if you have found more issues.*
+
+*Performance is a known issue with the recomp! Due to native renderer not yet implemented, a powerful GPU is recommended to be able to run the game at 60 FPS at high resolution!*
+
+---
+
+## Quick Start Guide
+
+### Requirements
+
+| | |
+|---|---|
+| **OS** | Windows 10 or 11, 64-bit |
+| **CPU** | **Must support AVX2** — Intel 4th-gen Core (2013) or newer, AMD Zen (2017) or newer. |
+| **GPU** | Direct3D 12 capable |
+| **Game data** | Your own legally obtained copy of Ace Combat 6 (US region only! Europe and Japan is not supported) |
+
+*Note that the system requirement does not guarantees that the recomp will perform well on your system!*
+
+### Steps
+
+1. **Get a build.** Either download from release, or build from source (see [How to build](#how-to-build)).
+
+2. **Provide the game data.** Put *one* of the following next to `ac6recomp.exe`:
+   - the game's `.iso` disc image **or**
+   - an `assets/` folder containing the extracted game files.
+
+4. **(Optional) Add DLC.** Extracted DLC packages can be placed next to the executable, inside a folder named `dlc/`.
+
+5. **Run `ac6recomp.exe`.** On first run it creates `ac6recomp.toml` beside the executable, which contains the game settings.
+
+6. **In-game keys:**
+   - `F3` - toggle FPS overlay
+   - `F4` - settings overlay (browse and change most options live)
+   - `F11` - toggle fullscreen
+
+---
+
+## Important console variables
+
+Settings live in **`ac6recomp.toml`** next to the executable. Most can also be changed live in the `F4` overlay. Some only take effect after a restart.
+
+> [!IMPORTANT]
+> In `.toml`, **use forward slashes in paths**. A single backslash is an escape character and one bad line silently voids the entire file, sending every setting back to its default.
+
+| cvar | default | what it does |
+|---|---|---|
+| `user_language` | `1` | Sets the language. `1` for English, `2` for Japanese. |
+| `fullscreen` | `false` | Start in fullscreen (`F11` toggles at runtime) |
+| `draw_resolution_scale_x` | `1` | Internal render scale on the x axis. `1` for 1280, `2` for 2560, `3` for 3840, etc. |
+| `draw_resolution_scale_y` | `1` | Internal render scale on the y axis. `1` for 720, `2` for 1440, `3` for 2160, etc. |
+| `ac6_unlock_fps` | `true` | Allow framerates above the stock 30 fps |
+| `ac6_dynamic_vblank` | `true` | Keep menus and cutscenes at their native 60 Hz pacing while gameplay runs at your target |
+| `ac6_performance_mode` | `true` | Reduces logging and diagnostic overhead |
+| `ac6_widescreen` | `false` | Ultrawide support (hor+) in missions. Menus and hangar stay 16:9 |
+| `ac6_widescreen_cinematics` | `true` | With ultrawide on, also widen in-engine cinematics. They are staged for 16:9, so this can expose set edges |
+| `ac6_terrain_hd` | `true` | Draw terrain at the full shipped resolution (2× what the console drew), which also removes terrain cracks |
+| `ac6_cursor_hide_seconds` | `3.0` | Hide the mouse cursor after this many idle seconds. `0` = never hide |
+| `ac6_kbm_enabled` | `false` | **Enable keyboard and mouse controls.** Off by default — controllers work out of the box |
+| `ac6_kbm_config` | `ac6_input.toml` | Path to the key bindings file. Edits are picked up live |
+| `ac6_texture_swaps_enabled` | `false` | Enable texture replacement mods (see [Modding docs](#modding-docs)) |
+
+For 1440p, set both `draw_resolution_scale_x` and `draw_resolution_scale_y` to `2`. For 2160p or 4K, set them to `3`.
+
+For 1440p Ultrawide, it is recommended to set `draw_resolution_scale_x` to `3` and `draw_resolution_scale_y` to `2`.
+
+### Fixes
+
+These are on by default and exist so a problem can be isolated. Turning one off restores the original behavior, bugs included.
+
+| cvar | default | what it fixes |
+|---|---|---|
+| `ac6_effect_mode_fix` | `false` | **IMPORTANT: If your clouds and afterburner effects are flickering, set this to `true`!** |
+| `ac6_fix_scaling` | `true` | Upscaling mosaic on deferred passes (only active above 1× scale) |
+| `ac6_fix_deswizzle` | `true` | Mosaic and streak artifacts from the game's manual texture de-swizzle |
+| `ac6_fix_dof` | `true` | Cutscene depth-of-field striping and ghosting above 1× scale |
+| `ac6_fix_trails` | `true` | Invisible missile and jet trails |
+| `ac6_fix_water_line` | `true` |  Lines across open water seen at a grazing angle |
+| `ac6_flare_drop_quad2` | `true` | Faint rectangle around the sun |
+| `ac6_cutscene_resync` | `true` | Keeps cutscene video locked to its audio after a render hitch |
+
+---
+
+## Default keybinds
+
+Controllers work with no configuration. **Keyboard and mouse are off by default**. Set `ac6_kbm_enabled = true` to enable them.
+
+Bindings live in `ac6_input.toml`, created next to the executable on first run after `ac6_kbm_enabled` is enabled. By default, the keybinds are similar to Ace Combat 7.
+
+### Flight
+
+| action | keys | | action | keys |
+|---|---|---|---|---|
+| Pitch down / up | `1` / `3` | | Fire machine gun | `Mouse1`, `Left Ctrl` |
+| Roll left / right | `A` / `D` | | Fire missile | `Mouse2`, `Space` |
+| Yaw left / right | `Q` / `E` | | Change weapon | `Mouse wheel`, `C` |
+| Accelerate | `W` | | Switch targets | `Tab` |
+| Decelerate | `S` | | Change view | `V` |
+| High-G turn | `2` | | Radar / map | `R` |
+| Autopilot | `Z`, `X` | | Landing gear | `G` |
+| Pause | `Escape` | | | |
+
+**Mouse** steers the aircraft. Hold `Left Alt` (camera control) to look around with the mouse instead of steering.
+
+**Camera:** `Numpad 8` / `2` / `4` / `6` — up / down / left / right.
+
+**Wingman commands:** arrow keys.
+
+### Menus
+
+| action | keys |
+|---|---|
+| Navigate | `W` `A` `S` `D` or arrow keys |
+| Confirm | `Space`, `Mouse1` |
+| Cancel | `Escape`, `Backspace`, `Mouse2` |
+| Start | `Enter` |
+| Back | `Tab` |
+
+---
+
+## How to build
+
+### Option A: Automatic setup (recommended)
+
+The automated build script handles environment setup, ISO extraction, and the multi-step CMake build:
+
+1. Place your legally obtained **Ace Combat 6 ISO** in the repository root directory.
+2. Run `setup_and_build.bat`. The script locates Visual Studio, extracts the assets, runs codegen, and builds the runtime using the MSVC backend.
+3. Copy the compiled executable and default config to the root directory to run:
+   ```powershell
+   Copy-Item out/build/win-amd64-relwithdebinfo/ac6recomp.exe . -Force
+   Copy-Item out/build/win-amd64-relwithdebinfo/ac6recomp.toml . -Force
+   ```
+4. Run `ac6recomp.exe` directly from the root directory.
+5. Optionally create a shortcut to the executable.
+
+### Option B: Manual build
+
+```bash
+cmake --preset win-amd64-relwithdebinfo
+cmake --build --preset win-amd64-relwithdebinfo --target ac6recomp_codegen
+cmake --preset win-amd64-relwithdebinfo
+cmake --build --preset win-amd64-relwithdebinfo
+```
+
+The executable is placed at `out/build/win-amd64-relwithdebinfo/ac6recomp.exe`.
+
+On Windows, use the preset commands above rather than plain `cmake -L` in the repo root. If you previously configured from an `x86` Visual Studio prompt or with the wrong compiler on `PATH`, delete `out/build/win-amd64-relwithdebinfo` and re-run the preset from a normal 64-bit PowerShell/CMD window or an x64 Native Tools prompt.
+
+---
 
 ## Repository policy
 
@@ -29,66 +198,11 @@ Do **not** commit or redistribute:
 
 Users must supply their own legally obtained game files locally.
 
-## Build
-
-### Option A: Automatic Setup (Recommended)
-You can use the automated build script which handles environment setup, ISO extraction, and the multi-step CMake build:
-1. Place your legally obtained **Ace Combat 6 ISO** in the repository root directory.
-2. Run `setup_and_build.bat`. The script will automatically locate Visual Studio, extract the assets, run codegen, and build the runtime using the MSVC backend.
-3. Once completed, copy the compiled executable and default config to the root directory to run:
-   ```powershell
-   Copy-Item out/build/win-amd64-relwithdebinfo/ac6recomp.exe . -Force
-   Copy-Item out/build/win-amd64-relwithdebinfo/ac6recomp.toml . -Force
-   ```
-4. Run `ac6recomp.exe` directly from the root directory.
-5. Optionally create a shortcut to the executable file.
-
-### Option B: Manual Build
-```bash
-cmake --preset win-amd64-relwithdebinfo
-cmake --build --preset win-amd64-relwithdebinfo --target ac6recomp_codegen
-cmake --preset win-amd64-relwithdebinfo
-cmake --build --preset win-amd64-relwithdebinfo
-```
-
-The executable is placed at `out/build/win-amd64-relwithdebinfo/ac6recomp.exe`.
-
-On Windows, use the preset commands above rather than plain `cmake -L` in the repo root. If you previously configured from an `x86` Visual Studio prompt or with the wrong compiler on `PATH`, delete `out/build/win-amd64-relwithdebinfo` and re-run the preset from a normal 64-bit PowerShell/CMD window or an x64 Native Tools prompt.
-
-## Recommended Configuration Tweaks
-
-Create or modify `ac6recomp.toml` in your out or root directory with these settings to optimize your gameplay experience:
-
-```toml
-# Play in Fullscreen
-fullscreen = true
-
-# (Forces point lists to expand to triangle strips in the VS, bypassing deprecated GPU point-sprite limits)
-d3d12_expand_point_sprites_in_vs = true
-
-# Eliminate Microstutters
-# (Decouples presentation from UI event loop thread and enables G-Sync/FreeSync VRR tearing support)
-host_present_from_non_ui_thread = true
-d3d12_allow_variable_refresh_rate_and_tearing = true
-d3d12_low_latency_swap_chain = true
-d3d12_max_frame_latency = 1
-```
-
-## Modding Docs
+## Modding docs
 
 - [Texture Swap Modding Guide](docs/TEXTURE_SWAP_MODDING_GUIDE.txt)
 - [Texture Swap Reference](docs/TEXTURE_SWAPS.txt)
 
-## Runtime Defaults
-
-The default AC6 graphics configuration after this pivot is:
-
-- `ac6_native_graphics_enabled=true`
-- `ac6_graphics_mode=hybrid_backend_fixes`
-- `ac6_render_capture=true`
-- `ac6_experimental_replay_present=false`
-
-That means the RexGlue/Xenia D3D12 backend remains the visible renderer by default, while AC6-specific analysis and diagnostics stay active.
 
 ## Project layout
 
