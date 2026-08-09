@@ -92,6 +92,12 @@ class D3D12Provider : public GraphicsProvider {
   D3D12_RESOURCE_BINDING_TIER GetResourceBindingTier() const { return resource_binding_tier_; }
   D3D12_TILED_RESOURCES_TIER GetTiledResourcesTier() const { return tiled_resources_tier_; }
   bool AreUnalignedBlockTexturesSupported() const { return unaligned_block_textures_supported_; }
+  // D3D12_BLEND_ALPHA_FACTOR / INV_ALPHA_FACTOR are an OPTIONAL feature: the
+  // docs require D3D12_FEATURE_DATA_D3D12_OPTIONS13::AlphaBlendFactorSupported
+  // to be TRUE before either may be used. Using them without checking gets the
+  // whole pipeline rejected, and the draw disappears with it. False when the
+  // runtime is too old to answer, which is the safe reading.
+  bool IsAlphaBlendFactorSupported() const { return alpha_blend_factor_supported_; }
   uint32_t GetVirtualAddressBitsPerResource() const { return virtual_address_bits_per_resource_; }
 
   // Proxies for DirectX functions since they are loaded dynamically.
@@ -167,6 +173,7 @@ class D3D12Provider : public GraphicsProvider {
   bool ps_specified_stencil_reference_supported_;
   bool rasterizer_ordered_views_supported_;
   bool unaligned_block_textures_supported_;
+  bool alpha_blend_factor_supported_;
 };
 
 }  // namespace rex::ui::d3d12

@@ -61,7 +61,65 @@ REXCVAR_DEFINE_INT32(d3d12_pipeline_creation_threads, -1, "GPU/D3D12",
 REXCVAR_DEFINE_BOOL(d3d12_tessellation_wireframe, false, "GPU/D3D12",
                     "Render tessellation as wireframe");
 
+REXCVAR_DEFINE_BOOL(d3d12_constant_alpha_blend, true, "GPU/D3D12",
+                    "Use the D3D12 constant-alpha blend factors where the device reports "
+                    "support for them. Turning this off forces the substitute encoding even "
+                    "on a device that allows them, which is the only way to exercise that "
+                    "path for testing; devices without support always use it regardless")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 namespace rex::graphics::d3d12 {
+
+// Whether the D3D12 constant-alpha blend factors may be emitted: the device
+// must report AlphaBlendFactorSupported - they are an optional feature, and
+// using them without it makes CreateGraphicsPipelineState reject the pipeline
+// outright - and the cvar must not be forcing the substitute for testing.
+static bool UseConstantAlphaBlendFactors(const D3D12CommandProcessor& command_processor) {
+  return command_processor.GetD3D12Provider().IsAlphaBlendFactorSupported() &&
+         REXCVAR_GET(d3d12_constant_alpha_blend);
+}
+
+// Whether this draw may carry the blend constant's alpha in the pixel shader's
+// alpha output so INV_SRC_ALPHA can stand in for ONE_MINUS_CONSTANT_ALPHA.
+//
+// Needed only when a COLOUR slot asks for the constant's alpha (guest 14/15) -
+// the colour equation is the one with no other route to it. Permitted only when
+// nothing else reads the alpha the shader writes, because the route overwrites
+// it: no slot anywhere may use a source-alpha factor (guest 6, 7 and the
+// saturating 16 read it; in the alpha equation guest 4 and 5 collapse onto it
+// too), and neither the alpha test nor alpha-to-mask may be enabled.
+//
+// Scans all four blend controls rather than only the bound ones. That can only
+// withhold the route, never grant it wrongly, which is the safe direction.
+static bool DrawNeedsBlendConstantAlphaInOutput(const RegisterFile& regs) {
+  auto color_control = regs.Get<reg::RB_COLORCONTROL>();
+  if (color_control.alpha_test_enable || color_control.alpha_to_mask_enable) {
+    return false;
+  }
+  bool colour_slot_wants_constant_alpha = false;
+  for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+    auto blendcontrol =
+        regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[i]);
+    uint32_t colour_factors[] = {uint32_t(blendcontrol.color_srcblend),
+                                 uint32_t(blendcontrol.color_destblend)};
+    uint32_t alpha_factors[] = {uint32_t(blendcontrol.alpha_srcblend),
+                                uint32_t(blendcontrol.alpha_destblend)};
+    for (uint32_t factor : colour_factors) {
+      if (factor == 14 || factor == 15) {
+        colour_slot_wants_constant_alpha = true;
+      }
+      if (factor == 6 || factor == 7 || factor == 16) {
+        return false;
+      }
+    }
+    for (uint32_t factor : alpha_factors) {
+      if (factor == 4 || factor == 5 || factor == 6 || factor == 7 || factor == 16) {
+        return false;
+      }
+    }
+  }
+  return colour_slot_wants_constant_alpha;
+}
 
 // Generated with `xb buildshaders`.
 namespace shaders {
@@ -872,6 +930,13 @@ DxbcShaderTranslator::Modification PipelineCache::GetCurrentPixelShaderModificat
     modification.pixel.param_gen_point = 0;
   }
 
+  modification.pixel.alpha_output_is_blend_constant =
+      (!UseConstantAlphaBlendFactors(command_processor_) &&
+       render_target_cache_.GetPath() == RenderTargetCache::Path::kHostRenderTargets &&
+       DrawNeedsBlendConstantAlphaInOutput(regs))
+          ? 1
+          : 0;
+
   if (render_target_cache_.GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
     using DepthStencilMode = DxbcShaderTranslator::Modification::DepthStencilMode;
     if (render_target_cache_.depth_float24_convert_in_pixel_shader() &&
@@ -1534,10 +1599,13 @@ bool PipelineCache::GetCurrentStateDescription(
         /* 12 */ PipelineBlendFactor::kBlendFactor,
         // ONE_MINUS_CONSTANT_COLOR
         /* 13 */ PipelineBlendFactor::kInvBlendFactor,
-        // CONSTANT_ALPHA - uses the constant's ALPHA, not RGB.
-        /* 14 */ PipelineBlendFactor::kBlendFactorAlpha,
-        // ONE_MINUS_CONSTANT_ALPHA - uses 1 - constant ALPHA, not 1 - RGB.
-        /* 15 */ PipelineBlendFactor::kInvBlendFactorAlpha,
+        // CONSTANT_ALPHA / ONE_MINUS_CONSTANT_ALPHA. This is the ALPHA blend
+        // equation, where D3D12's plain BLEND_FACTOR already takes the
+        // constant's alpha component - ALPHA_FACTOR computes the same value
+        // here. Use the always-available factor so the alpha slots never depend
+        // on an optional feature; only the colour slots genuinely need one.
+        /* 14 */ PipelineBlendFactor::kBlendFactor,
+        /* 15 */ PipelineBlendFactor::kInvBlendFactor,
         /* 16 */ PipelineBlendFactor::kSrcAlphaSat,
     };
     // While it's okay to specify fewer render targets in the pipeline state
@@ -1552,6 +1620,32 @@ bool PipelineCache::GetCurrentStateDescription(
     // multisampled render targets bound (happens in 4D5307E6 main menu).
     // TODO(Triang3l): Investigate interaction of OMSetRenderTargets with
     // non-null depth and DSVFormat DXGI_FORMAT_UNKNOWN in the same case.
+    // The colour blend equation cannot reach the blend constant's alpha on its
+    // own, so the Xenos CONSTANT_ALPHA / ONE_MINUS_CONSTANT_ALPHA factors
+    // (14/15) need D3D12's optional ALPHA_FACTOR family there. Where that is
+    // unavailable the pixel shader carries the constant's alpha in its alpha
+    // output instead, and SRC_ALPHA / INV_SRC_ALPHA reproduce them exactly. If
+    // even that route is closed, fall back to the constant-colour family -
+    // wrong, but it keeps the draw.
+    const bool substitute_constant_alpha = !UseConstantAlphaBlendFactors(command_processor_);
+    const bool alpha_via_output =
+        substitute_constant_alpha && DrawNeedsBlendConstantAlphaInOutput(regs);
+    auto map_colour_blend_factor = [substitute_constant_alpha,
+                                    alpha_via_output](PipelineBlendFactor factor) {
+      if (!substitute_constant_alpha) {
+        return factor;
+      }
+      switch (factor) {
+        case PipelineBlendFactor::kBlendFactorAlpha:
+          return alpha_via_output ? PipelineBlendFactor::kSrcAlpha
+                                  : PipelineBlendFactor::kBlendFactor;
+        case PipelineBlendFactor::kInvBlendFactorAlpha:
+          return alpha_via_output ? PipelineBlendFactor::kInvSrcAlpha
+                                  : PipelineBlendFactor::kInvBlendFactor;
+        default:
+          return factor;
+      }
+    };
     for (uint32_t i = 0; i < 4; ++i) {
       if (!(bound_depth_and_color_render_target_bits & (uint32_t(1) << (1 + i)))) {
         continue;
@@ -1565,8 +1659,10 @@ bool PipelineCache::GetCurrentStateDescription(
       if (rt.write_mask) {
         auto blendcontrol =
             regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[i]);
-        rt.src_blend = kBlendFactorMap[uint32_t(blendcontrol.color_srcblend)];
-        rt.dest_blend = kBlendFactorMap[uint32_t(blendcontrol.color_destblend)];
+        rt.src_blend =
+            map_colour_blend_factor(kBlendFactorMap[uint32_t(blendcontrol.color_srcblend)]);
+        rt.dest_blend =
+            map_colour_blend_factor(kBlendFactorMap[uint32_t(blendcontrol.color_destblend)]);
         rt.blend_op = blendcontrol.color_comb_fcn;
         rt.src_blend_alpha = kBlendFactorAlphaMap[uint32_t(blendcontrol.alpha_srcblend)];
         rt.dest_blend_alpha = kBlendFactorAlphaMap[uint32_t(blendcontrol.alpha_destblend)];

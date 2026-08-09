@@ -111,7 +111,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
     // If anything in this is structure is changed in a way not compatible with
     // the previous layout, invalidate the pipeline storages by increasing this
     // version number (0xYYYYMMDD)!
-    static constexpr uint32_t kVersion = 0x20260410;
+    static constexpr uint32_t kVersion = 0x20260809;
 
     enum class DepthStencilMode : uint32_t {
       kNoModifiers,
@@ -176,6 +176,18 @@ class DxbcShaderTranslator : public ShaderTranslator {
       uint32_t dynamic_addressable_register_count : 8;
       // Non-ROV - depth / stencil output mode.
       DepthStencilMode depth_stencil_mode : 2;
+      // Non-ROV - write the blend constant's alpha into the alpha of colour
+      // output 0 instead of what the guest shader produced.
+      //
+      // The colour blend equation has no way of its own to reach the blend
+      // constant's alpha, and D3D12's ALPHA_FACTOR family - which exists for
+      // exactly that - is an optional feature some devices do not have. Putting
+      // the value in the alpha output lets INV_SRC_ALPHA stand in for
+      // ONE_MINUS_CONSTANT_ALPHA exactly, using only always-available factors.
+      //
+      // Only set when the alpha equation does not read the alpha output, so
+      // overwriting it cannot change the alpha result.
+      uint32_t alpha_output_is_blend_constant : 1;
     } pixel;
 
     explicit Modification(uint64_t modification_value = 0) : value(modification_value) {

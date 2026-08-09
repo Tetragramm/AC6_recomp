@@ -1563,6 +1563,17 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToRTVs() {
       }
       a_.OpEndIf();
     }
+    if (i == 0 && GetDxbcShaderModification().pixel.alpha_output_is_blend_constant) {
+      // Hand the blend constant's alpha to the output merger through the alpha
+      // output, so INV_SRC_ALPHA can express ONE_MINUS_CONSTANT_ALPHA exactly
+      // on devices without the constant-alpha blend factors. Safe only because
+      // this modification is set exclusively for draws whose alpha equation
+      // ignores the alpha output - see PixelShaderModification.
+      a_.OpMov(dxbc::Dest::R(system_temp_color, 0b1000),
+               LoadSystemConstant(SystemConstants::Index::kEdramBlendConstant,
+                                  offsetof(SystemConstants, edram_blend_constant),
+                                  dxbc::Src::kWWWW));
+    }
     // Copy the color from a readable temp register to an output register.
     a_.OpMov(dxbc::Dest::O(i), dxbc::Src::R(system_temp_color));
   }
