@@ -159,6 +159,9 @@ struct DiscoveredContainer {
   uint32_t title_id = 0;
   std::u16string display_name;
   std::string source;  // short label for the startup report ("dlc", "content root")
+  // A package can be a raw container file or an already-extracted folder; both
+  // mount, ContentPackage picks the device by what the path is.
+  bool is_extracted_folder = false;
 };
 
 class ContentManager {
@@ -204,13 +207,14 @@ class ContentManager {
   // and writes a .header file for XAM enumeration.
   X_RESULT InstallContent(const std::filesystem::path& package_path);
 
-  // Scans for raw content containers - a dlc folder (recursive, so a flat
-  // dump and Xenia's content-directory layout both work) plus container files
-  // dropped straight into the content root - and logs one line per package
-  // found. Only containers for the running title are indexed, so call after
-  // the module is loaded. Containers take priority over an ambient extracted
-  // install: the user placed them next to the exe, so they win - same rule as
-  // the assets folder (and Windows' local-DLL search order).
+  // Scans the dlc folder (recursive, so a flat dump and Xenia's
+  // content-directory layout both work) plus container files dropped straight
+  // into the content root, and logs one line per package found. In the dlc
+  // folder a package may be either a raw container file or an ALREADY-EXTRACTED
+  // package folder - both mount. Only packages for the running title are
+  // indexed, so call after the module is loaded. What the user placed in dlc
+  // takes priority over an ambient extracted install - same rule as the assets
+  // folder (and Windows' local-DLL search order).
   void DiscoverContainers(const std::filesystem::path& dlc_dir);
 
  private:
@@ -234,7 +238,7 @@ class ContentManager {
   const DiscoveredContainer* FindContainer(const std::string_view file_name,
                                            XContentType content_type) const;
   void DiscoverContainersInDir(const std::filesystem::path& dir, const char* source,
-                               bool recursive, uint32_t title_id);
+                               bool recursive, bool index_directories, uint32_t title_id);
 
   KernelState* kernel_state_;
   std::filesystem::path root_path_;

@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstring>
 #include <queue>
 #include <string>
@@ -779,12 +780,79 @@ X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_pat
 // wild usually ship one; that is normal and harmless.
 static constexpr uint32_t kTitleUpdateContentType = 0x000B0000;
 
+// Package folder names are the content id in hex (42 chars in practice); this
+// is the fallback rule for an extracted package sitting loose in the dlc
+// folder, without the title-id/content-type directories around it.
+static constexpr size_t kMinPackageNameLength = 40;
+
+// Parses exactly eight hex digits - the form the title-id and content-type
+// directories take in the standard content layout.
+static bool ParseHex8(const std::string& text, uint32_t* out_value) {
+  if (text.size() != 8) {
+    return false;
+  }
+  uint32_t value = 0;
+  for (char c : text) {
+    uint32_t digit;
+    if (c >= '0' && c <= '9') {
+      digit = uint32_t(c - '0');
+    } else if (c >= 'a' && c <= 'f') {
+      digit = uint32_t(c - 'a') + 10;
+    } else if (c >= 'A' && c <= 'F') {
+      digit = uint32_t(c - 'A') + 10;
+    } else {
+      return false;
+    }
+    value = (value << 4) | digit;
+  }
+  *out_value = value;
+  return true;
+}
+
+static bool IsHexName(const std::string& text) {
+  return !text.empty() && std::all_of(text.cbegin(), text.cend(), [](unsigned char c) {
+    return std::isxdigit(c) != 0;
+  });
+}
+
 void ContentManager::DiscoverContainersInDir(const std::filesystem::path& dir, const char* source,
-                                             bool recursive, uint32_t title_id) {
+                                             bool recursive, bool index_directories,
+                                             uint32_t title_id) {
   std::error_code ec;
   if (dir.empty() || !std::filesystem::is_directory(dir, ec) || ec) {
     return;
   }
+
+  auto index_package = [&](const std::filesystem::path& path, XContentType content_type,
+                           std::u16string display_name, bool is_extracted_folder) {
+    // Key = the name enumeration hands to the game (42-char field).
+    auto key_name = rex::path_to_utf8(path.filename());
+    if (key_name.size() > 42) {
+      key_name.resize(42);
+    }
+    if (containers_.count(string::string_key_case(key_name))) {
+      REXSYS_DEBUG("ContentManager: duplicate package name {}, keeping the first found", key_name);
+      return;
+    }
+    if (display_name.empty()) {
+      // An extracted folder carries no header of its own, but the .header
+      // sidecar in the content root still names it when one was written.
+      XCONTENT_AGGREGATE_DATA header_data;
+      if (XSUCCEEDED(ReadContentHeaderFile(key_name, 0, title_id,
+                                           XContentType::kMarketplaceContent, header_data))) {
+        display_name = header_data.display_name();
+      }
+    }
+
+    DiscoveredContainer package;
+    package.path = path;
+    package.content_type = content_type;
+    package.title_id = title_id;
+    package.display_name = std::move(display_name);
+    package.source = source;
+    package.is_extracted_folder = is_extracted_folder;
+    containers_.insert({string::string_key_case::create(key_name), std::move(package)});
+  };
 
   auto handle_file = [&](const std::filesystem::path& path) {
     auto header = rex::filesystem::StfsContainerDevice::ReadPackageHeader(path);
@@ -811,24 +879,59 @@ void ContentManager::DiscoverContainersInDir(const std::filesystem::path& dir, c
       return;
     }
 
-    // Key = the file name enumeration hands to the game (42-char field).
-    auto key_name = rex::path_to_utf8(path.filename());
-    if (key_name.size() > 42) {
-      key_name.resize(42);
-    }
-    if (containers_.count(string::string_key_case(key_name))) {
-      REXSYS_DEBUG("ContentManager: duplicate container name {}, keeping the first found",
-                   key_name);
-      return;
+    index_package(path, content_type, header->metadata.display_name(XLanguage::kEnglish), false);
+  };
+
+  // Recognises an ALREADY-EXTRACTED package folder, so users who unpacked
+  // their DLC do not have to repack it. A folder is a package when it either
+  // sits directly under <title id>/<content type>/ (the standard content
+  // layout, whatever the folder itself is called) or is named after the
+  // content id in hex. Returns true when the directory IS a package folder,
+  // so the caller stops the walk from descending into its assets.
+  auto handle_directory = [&](const std::filesystem::path& path) {
+    const auto name = rex::path_to_utf8(path.filename());
+    XContentType content_type = XContentType::kMarketplaceContent;
+    uint32_t parent_type = 0;
+    uint32_t grandparent_title = 0;
+    const bool anchored =
+        ParseHex8(rex::path_to_utf8(path.parent_path().filename()), &parent_type) &&
+        ParseHex8(rex::path_to_utf8(path.parent_path().parent_path().filename()),
+                  &grandparent_title) &&
+        grandparent_title == title_id;
+    if (anchored) {
+      content_type = XContentType(parent_type);
+    } else if (name.size() < kMinPackageNameLength || !IsHexName(name)) {
+      // An ordinary folder on the way down; keep walking into it.
+      return false;
     }
 
-    DiscoveredContainer container;
-    container.path = path;
-    container.content_type = content_type;
-    container.title_id = container_title;
-    container.display_name = header->metadata.display_name(XLanguage::kEnglish);
-    container.source = source;
-    containers_.insert({string::string_key_case::create(key_name), std::move(container)});
+    if (uint32_t(content_type) == kTitleUpdateContentType) {
+      REXSYS_DEBUG("ContentManager: title update package present (not used by this port): {}",
+                   name);
+      return true;
+    }
+    if (content_type != XContentType::kMarketplaceContent) {
+      REXSYS_DEBUG("ContentManager: ignoring extracted package of content type {:08X}: {}",
+                   uint32_t(content_type), rex::path_to_utf8(path));
+      return true;
+    }
+
+    // A package folder holds the package's files; an empty one is not content.
+    bool has_file = false;
+    std::error_code dir_ec;
+    for (auto it = std::filesystem::directory_iterator(path, dir_ec);
+         !dir_ec && it != std::filesystem::directory_iterator(); it.increment(dir_ec)) {
+      if (it->is_regular_file(dir_ec)) {
+        has_file = true;
+        break;
+      }
+    }
+    if (!has_file) {
+      return false;
+    }
+
+    index_package(path, content_type, std::u16string(), true);
+    return true;
   };
 
   if (recursive) {
@@ -837,6 +940,9 @@ void ContentManager::DiscoverContainersInDir(const std::filesystem::path& dir, c
          !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
       if (it->is_regular_file(ec)) {
         handle_file(it->path());
+      } else if (index_directories && it->is_directory(ec) && handle_directory(it->path())) {
+        // It is a package folder, not a step on the way to one.
+        it.disable_recursion_pending();
       }
     }
   } else {
@@ -845,6 +951,8 @@ void ContentManager::DiscoverContainersInDir(const std::filesystem::path& dir, c
          !ec && it != std::filesystem::directory_iterator(); it.increment(ec)) {
       if (it->is_regular_file(ec)) {
         handle_file(it->path());
+      } else if (index_directories && it->is_directory(ec)) {
+        handle_directory(it->path());
       }
     }
   }
@@ -854,12 +962,18 @@ void ContentManager::DiscoverContainers(const std::filesystem::path& dlc_dir) {
   const uint32_t title_id = kernel_state_->title_id();
   containers_.clear();
 
-  // The dlc folder next to the exe: recursive, so a flat dump, an unzipped
-  // content set, and Xenia's content-directory layout all work unchanged.
-  DiscoverContainersInDir(dlc_dir, "dlc", true, title_id);
+  // The dlc folder next to the exe: recursive and accepting extracted package
+  // folders as well as containers, so a flat dump, an unzipped content set,
+  // Xenia's content-directory layout, and an already-extracted install all
+  // work unchanged.
+  DiscoverContainersInDir(dlc_dir, "dlc", /*recursive=*/true, /*index_directories=*/true,
+                          title_id);
   // Containers dropped straight into the content root's marketplace folder.
+  // Directories there are the canonical install, already found by the normal
+  // package path, so they are not indexed as placed packages.
   DiscoverContainersInDir(ResolvePackageRoot(0, XContentType::kMarketplaceContent, title_id),
-                          "content root", false, title_id);
+                          "content root", /*recursive=*/false, /*index_directories=*/false,
+                          title_id);
 
   // Startup report, one line per package: "did my DLC install work?" becomes
   // a log grep instead of a guess. Containers take priority, so a folder with
@@ -878,10 +992,13 @@ void ContentManager::DiscoverContainers(const std::filesystem::path& dlc_dir) {
                                          content_data))) {
       display = rex::string::to_utf8(content_data.display_name());
     }
-    const bool overridden =
-        FindContainer(name, XContentType::kMarketplaceContent) != nullptr;
+    const auto* overriding = FindContainer(name, XContentType::kMarketplaceContent);
+    std::string note;
+    if (overriding) {
+      note = fmt::format(" (overridden by {})", overriding->source);
+    }
     REXSYS_INFO("DLC: \"{}\" [{}] - extracted folder{}", display.empty() ? name : display, name,
-                overridden ? " (overridden by a container)" : "");
+                note);
     folder_count++;
   }
 
@@ -892,14 +1009,22 @@ void ContentManager::DiscoverContainers(const std::filesystem::path& dlc_dir) {
   }
   std::sort(sorted_containers.begin(), sorted_containers.end(),
             [](const auto* a, const auto* b) { return a->first.view() < b->first.view(); });
+  size_t extracted_count = 0;
   for (const auto* entry : sorted_containers) {
     const auto& container = entry->second;
-    REXSYS_INFO("DLC: \"{}\" [{}] - container ({}): {}",
-                rex::string::to_utf8(container.display_name), entry->first.view(),
-                container.source, rex::path_to_utf8(container.path));
+    auto display = rex::string::to_utf8(container.display_name);
+    if (display.empty()) {
+      display = std::string(entry->first.view());
+    }
+    REXSYS_INFO("DLC: \"{}\" [{}] - {} ({}): {}", display, entry->first.view(),
+                container.is_extracted_folder ? "extracted folder" : "container", container.source,
+                rex::path_to_utf8(container.path));
+    extracted_count += container.is_extracted_folder ? 1 : 0;
   }
-  REXSYS_INFO("DLC: {} extracted folder(s), {} container(s) mounted with priority", folder_count,
-              containers_.size());
+  REXSYS_INFO(
+      "DLC: {} extracted folder(s) in the content root, {} package(s) mounted with priority "
+      "({} container(s), {} extracted folder(s))",
+      folder_count, containers_.size(), containers_.size() - extracted_count, extracted_count);
 }
 
 }  // namespace xam
