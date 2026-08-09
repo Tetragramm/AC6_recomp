@@ -144,8 +144,10 @@ struct FlightActionDef {
   int16_t lx, ly;    // left-stick deflection to assert (kb overrides pad axis)
   int16_t rx, ry;    // right-stick (camera) deflection
 };
-// Button identities VERIFIED by the M2 round-2 field test:
-// A=missile/fire, B=machine gun, X=map/radar, Y=switch target,
+// Button identities from field testing. A/B corrected 2026-08-09: the
+// M2 round-2 report had these two the wrong way round, which swapped the
+// mouse buttons in game (LMB fired missiles, RMB the gun).
+// A=machine gun, B=missile/fire, X=map/radar, Y=switch target,
 // RS-click=change view, LS-click=gear, BACK=change weapon, START=pause.
 // Names and order follow AC7's PC keyboard screen (user request); AC6-only
 // actions (pause, wingman, gear) append at the end. AC7 actions with no AC6
@@ -159,8 +161,8 @@ constexpr FlightActionDef kFlightActions[] = {
     {"yaw_right", 0x0200, 0, 0, 0, 0, 0, 0},  // RB
     {"accelerate", 0, 0, 255, 0, 0, 0, 0},    // RT (was: throttle)
     {"decelerate", 0, 255, 0, 0, 0, 0, 0},    // LT (was: brake)
-    {"fire_machine_gun", 0x2000, 0, 0, 0, 0, 0, 0},  // B
-    {"fire_missile", 0x1000, 0, 0, 0, 0, 0, 0},      // A - missile / sp weapon
+    {"fire_machine_gun", 0x1000, 0, 0, 0, 0, 0, 0},  // A
+    {"fire_missile", 0x2000, 0, 0, 0, 0, 0, 0},      // B - missile / sp weapon
     {"change_weapon", 0x0020, 0, 0, 0, 0, 0, 0},     // BACK
     // Mode key, no pad effect: while held the mouse drives the camera (right
     // stick) instead of pitch/roll - AC7's "Camera Control Key".
