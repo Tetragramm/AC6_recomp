@@ -4,6 +4,8 @@
 #include <shared_mutex>
 #include <unordered_set>
 
+#include "ac6_backend_fixes/ac6_fullres_effects.h"
+
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/ppc.h>
@@ -321,6 +323,7 @@ void CaptureResolve(uint32_t device, const PPCContext& ctx) {
     }
 
     ac6::d3d::ResolveRecord record;
+    record.guest_lr = static_cast<uint32_t>(ctx.lr);
     record.args = {
         ctx.r4.u32,
         ctx.r5.u32,
@@ -439,6 +442,7 @@ PPC_FUNC_IMPL(rex_sub_821D95C8) {
         std::unique_lock<std::shared_mutex> lock(g_shadow_mutex);
         g_shadow.render_targets[index] = surface;
     }
+    ac6::backend::NoteRt0Bound(index, surface);
     g_live_stats.set_render_target_calls.fetch_add(1, std::memory_order_relaxed);
 
     if (REXCVAR_GET(ac6_d3d_trace)) {
@@ -540,6 +544,11 @@ PPC_FUNC_IMPL(rex_sub_821E2BB8) {
 
     RememberDevice(ctx.r3.u32);
     g_live_stats.resolve_calls.fetch_add(1, std::memory_order_relaxed);
+    // D3DDevice_Resolve(pDevice=r3, Flags=r4, pSourceRect=r5, pDestTexture=r6,
+    // ...): record the dest as the silhouette mask base if the downscaler just
+    // ran, then lift the effects module's 640x360 source rect to 1280x720.
+    ac6::backend::FxNoteResolveDest(ctx.r6.u32, base);
+    ac6::backend::FullresFixResolveRect(ctx, base);
     CaptureResolve(ctx.r3.u32, ctx);
 
     if (REXCVAR_GET(ac6_d3d_trace)) {

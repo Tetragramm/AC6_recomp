@@ -149,6 +149,7 @@ struct ClearRecord {
 
 struct ResolveRecord {
     uint32_t sequence{0};
+    uint32_t guest_lr{0};  // Game-code return address of the D3D Resolve call.
     std::array<uint32_t, 7> args{};
     float depth_or_scale{0.0f};
     ShadowState shadow_state{};

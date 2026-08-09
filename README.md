@@ -91,6 +91,7 @@ Settings live in **`ac6recomp.toml`** next to the executable. Most can also be c
 | `ac6_widescreen` | `false` | Ultrawide support (hor+) in missions. Menus and hangar stay 16:9 |
 | `ac6_widescreen_cinematics` | `true` | With ultrawide on, also widen in-engine cinematics. They are staged for 16:9, so this can expose set edges |
 | `ac6_terrain_hd` | `true` | Draw terrain at the full shipped resolution (2× what the console drew), which also removes terrain cracks |
+| `ac6_fullres_effects` | `false` | Draw clouds, smokes, trails, and afterburner effect at native resolution (2× what the console drew), slightly affects performance |
 | `ac6_cursor_hide_seconds` | `3.0` | Hide the mouse cursor after this many idle seconds. `0` = never hide |
 | `ac6_kbm_enabled` | `false` | **Enable keyboard and mouse controls.** Off by default — controllers work out of the box |
 | `ac6_kbm_config` | `ac6_input.toml` | Path to the key bindings file. Edits are picked up live |

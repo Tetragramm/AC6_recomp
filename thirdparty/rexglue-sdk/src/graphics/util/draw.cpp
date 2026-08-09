@@ -11,6 +11,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <mutex>
+#include <set>
+#include <tuple>
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
@@ -1014,8 +1017,24 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
   int32_t surface_pitch_aligned =
       int32_t(rb_surface_info.surface_pitch & ~uint32_t(xenos::kResolveAlignmentPixels - 1));
   if (x1 > surface_pitch_aligned) {
-    REXGPU_ERROR("Resolve region {} <= x < {} is outside the surface pitch {}", x0, x1,
-                 surface_pitch_aligned);
+    // A guest can do this every frame - a resolve whose region is legitimately
+    // wider than the surface it runs against, where the clamp below is the
+    // intended behaviour rather than a fault. Reporting it per frame buries the
+    // rest of the log (~20 MB/hour at 60 fps, which rotates the boot half away
+    // inside minutes), so report each distinct region/pitch combination once.
+    // A genuinely new one still shows up immediately.
+    static std::mutex reported_mutex;
+    static std::set<std::tuple<int32_t, int32_t, int32_t>> reported;
+    bool first = false;
+    {
+      std::lock_guard<std::mutex> lock(reported_mutex);
+      first = reported.size() < 32 && reported.emplace(x0, x1, surface_pitch_aligned).second;
+    }
+    if (first) {
+      REXGPU_ERROR("Resolve region {} <= x < {} is outside the surface pitch {} - clamping "
+                   "(logged once per distinct region)",
+                   x0, x1, surface_pitch_aligned);
+    }
     x0 = std::min(x0, surface_pitch_aligned);
     x1 = std::min(x1, surface_pitch_aligned);
   }

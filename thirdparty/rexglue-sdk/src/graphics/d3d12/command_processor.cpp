@@ -34,6 +34,7 @@
 #include <rex/ui/d3d12/d3d12_util.h>
 
 #include "../../../../../src/ac6_backend_fixes/ac6_backend_hooks.h"
+#include "../../../../../src/ac6_backend_fixes/ac6_fullres_effects.h"
 #include "../../../../../src/ac6_backend_fixes/ac6_widescreen.h"
 #include "../../../../../src/ac6_native_graphics.h"
 #include "../../../../../src/render_hooks.h"
@@ -2722,6 +2723,14 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   if (pixel_shader && pixel_shader->ucode_data_hash() == UINT64_C(0x17e5e4ac3e713245)) {
     ac6::NotifyWorldCompositorDraw();
   }
+  // AC6 full-res effects (the silhouette fix): the compositor mask is
+  // sampled by whichever cloud draw binds it, not necessarily the world
+  // compositor - so crop the mask fetch to the filled 640x360 quarter on every
+  // draw that reads it. No-op unless ac6_fullres_effects + ac6_fullres_mask_crop.
+  ac6::backend::FxCropCompositorMask(
+      vertex_shader ? vertex_shader->ucode_data_hash() : 0,
+      pixel_shader ? pixel_shader->ucode_data_hash() : 0,
+      &register_file_->values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0]);
 
   // AC6 ultrawide: pre-squeeze the game's screen-space 2D transforms in the
   // VS float constants so the presenter's fill-window stretch cancels out
@@ -2741,6 +2750,20 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                                   ac6_sub_viewport)) {
     cbuffer_binding_float_vertex_.up_to_date = false;
   }
+
+  // AC6 full-res effects (THE silhouette fix): the 2:1 silhouette downscaler
+  // (PS 8EE463763E880F35) samples 2*coord from its full-res input; doubling the
+  // fx buffers made its output 1280 wide, so it reads 0..2560 from a 1280-wide
+  // input -> the right half wraps -> 2x2 ghost planes. Restore JUST this draw's
+  // target to 640 wide (hash-gated - no scene-wide effect).
+  ac6::backend::FxFixDownscalerDraw(
+      pixel_shader ? pixel_shader->ucode_data_hash() : 0,
+      &register_file_->values[XE_GPU_REG_RB_SURFACE_INFO],
+      &register_file_->values[XE_GPU_REG_PA_CL_VPORT_XSCALE],
+      &register_file_->values[XE_GPU_REG_PA_CL_VPORT_YSCALE],
+      &register_file_->values[XE_GPU_REG_PA_CL_VPORT_XOFFSET],
+      &register_file_->values[XE_GPU_REG_PA_CL_VPORT_YOFFSET]);
+
   // AC6 ultrawide: narrow target-marker quads about their own centres so the
   // fill-window stretch renders them square while the game-computed aim points
   // stay put (see WidescreenShrinkMarkerQuads). The game draws them as a quad
