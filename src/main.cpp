@@ -120,6 +120,7 @@ void ApplyAc6DefaultSettings() {
     rex::cvar::SetSessionDefault("resolution", "1080p");
     rex::cvar::SetSessionDefault("window_width", "1920");
     rex::cvar::SetSessionDefault("window_height", "1080");
+    rex::cvar::SetSessionDefault("show_build_stamp", "false");
 }
 
 void ApplyAc6PerformanceModeOverrides() {
