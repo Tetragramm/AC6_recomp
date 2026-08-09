@@ -73,12 +73,38 @@ constexpr uint32_t kSweepEveryPolls = 8;
 // selftest_macro.md, runtime-verified): [0x8293B930] -> CTaskModeManager
 // singleton, +0x8 -> the currently-running CModeTask, +0x0 -> its vtable
 // pointer, which is a static per-class address and therefore a screen id.
-// 0x820642F4 = CModeTaskGame, the in-mission task (gameplay, in-engine
-// cutscenes and the pause menu all run under it). The +0x8 slot is briefly
-// null while the manager swaps tasks - treated as "hold the previous state".
+// The +0x8 slot is briefly null while the manager swaps tasks - treated as
+// "hold the previous state".
 constexpr uint32_t kModeManagerPtrEA = 0x8293B930;
 constexpr uint32_t kModeTaskSlotOffset = 0x8;
-constexpr uint32_t kModeTaskGameVtable = 0x820642F4;
+// Mode tasks that present as gameplay and must render wide. Several exist -
+// the campaign, the tutorial and the replay viewer are separate tasks - so
+// this is a set rather than a single comparison.
+//   0x820642F4  CModeTaskGame - campaign missions (gameplay, in-engine
+//               cutscenes and the pause menu all run under it).
+//   0x8206474C  tutorial. From a user log 2026-08-09: the last mode
+//               transition before a session that ended in the tutorial.
+//   0x820646EC  replay viewer. From the same reporter's second log: the only
+//               task held for a long dwell (~38 s) between menu transitions
+//               of 2-3 s, returning afterwards to the menu it came from.
+// To add another mode, read its id from the "[AC6-WIDE] mode task 0x..."
+// line (logged at error level on every transition) while that mode is on
+// screen, and list it below.
+constexpr uint32_t kModeTaskWideVtables[] = {
+    0x820642F4,
+    0x8206474C,
+    0x820646EC,
+    0x82066BC4,
+};
+
+bool IsWideModeTask(uint32_t vtable) {
+  for (uint32_t candidate : kModeTaskWideVtables) {
+    if (vtable == candidate) {
+      return true;
+    }
+  }
+  return false;
+}
 
 std::atomic<rex::memory::Memory*> g_ws_memory{nullptr};
 // Bits of the UI X-shrink factor (16:9 / target aspect), published by the
@@ -441,7 +467,7 @@ DWORD WINAPI WidescreenThread(LPVOID) {
     if (enabled && memory) {
       uint32_t id = ReadCurrentScreenId(memory);
       if (id != 0) {
-        in_mission = (id == kModeTaskGameVtable);
+        in_mission = IsWideModeTask(id);
         if (id != last_screen_id) {
           last_screen_id = id;
           static uint32_t mode_logs = 0;
