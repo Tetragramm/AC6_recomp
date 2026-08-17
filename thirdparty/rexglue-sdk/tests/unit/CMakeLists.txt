@@ -4,6 +4,7 @@ add_executable(unit_tests
     memory/heap_allocation_test.cpp
     kernel/object_table_test.cpp
     kernel/xam_user_alias_test.cpp
+    system/host_path_atomic_test.cpp
     core/cvar_test.cpp
     core/fiber_test.cpp
     core/sha256_test.cpp
@@ -22,6 +23,7 @@ target_link_libraries(unit_tests PRIVATE
     rexcore
     rexcodegen
     rexkernel
+    rexfilesystem
     Catch2::Catch2WithMain
 )
 
