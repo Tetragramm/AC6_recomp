@@ -6,6 +6,7 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <atomic>
 #include <cstring>
 
 #include <rex/cvar.h>
@@ -30,8 +31,29 @@ namespace xam {
 using namespace rex::system;
 using namespace rex::system::xam;
 
+namespace {
+
+// Signin diagnostic ("Gamer Profile not selected"): log which user index the
+// guest asks about, once per distinct index per API, at error level so it is
+// present in any user's log. The one synthetic profile lives at index 0; an
+// affected user's log showing index N!=0 confirms the controller-slot
+// mechanism - or refutes the whole theory. No behaviour change.
+void LogUserIndexOnce(std::atomic<uint32_t>& seen_mask, const char* api, uint32_t user_index) {
+  const uint32_t bit = 1u << (user_index < 31 ? user_index : 31);
+  if (!(seen_mask.fetch_or(bit, std::memory_order_relaxed) & bit)) {
+    REXKRNL_ERROR("{}: guest queried user_index={} (signin diagnostic; the profile is at index 0)",
+                  api, user_index);
+  }
+}
+
+std::atomic<uint32_t> g_signin_state_indices_seen{0};
+std::atomic<uint32_t> g_get_xuid_indices_seen{0};
+
+}  // namespace
+
 ppc_hresult_result_t XamUserGetXUID_entry(ppc_u32_t user_index, ppc_u32_t type_mask,
                                           ppc_pu64_t xuid_ptr) {
+  LogUserIndexOnce(g_get_xuid_indices_seen, "XamUserGetXUID", user_index);
   assert_true(type_mask == 1 || type_mask == 2 || type_mask == 3 || type_mask == 4 ||
               type_mask == 7);
   if (!xuid_ptr) {
@@ -61,6 +83,7 @@ ppc_hresult_result_t XamUserGetXUID_entry(ppc_u32_t user_index, ppc_u32_t type_m
 }
 
 ppc_u32_result_t XamUserGetSigninState_entry(ppc_u32_t user_index) {
+  LogUserIndexOnce(g_signin_state_indices_seen, "XamUserGetSigninState", user_index);
   uint32_t signin_state = 0;
   if (user_index < 4) {
     if (user_index == 0) {
@@ -485,6 +508,14 @@ ppc_u32_result_t XamUserAreUsersFriends_entry(ppc_u32_t user_index, ppc_u32_t un
 
 ppc_u32_result_t XamShowSigninUI_entry(ppc_u32_t unk, ppc_u32_t unk_mask) {
   // Mask values vary. Probably matching user types? Local/remote?
+
+  // Signin diagnostic: record that the guest asked for the signin picker and
+  // exactly what this stub does about it. Error level so any user's log
+  // carries it.
+  REXKRNL_ERROR(
+      "XamShowSigninUI(unk={}, mask={:#x}): completing as 'user 0 signed in' - broadcasting "
+      "XN_SYS_SIGNINCHANGED(1) + XN_SYS_UI(off), returning X_ERROR_SUCCESS (signin diagnostic)",
+      static_cast<uint32_t>(unk), static_cast<uint32_t>(unk_mask));
 
   // To fix game modes that display a 4 profile signin UI (even if playing
   // alone):
