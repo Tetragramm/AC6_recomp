@@ -291,6 +291,38 @@ void ContentManager::QuarantineTornPackage(uint64_t xuid, const XCONTENT_AGGREGA
     return;
   }
 
+  // The marker's phase word says what the dead session proved about the
+  // container before it died:
+  //   "writing"    - no commit rename ever started; every file is still its
+  //                  previous version: consistent, keep it.
+  //   "complete"   - every commit finished; only the marker's own deletion
+  //                  failed (typically an antivirus holding the file):
+  //                  consistent, keep it.
+  //   "committing" - a commit rename ran and the session died before the
+  //                  burst closed: may be torn across files, quarantine.
+  // Unreadable or unrecognized content quarantines too - the conservative
+  // default for a marker that proves nothing.
+  const std::string phase = rex::filesystem::HostPathDevice::ReadWriteMarkerPhase(marker_path);
+  if (phase == rex::filesystem::kWriteMarkerPhaseWriting ||
+      phase == rex::filesystem::kWriteMarkerPhaseComplete) {
+    std::error_code rm_ec;
+    std::filesystem::remove(marker_path, rm_ec);
+    if (rm_ec) {
+      REXSYS_ERROR(
+          "Content '{}' has a stale write marker (phase '{}') proving it consistent, but the "
+          "marker could not be removed ({}); the container is kept and the check will repeat "
+          "next mount",
+          rex::path_to_utf8(package_path), phase, rm_ec.message());
+    } else {
+      REXSYS_ERROR(
+          "Content '{}' had a stale write marker (phase '{}' - the last session died without a "
+          "commit in flight); the container is consistent, so it was kept and only the marker "
+          "was cleared",
+          rex::path_to_utf8(package_path), phase);
+    }
+    return;
+  }
+
   if (std::filesystem::is_directory(package_path, ec) && !ec) {
     auto quarantine_root = root_path_ / "quarantine";
     std::error_code mkdir_ec;

@@ -140,6 +140,11 @@ void HostPathEntry::CommitAtomicWrite(const std::filesystem::path& temp_path, bo
     // Write handle closed without writing anything: nothing to commit.
     std::filesystem::remove(temp_path, ec);
   } else {
+    // The container is about to change: flip the write marker to its
+    // "committing" phase BEFORE the first rename, so only a death from here
+    // on is treated as potentially torn at the next mount. The abandon
+    // paths above never mutate committed files and take no flip.
+    host_device->OnAtomicWriteCommit();
     // Keep exactly one backup generation, then swap the finished temp in.
     std::filesystem::path bak_path = host_path_;
     bak_path += kAtomicWriteBackupSuffix;

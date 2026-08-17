@@ -175,22 +175,60 @@ void HostPathDevice::SweepStaleAtomicArtifacts() {
   }
 }
 
+bool HostPathDevice::WriteMarkerPhaseLocked(const char* phase) {
+  auto marker = rex::filesystem::OpenFile(write_marker_path_, "wb");
+  if (!marker) {
+    return false;
+  }
+  // First line = the phase word (what the mount-time check parses); the rest
+  // is for a human who finds the file.
+  fprintf(marker,
+          "%s\n\n"
+          "Write-in-progress marker for the content folder next to this file.\n"
+          "If it is still present at the next launch, the phase word on the first\n"
+          "line decides what happens: 'committing' moves the folder aside into\n"
+          "quarantine (kept, never deleted); 'writing' or 'complete' proves the\n"
+          "folder consistent and only this marker is removed.\n",
+          phase);
+  fclose(marker);
+  return true;
+}
+
 void HostPathDevice::OnAtomicWriteBegin() {
   if (write_marker_path_.empty()) {
     return;
   }
   std::lock_guard<std::mutex> lock(write_marker_mutex_);
   if (active_atomic_writes_++ == 0) {
-    auto marker = rex::filesystem::OpenFile(write_marker_path_, "wb");
-    if (marker) {
-      static const char kMarkerText[] =
-          "Write in progress. If this file is still here on the next launch, the last "
-          "write died mid-flight and the container next to it will be quarantined.\n";
-      fwrite(kMarkerText, 1, sizeof(kMarkerText) - 1, marker);
-      fclose(marker);
-    } else {
+    // A new marker lifetime: phase starts at "writing" - no commit rename
+    // has run, so a death anywhere before OnAtomicWriteCommit() leaves the
+    // container provably consistent.
+    marker_committing_ = false;
+    if (!WriteMarkerPhaseLocked(kWriteMarkerPhaseWriting)) {
       REXFS_WARN("Could not create write-in-progress marker '{}'",
                  rex::path_to_utf8(write_marker_path_));
+    }
+  }
+}
+
+void HostPathDevice::OnAtomicWriteCommit() {
+  if (write_marker_path_.empty()) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(write_marker_mutex_);
+  if (active_atomic_writes_ > 0 && !marker_committing_) {
+    // The first commit rename of this marker's lifetime is about to run:
+    // from here until the marker is deleted, a death can tear the container
+    // across files, so a leftover marker must quarantine. Monotonic - the
+    // phase never returns to "writing" while this marker lives.
+    if (WriteMarkerPhaseLocked(kWriteMarkerPhaseCommitting)) {
+      marker_committing_ = true;
+    } else {
+      // Leave marker_committing_ unset so the next commit retries; a marker
+      // stuck on "writing" while commits run would defeat torn-container
+      // detection.
+      REXFS_ERROR("Could not flip write-in-progress marker '{}' to phase '{}'",
+                  rex::path_to_utf8(write_marker_path_), kWriteMarkerPhaseCommitting);
     }
   }
 }
@@ -203,7 +241,49 @@ void HostPathDevice::OnAtomicWriteEnd() {
   if (active_atomic_writes_ > 0 && --active_atomic_writes_ == 0) {
     std::error_code ec;
     std::filesystem::remove(write_marker_path_, ec);
+    if (ec) {
+      // One retry: transient sharing violations (an antivirus scanning the
+      // marker it just saw us write) often clear immediately.
+      ec.clear();
+      std::filesystem::remove(write_marker_path_, ec);
+    }
+    if (ec) {
+      // Deletion is blocked, but a scanner that holds the file usually still
+      // permits rewriting an existing one: record phase "complete" so the
+      // next mount does not quarantine a container whose writes all
+      // finished. This failure used to be swallowed silently.
+      if (WriteMarkerPhaseLocked(kWriteMarkerPhaseComplete)) {
+        REXFS_ERROR(
+            "Could not delete write-in-progress marker '{}' ({}); rewrote it as phase '{}' so "
+            "the container is not quarantined at the next launch",
+            rex::path_to_utf8(write_marker_path_), ec.message(), kWriteMarkerPhaseComplete);
+      } else {
+        REXFS_ERROR(
+            "Could not delete write-in-progress marker '{}' ({}) nor rewrite its phase - the "
+            "container may be needlessly quarantined (kept, never deleted) at the next launch",
+            rex::path_to_utf8(write_marker_path_), ec.message());
+      }
+    }
   }
+}
+
+std::string HostPathDevice::ReadWriteMarkerPhase(const std::filesystem::path& marker_path) {
+  auto file = rex::filesystem::OpenFile(marker_path, "rb");
+  if (!file) {
+    return {};
+  }
+  char buffer[64] = {};
+  const size_t read = fread(buffer, 1, sizeof(buffer) - 1, file);
+  fclose(file);
+  std::string phase(buffer, read);
+  const size_t eol = phase.find_first_of("\r\n");
+  if (eol != std::string::npos) {
+    phase.resize(eol);
+  }
+  while (!phase.empty() && (phase.back() == ' ' || phase.back() == '\t')) {
+    phase.pop_back();
+  }
+  return phase;
 }
 
 }  // namespace rex::filesystem

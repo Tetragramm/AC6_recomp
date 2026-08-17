@@ -40,10 +40,14 @@ constexpr uint32_t kCurrentlyRunningTitleId = 0xFFFFFFFF;
 
 // Write-in-progress marker: "<package folder>.rex-writing" sits
 // next to an extracted content package while any write into it is in flight
-// and is removed when the last write commits. Found at mount time it means a
-// previous session died mid-write - the package may be torn ACROSS files
-// (file A committed, file B not) even though each individual file write is
-// atomic - and the package is quarantined so the game recreates it cleanly.
+// and is removed when the last write commits. Its first line is a phase word
+// (see host_path_device.h). Found at mount time, phase "committing" means a
+// previous session died after a commit rename had started - the package may
+// be torn ACROSS files (file A committed, file B not) even though each
+// individual file write is atomic - and the package is quarantined so the
+// game recreates it cleanly. Phases "writing" and "complete" prove the
+// package consistent: only the stale marker is cleared. Unreadable or
+// unrecognized content quarantines (the conservative default).
 inline constexpr char kContentWriteMarkerSuffix[] = ".rex-writing";
 
 struct XCONTENT_DATA {
@@ -225,6 +229,24 @@ class ContentManager {
   // folder (and Windows' local-DLL search order).
   void DiscoverContainers(const std::filesystem::path& dlc_dir);
 
+  // Torn-container self-healing: if the package's write-in-progress
+  // marker survived to this mount, the last session died mid-flight. The
+  // marker's phase word decides what that proves: "writing" (no commit
+  // rename ever started) and "complete" (every commit finished, only the
+  // marker's own deletion failed) prove the package consistent, so it is
+  // kept and only the stale marker is cleared, with one error-level log
+  // line. Phase "committing" - and unreadable or unrecognized content -
+  // means the package may be torn across files: the folder is renamed
+  // aside into root_path_/quarantine/"<name>.corrupt-<yyyymmdd-hhmmss>" -
+  // never deleted, it stays available as diagnostic evidence - so the game
+  // sees a clean slate and recreates it. This retires the game's own
+  // "please delete this Game Data" dialog, which asks the player for
+  // host-side surgery they have no in-game way to do. No-op while the
+  // package is open in this process (the marker is then a live write, not
+  // a torn one). Public so the unit drill can exercise the mount-time
+  // decision table directly.
+  void QuarantineTornPackage(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data);
+
  private:
   std::filesystem::path ResolvePackageRoot(uint64_t xuid, XContentType content_type,
                                            uint32_t title_id = -1);
@@ -238,17 +260,6 @@ class ContentManager {
   FindOpenPackageByData(const XCONTENT_AGGREGATE_DATA& data);
   ContentPackage* DetachPackage(std::unordered_map<string::string_key_case, ContentPackage*,
                                                    string::string_key_case::Hash>::iterator it);
-
-  // Torn-container self-healing: if the package's write-in-progress
-  // marker survived to this mount, the last write died mid-flight. The
-  // package folder is renamed aside into root_path_/quarantine/
-  // "<name>.corrupt-<yyyymmdd-hhmmss>" - never deleted, it stays available as
-  // diagnostic evidence - so the game sees a clean slate and recreates it.
-  // This retires the game's own "please delete this Game Data" dialog, which
-  // asks the player for host-side surgery they have no in-game way to do.
-  // No-op while the package is open in this process (the marker is then a
-  // live write, not a torn one).
-  void QuarantineTornPackage(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data);
 
   // Where a package's data actually lives: a discovered container if one
   // exists (containers take priority), else the extracted folder / container
