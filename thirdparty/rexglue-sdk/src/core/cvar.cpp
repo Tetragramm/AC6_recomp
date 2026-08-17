@@ -19,6 +19,7 @@
 #include <CLI/CLI.hpp>
 
 #include <rex/cvar.h>
+#include <rex/filesystem.h>
 #include <rex/logging.h>
 
 #include <toml++/toml.hpp>
@@ -613,16 +614,31 @@ std::vector<std::string> Init(int argc, char** argv) {
 
 void LoadConfig(const std::filesystem::path& config_path) {
   if (!std::filesystem::exists(config_path)) {
-    REXLOG_DEBUG("Config file not found: {}", config_path.string());
+    REXLOG_DEBUG("Config file not found: {}", rex::path_to_utf8(config_path));
     return;
   }
 
   try {
-    auto config = toml::parse_file(config_path.string());
+    // Open through a path-native stream, exactly as SaveConfig below writes.
+    // parse_file(path.string()) narrowed the path through the ANSI code page
+    // on Windows, so a config that SAVED fine from a non-ASCII install path
+    // (Cyrillic/CJK folder) could never be read back - every setting
+    // silently reverted to defaults. Upstream Xenia's config.cc
+    // does the equivalent via xe::path_to_utf8; the fork's rename dropped
+    // the helper from this call site while the save side stayed path-native.
+    std::ifstream file(config_path, std::ios::binary);
+    if (!file) {
+      REXLOG_ERROR("Failed to open config {}", rex::path_to_utf8(config_path));
+      return;
+    }
+    auto config = toml::parse(file, rex::path_to_utf8(config_path));
     ApplyTomlTable(config, "");
-    REXLOG_INFO("Loaded config from {}", config_path.string());
+    REXLOG_INFO("Loaded config from {}", rex::path_to_utf8(config_path));
   } catch (const toml::parse_error& err) {
-    REXLOG_ERROR("Failed to parse config {}: {}", config_path.string(), err.what());
+    // path_to_utf8, not .string(): MSVC's path::string() can itself throw
+    // for characters outside the ACP - a diagnostic must never throw while
+    // reporting the failure.
+    REXLOG_ERROR("Failed to parse config {}: {}", rex::path_to_utf8(config_path), err.what());
   }
 }
 
@@ -666,12 +682,12 @@ void SaveConfig(const std::filesystem::path& config_path) {
   try {
     std::ofstream file(config_path);
     if (!file) {
-      REXLOG_ERROR("SaveConfig: failed to open {}", config_path.string());
+      REXLOG_ERROR("SaveConfig: failed to open {}", rex::path_to_utf8(config_path));
       return;
     }
     file << "# Auto-generated cvar configuration\n";
     file << content;
-    REXLOG_INFO("Saved config to {}", config_path.string());
+    REXLOG_INFO("Saved config to {}", rex::path_to_utf8(config_path));
   } catch (const std::exception& e) {
     REXLOG_ERROR("SaveConfig: {}", e.what());
   }
