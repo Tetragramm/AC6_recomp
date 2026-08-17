@@ -13,6 +13,7 @@
 #include <array>
 #include <cctype>
 #include <cstring>
+#include <ctime>
 #include <queue>
 #include <string>
 
@@ -84,6 +85,13 @@ ContentPackage::ContentPackage(KernelState* kernel_state, const std::string_view
     // An extracted folder: the historical path, unchanged.
     auto device =
         std::make_unique<rex::filesystem::HostPathDevice>(device_path_, package_path, false);
+    // Torn-write detection: while any write into this package is in
+    // flight the device keeps "<folder>.rex-writing" next to the folder;
+    // found at the NEXT mount it means a write died mid-flight and
+    // ContentManager::QuarantineTornPackage moves the folder aside.
+    std::filesystem::path marker_path = package_path;
+    marker_path += kContentWriteMarkerSuffix;
+    device->set_write_marker_path(marker_path);
     device->Initialize();
     fs->RegisterDevice(std::move(device));
     device_mounted_ = true;
@@ -268,6 +276,62 @@ std::filesystem::path ContentManager::ResolvePackageDataPath(uint64_t xuid,
   return {};
 }
 
+void ContentManager::QuarantineTornPackage(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) {
+  auto package_path = ResolvePackagePath(xuid, data);
+  std::filesystem::path marker_path = package_path;
+  marker_path += kContentWriteMarkerSuffix;
+
+  std::error_code ec;
+  if (!std::filesystem::exists(marker_path, ec) || ec) {
+    return;
+  }
+  if (IsContentOpen(data)) {
+    // The marker belongs to a write in flight in THIS process, not a torn
+    // container from a dead one.
+    return;
+  }
+
+  if (std::filesystem::is_directory(package_path, ec) && !ec) {
+    auto quarantine_root = root_path_ / "quarantine";
+    std::error_code mkdir_ec;
+    std::filesystem::create_directories(quarantine_root, mkdir_ec);
+
+    const std::time_t now = std::time(nullptr);
+    std::tm tm_local{};
+#if defined(_WIN32)
+    localtime_s(&tm_local, &now);
+#else
+    localtime_r(&now, &tm_local);
+#endif
+    char stamp[32] = "unknown-time";
+    std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &tm_local);
+    const auto base_name =
+        fmt::format("{}.corrupt-{}", rex::path_to_utf8(package_path.filename()), stamp);
+    auto dest = quarantine_root / rex::to_path(base_name);
+    for (int i = 2; std::filesystem::exists(dest, ec) && i < 10; ++i) {
+      dest = quarantine_root / rex::to_path(fmt::format("{}-{}", base_name, i));
+    }
+
+    std::error_code rename_ec;
+    std::filesystem::rename(package_path, dest, rename_ec);
+    if (rename_ec) {
+      REXSYS_ERROR(
+          "Content '{}' was left by an interrupted write but could not be quarantined ({}); "
+          "leaving it in place",
+          rex::path_to_utf8(package_path), rename_ec.message());
+      return;  // keep the marker so the next mount retries
+    }
+    // The one line: what happened, where the data went, what happens next.
+    REXSYS_ERROR(
+        "Content '{}' was torn by an interrupted write and has been quarantined to '{}' - the "
+        "game will recreate it (nothing was deleted)",
+        rex::path_to_utf8(package_path), rex::path_to_utf8(dest));
+  }
+
+  std::error_code rm_ec;
+  std::filesystem::remove(marker_path, rm_ec);
+}
+
 std::unique_ptr<ContentPackage> ContentManager::ResolvePackage(
     const std::string_view root_name, uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) {
   auto data_path = ResolvePackageDataPath(xuid, data);
@@ -302,9 +366,12 @@ X_RESULT ContentManager::WriteContentHeaderFile(uint64_t xuid, XCONTENT_AGGREGAT
     }
   }
 
-  rex::filesystem::CreateEmptyFile(header_path);
-
-  auto file = rex::filesystem::OpenFile(header_path, "wb");
+  // Write-then-rename: a header torn by a mid-write death would
+  // corrupt the package's enumeration entry. Same-directory temp keeps the
+  // rename atomic.
+  std::filesystem::path temp_path = header_path;
+  temp_path += ".rex-tmp";
+  auto file = rex::filesystem::OpenFile(temp_path, "wb");
   if (!file) {
     return X_ERROR_FILE_NOT_FOUND;
   }
@@ -312,7 +379,15 @@ X_RESULT ContentManager::WriteContentHeaderFile(uint64_t xuid, XCONTENT_AGGREGAT
   if (license_mask != 0) {
     fwrite(&license_mask, 1, sizeof(license_mask), file);
   }
+  fflush(file);
   fclose(file);
+  std::error_code rename_ec;
+  std::filesystem::rename(temp_path, header_path, rename_ec);
+  if (rename_ec) {
+    std::error_code rm_ec;
+    std::filesystem::remove(temp_path, rm_ec);
+    return X_ERROR_ACCESS_DENIED;
+  }
   return X_ERROR_SUCCESS;
 }
 
@@ -358,6 +433,11 @@ X_RESULT ContentManager::CreateContent(const std::string_view root_name, uint64_
     }
   }
 
+  // A torn leftover from a dead write session must not block creation
+  // forever ("always says corrupted" until the user deletes the folder by
+  // hand in Explorer).
+  QuarantineTornPackage(xuid, data);
+
   auto package_path = ResolvePackagePath(xuid, data);
   if (std::filesystem::exists(package_path)) {
     return X_ERROR_ALREADY_EXISTS;
@@ -387,6 +467,11 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name, uint64_t 
       return X_ERROR_ALREADY_EXISTS;
     }
   }
+
+  // Mount-time torn-container check: a package whose last write
+  // died mid-flight reads as missing, so the game recreates it instead of
+  // looping on its own "corrupted, please delete" dialog.
+  QuarantineTornPackage(xuid, data);
 
   auto package = ResolvePackage(root_name, xuid, data);
   if (!package) {

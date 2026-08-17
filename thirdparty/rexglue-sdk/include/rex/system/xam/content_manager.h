@@ -38,6 +38,14 @@ namespace xam {
 // TODO: check if actual x360 kernel/xam has a value similar to this
 constexpr uint32_t kCurrentlyRunningTitleId = 0xFFFFFFFF;
 
+// Write-in-progress marker: "<package folder>.rex-writing" sits
+// next to an extracted content package while any write into it is in flight
+// and is removed when the last write commits. Found at mount time it means a
+// previous session died mid-write - the package may be torn ACROSS files
+// (file A committed, file B not) even though each individual file write is
+// atomic - and the package is quarantined so the game recreates it cleanly.
+inline constexpr char kContentWriteMarkerSuffix[] = ".rex-writing";
+
 struct XCONTENT_DATA {
   be<uint32_t> device_id;
   be<XContentType> content_type;
@@ -230,6 +238,17 @@ class ContentManager {
   FindOpenPackageByData(const XCONTENT_AGGREGATE_DATA& data);
   ContentPackage* DetachPackage(std::unordered_map<string::string_key_case, ContentPackage*,
                                                    string::string_key_case::Hash>::iterator it);
+
+  // Torn-container self-healing: if the package's write-in-progress
+  // marker survived to this mount, the last write died mid-flight. The
+  // package folder is renamed aside into root_path_/quarantine/
+  // "<name>.corrupt-<yyyymmdd-hhmmss>" - never deleted, it stays available as
+  // diagnostic evidence - so the game sees a clean slate and recreates it.
+  // This retires the game's own "please delete this Game Data" dialog, which
+  // asks the player for host-side surgery they have no in-game way to do.
+  // No-op while the package is open in this process (the marker is then a
+  // live write, not a torn one).
+  void QuarantineTornPackage(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data);
 
   // Where a package's data actually lives: a discovered container if one
   // exists (containers take priority), else the extracted folder / container
