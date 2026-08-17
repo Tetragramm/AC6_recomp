@@ -14,6 +14,11 @@ namespace rex::filesystem {
 
 class HostPathDevice;
 
+// Host-side artifacts of the atomic write path. Never guest-visible:
+// the device skips them when populating the entry tree.
+inline constexpr char kAtomicWriteTempSuffix[] = ".rex-tmp";
+inline constexpr char kAtomicWriteBackupSuffix[] = ".rex-bak";
+
 class HostPathEntry : public Entry {
  public:
   HostPathEntry(Device* device, Entry* parent, const std::string_view path,
@@ -28,6 +33,15 @@ class HostPathEntry : public Entry {
 
   X_STATUS Open(uint32_t desired_access, File** out_file) override;
   bool Truncate() override;
+
+  // Atomic write session: a write handle opened by Open() writes
+  // into "<name>.rex-tmp" in the same directory; HostPathFile calls this on
+  // close. commit=false abandons the temp (failed write - old data stays);
+  // dirty=false means nothing was written (temp discarded, file untouched).
+  // A successful commit keeps ONE previous generation at "<name>.rex-bak"
+  // and renames the temp over the real file, so an interrupted or failed
+  // save can never leave a torn file in place.
+  void CommitAtomicWrite(const std::filesystem::path& temp_path, bool commit, bool dirty);
 
   bool can_map() const override { return true; }
   std::unique_ptr<memory::MappedMemory> OpenMapped(memory::MappedMemory::Mode mode, size_t offset,
@@ -47,6 +61,13 @@ class HostPathEntry : public Entry {
   void RenameEntryInternal(const std::vector<std::string_view>& path_parts) override;
 
   std::filesystem::path host_path_;
+  // Truncate() defers the on-disk truncation into the atomic write session
+  // the VFS opens immediately afterwards, so an interrupted overwrite leaves
+  // the previous file intact. Consumed (and cleared) by the next Open().
+  bool pending_truncate_ = false;
+  // One atomic session per entry at a time; a second concurrent write handle
+  // falls back to in-place access (logged).
+  bool atomic_write_active_ = false;
 };
 
 }  // namespace rex::filesystem

@@ -12,9 +12,27 @@ HostPathFile::HostPathFile(uint32_t file_access, HostPathEntry* entry,
                            std::unique_ptr<rex::filesystem::FileHandle> file_handle)
     : File(file_access, entry), file_handle_(std::move(file_handle)) {}
 
+HostPathFile::HostPathFile(uint32_t file_access, HostPathEntry* entry,
+                           std::unique_ptr<rex::filesystem::FileHandle> file_handle,
+                           std::filesystem::path temp_path, bool started_dirty)
+    : File(file_access, entry),
+      file_handle_(std::move(file_handle)),
+      atomic_(true),
+      temp_path_(std::move(temp_path)),
+      dirty_(started_dirty) {}
+
 HostPathFile::~HostPathFile() = default;
 
 void HostPathFile::Destroy() {
+  if (atomic_) {
+    // Flush before the commit renames: the data must be on its way to disk
+    // before the temp becomes the real file.
+    if (file_handle_) {
+      file_handle_->Flush();
+      file_handle_.reset();
+    }
+    static_cast<HostPathEntry*>(entry_)->CommitAtomicWrite(temp_path_, !write_failed_, dirty_);
+  }
   delete this;
 }
 
@@ -38,9 +56,13 @@ X_STATUS HostPathFile::WriteSync(std::span<const uint8_t> buffer, size_t byte_of
     return X_STATUS_ACCESS_DENIED;
   }
 
+  dirty_ = true;
   if (file_handle_->Write(byte_offset, buffer.data(), buffer.size(), out_bytes_written)) {
     return X_STATUS_SUCCESS;
   } else {
+    // A failed write poisons the session: committing a partial temp over the
+    // real file would be exactly the torn save this path exists to prevent.
+    write_failed_ = true;
     return X_STATUS_END_OF_FILE;
   }
 }
@@ -50,9 +72,11 @@ X_STATUS HostPathFile::SetLength(size_t length) {
     return X_STATUS_ACCESS_DENIED;
   }
 
+  dirty_ = true;
   if (file_handle_->SetLength(length)) {
     return X_STATUS_SUCCESS;
   } else {
+    write_failed_ = true;
     return X_STATUS_END_OF_FILE;
   }
 }

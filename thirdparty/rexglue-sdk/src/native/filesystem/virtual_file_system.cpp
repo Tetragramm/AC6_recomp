@@ -312,11 +312,18 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
         break;
       case FileDisposition::kOverwrite:
       case FileDisposition::kOverwriteIf:
-        // Overwrite by delete + recreate, or truncate if delete fails
-        // (host file may be briefly locked by cloud sync, AV, etc.).
-        if (entry->Delete()) {
+        // Truncate first: a device that supports it (host paths) defers the
+        // truncation into the atomic write session opened right below, so an
+        // interrupted overwrite keeps the previous file contents.
+        // The historical delete + recreate destroyed the old file before the
+        // first new byte was written. Devices without Truncate, and files a
+        // truncate probe finds locked (cloud sync, AV), keep the old
+        // delete-or-fail behaviour.
+        if (entry->Truncate()) {
+          // Entry stays; the truncation materializes at open/commit.
+        } else if (entry->Delete()) {
           entry = nullptr;
-        } else if (!entry->Truncate()) {
+        } else {
           return X_STATUS_ACCESS_DENIED;
         }
         *out_action = FileAction::kOverwritten;

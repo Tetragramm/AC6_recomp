@@ -50,12 +50,123 @@ X_STATUS HostPathEntry::Open(uint32_t desired_access, File** out_file) {
     REXFS_ERROR("Attempting to open file for write access on read-only device");
     return X_STATUS_ACCESS_DENIED;
   }
+
+  const bool wants_write =
+      (desired_access & (FileAccess::kGenericWrite | FileAccess::kFileWriteData |
+                         FileAccess::kFileAppendData)) != 0;
+  const bool truncate_pending = pending_truncate_;
+  pending_truncate_ = false;
+
+  // Atomic write session: guest writes land in "<name>.rex-tmp" in
+  // the same directory (same volume, so the commit rename is atomic) and are
+  // committed over the real file when the handle closes, keeping one
+  // ".rex-bak" generation. A crash, kill or failed write mid-save leaves the
+  // OLD file intact instead of a torn one - the mechanism that left saves
+  // permanently stuck behind the game's "Game Data is corrupted / please
+  // delete it" dialog.
+  if (wants_write && !is_read_only()) {
+    if (!atomic_write_active_) {
+      std::filesystem::path temp_path = host_path_;
+      temp_path += kAtomicWriteTempSuffix;
+
+      std::error_code ec;
+      bool temp_ready = false;
+      if (!truncate_pending && std::filesystem::is_regular_file(host_path_, ec)) {
+        // Preserve read-modify-write semantics: the handle must see the
+        // current contents until the guest overwrites them.
+        std::filesystem::copy_file(host_path_, temp_path,
+                                   std::filesystem::copy_options::overwrite_existing, ec);
+        temp_ready = !ec;
+      } else {
+        // Fresh create, or a deferred truncation: start from empty.
+        auto temp_file = rex::filesystem::OpenFile(temp_path, "wb");
+        if (temp_file) {
+          fclose(temp_file);
+          temp_ready = true;
+        }
+      }
+
+      if (temp_ready) {
+        auto temp_handle = rex::filesystem::FileHandle::OpenExisting(temp_path, desired_access);
+        if (temp_handle) {
+          atomic_write_active_ = true;
+          static_cast<HostPathDevice*>(device_)->OnAtomicWriteBegin();
+          *out_file = new HostPathFile(desired_access, this, std::move(temp_handle),
+                                       std::move(temp_path), truncate_pending);
+          return X_STATUS_SUCCESS;
+        }
+      }
+      std::error_code cleanup_ec;
+      std::filesystem::remove(temp_path, cleanup_ec);
+      REXFS_WARN("Atomic write unavailable for '{}' - writing in place",
+                 rex::path_to_utf8(host_path_));
+    } else {
+      REXFS_WARN("Second concurrent write handle for '{}' - writing in place (not atomic)",
+                 rex::path_to_utf8(host_path_));
+    }
+  }
+
+  // Fallback / read-only path: direct handle on the real file. A truncation
+  // that could not ride an atomic session must land on disk here after all.
+  if (truncate_pending) {
+    auto file = rex::filesystem::OpenFile(host_path_, "wb");
+    if (!file) {
+      return X_STATUS_ACCESS_DENIED;
+    }
+    fclose(file);
+  }
+
   auto file_handle = rex::filesystem::FileHandle::OpenExisting(host_path_, desired_access);
   if (!file_handle) {
     return X_STATUS_NO_SUCH_FILE;
   }
   *out_file = new HostPathFile(desired_access, this, std::move(file_handle));
   return X_STATUS_SUCCESS;
+}
+
+void HostPathEntry::CommitAtomicWrite(const std::filesystem::path& temp_path, bool commit,
+                                      bool dirty) {
+  atomic_write_active_ = false;
+  auto* host_device = static_cast<HostPathDevice*>(device_);
+
+  std::error_code ec;
+  if (!commit) {
+    // A write failed during the session: abandon the temp, the previous file
+    // stays exactly as it was. The guest already saw the write error.
+    std::filesystem::remove(temp_path, ec);
+    REXFS_ERROR("Write to '{}' failed - previous contents kept intact",
+                rex::path_to_utf8(host_path_));
+  } else if (!dirty) {
+    // Write handle closed without writing anything: nothing to commit.
+    std::filesystem::remove(temp_path, ec);
+  } else {
+    // Keep exactly one backup generation, then swap the finished temp in.
+    std::filesystem::path bak_path = host_path_;
+    bak_path += kAtomicWriteBackupSuffix;
+    bool have_bak = false;
+    if (std::filesystem::exists(host_path_, ec) && !ec) {
+      std::error_code bak_ec;
+      std::filesystem::remove(bak_path, bak_ec);
+      bak_ec.clear();
+      std::filesystem::rename(host_path_, bak_path, bak_ec);
+      have_bak = !bak_ec;
+    }
+    ec.clear();
+    std::filesystem::rename(temp_path, host_path_, ec);
+    if (ec) {
+      REXFS_ERROR("Failed to commit write to '{}': {} - restoring previous contents",
+                  rex::path_to_utf8(host_path_), ec.message());
+      if (have_bak) {
+        std::error_code restore_ec;
+        std::filesystem::rename(bak_path, host_path_, restore_ec);
+      }
+      std::error_code rm_ec;
+      std::filesystem::remove(temp_path, rm_ec);
+    }
+    update();
+  }
+
+  host_device->OnAtomicWriteEnd();
 }
 
 std::unique_ptr<memory::MappedMemory> HostPathEntry::OpenMapped(memory::MappedMemory::Mode mode,
@@ -67,11 +178,20 @@ bool HostPathEntry::Truncate() {
   if (is_read_only() || (attributes_ & kFileAttributeDirectory)) {
     return false;
   }
-  auto file = rex::filesystem::OpenFile(host_path_, "wb");
+  // Probe writability without destroying anything: the old behaviour opened
+  // "wb" (truncating the real file on the spot), so an interrupted overwrite
+  // had already lost the previous contents before the first new byte landed.
+  // A locked file (AV/cloud sync) must still fail LOUDLY here - the guest
+  // gets a save error and retries - rather than silently later.
+  auto file = rex::filesystem::OpenFile(host_path_, "r+b");
   if (!file) {
     return false;
   }
   fclose(file);
+  // Defer the on-disk truncation into the atomic write session the VFS opens
+  // right after: the session starts from an empty temp and the
+  // real file is only replaced at commit.
+  pending_truncate_ = true;
   size_ = 0;
   allocation_size_ = 0;
   return true;
@@ -129,8 +249,15 @@ void HostPathEntry::RenameEntryInternal(const std::vector<std::string_view>& pat
 }
 
 void HostPathEntry::update() {
+  // During an atomic write session the in-flight contents live in the temp
+  // file; size queries must reflect what the guest just wrote, not the
+  // yet-to-be-replaced previous file.
+  std::filesystem::path query_path = host_path_;
+  if (atomic_write_active_) {
+    query_path += kAtomicWriteTempSuffix;
+  }
   rex::filesystem::FileInfo file_info;
-  if (!rex::filesystem::GetInfo(host_path_, &file_info)) {
+  if (!rex::filesystem::GetInfo(query_path, &file_info)) {
     return;
   }
   if (file_info.type == rex::filesystem::FileInfo::Type::kFile) {

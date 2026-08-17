@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include <filesystem>
+#include <mutex>
 #include <string>
 
 #include <native/filesystem/device.h>
@@ -35,13 +37,30 @@ class HostPathDevice : public Device {
   uint32_t sectors_per_allocation_unit() const override { return 1; }
   uint32_t bytes_per_sector() const override { return 0x200; }
 
+  // Write-in-progress marker. When a marker path is set (content
+  // packages do this), the device keeps a marker file on disk while any
+  // atomic write session is open and removes it when the last one commits.
+  // A marker still present at the next mount means a write died mid-flight
+  // and the container may be torn across files - the content manager then
+  // quarantines it. Empty path (the default) disables the marker.
+  void set_write_marker_path(const std::filesystem::path& marker_path) {
+    write_marker_path_ = marker_path;
+  }
+  void OnAtomicWriteBegin();
+  void OnAtomicWriteEnd();
+
  private:
   void PopulateEntry(HostPathEntry* parent_entry);
+  void SweepStaleAtomicArtifacts();
 
   std::string name_;
   std::filesystem::path host_path_;
   std::unique_ptr<Entry> root_entry_;
   bool read_only_;
+
+  std::filesystem::path write_marker_path_;
+  std::mutex write_marker_mutex_;
+  int active_atomic_writes_ = 0;
 };
 
 }  // namespace rex::filesystem
