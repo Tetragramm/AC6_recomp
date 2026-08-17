@@ -167,6 +167,14 @@ set(SPDLOG_BUILD_BENCH OFF CACHE BOOL "" FORCE)
 set(SPDLOG_INSTALL ON CACHE BOOL "" FORCE)
 add_subdirectory(spdlog)
 target_compile_options(spdlog PRIVATE -w)
+if(WIN32)
+    # Wide filenames: the log path derives from the exe directory, which is
+    # user-chosen and can contain any Unicode. Narrow spdlog filenames go
+    # through the ANSI code page in _fsopen, so a Cyrillic/CJK install path
+    # produced no log file at all. PUBLIC so every
+    # consumer's spdlog::filename_t agrees with the compiled lib.
+    target_compile_definitions(spdlog PUBLIC SPDLOG_WCHAR_FILENAMES)
+endif()
 
 #=============================================================================
 # snappy - Fast compression/decompression (GPU traces)

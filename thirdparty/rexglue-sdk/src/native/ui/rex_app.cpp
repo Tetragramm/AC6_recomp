@@ -354,7 +354,9 @@ bool ReXApp::OnInitialize() {
   std::filesystem::path user_dir;
   std::string user_data_cvar = REXCVAR_GET(user_data_root);
   if (!user_data_cvar.empty()) {
-    user_dir = user_data_cvar;
+    // to_path: the toml string is UTF-8, not the ANSI codepage a bare path
+    // construction would assume on Windows (same rule as game_iso/dlc_dir).
+    user_dir = rex::to_path(user_data_cvar);
   } else {
     user_dir = rex::filesystem::GetUserFolder() / GetName();
   }
@@ -363,7 +365,7 @@ bool ReXApp::OnInitialize() {
   std::filesystem::path update_dir;
   std::string update_data_cvar = REXCVAR_GET(update_data_root);
   if (!update_data_cvar.empty()) {
-    update_dir = update_data_cvar;
+    update_dir = rex::to_path(update_data_cvar);
   }
 
   // Allow subclass to override path defaults
@@ -399,7 +401,8 @@ bool ReXApp::OnInitialize() {
       crash_dir = exe_dir / "logs";
     } else {
       std::error_code crash_dir_ec;
-      crash_dir = std::filesystem::absolute(std::filesystem::path(log_file_cvar), crash_dir_ec)
+      // to_path: the cvar string is UTF-8 (see user_data_root above).
+      crash_dir = std::filesystem::absolute(rex::to_path(log_file_cvar), crash_dir_ec)
                       .parent_path();
       if (crash_dir.empty())
         crash_dir = std::filesystem::current_path();
@@ -421,7 +424,11 @@ bool ReXApp::OnInitialize() {
                                         log_level_str, category_levels);
   if (log_file_cvar.empty()) {
     log_config.app_name = std::string(GetName());
-    log_config.log_dir = (exe_dir / "logs").string();
+    // path_to_utf8, not .string(): a non-ASCII exe dir narrowed through the
+    // ANSI code page here made the log land in a mangled directory - or
+    // threw during startup - exactly when a user on such a path most needs
+    // their diagnostics. InitLogging converts back with rex::to_path.
+    log_config.log_dir = rex::path_to_utf8(exe_dir / "logs");
   }
   rex::InitLogging(log_config);
   rex::RegisterLogLevelCallback();

@@ -12,7 +12,9 @@
 #include <algorithm>
 #include <cctype>
 #include <charconv>
+#include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -23,6 +25,7 @@
 #include <toml++/toml.hpp>
 
 #include <rex/cvar.h>
+#include <rex/filesystem.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
 
@@ -82,16 +85,29 @@ static void RemovePreviousLog(const std::filesystem::path& path, int max_files) 
   std::error_code ec;
   std::filesystem::remove(path, ec);
   const std::filesystem::path dir = path.parent_path();
-  const std::string stem = path.stem().string();
-  const std::string ext = path.extension().string();
+  // path_to_utf8/to_path, not .string(): the log file name is user-chosen and
+  // may contain characters outside the ANSI code page (MSVC's path::string()
+  // throws for those).
+  const std::string stem = rex::path_to_utf8(path.stem());
+  const std::string ext = rex::path_to_utf8(path.extension());
   for (int i = 1; i <= max_files && i <= 64; ++i) {
-    std::filesystem::remove(dir / fmt::format("{}.{}{}", stem, i, ext), ec);
+    std::filesystem::remove(dir / rex::to_path(fmt::format("{}.{}{}", stem, i, ext)), ec);
   }
 }
 
 std::filesystem::path NextSequentialLogPath(const std::filesystem::path& logs_dir,
                                             std::string_view app_name) {
-  std::filesystem::create_directories(logs_dir);
+  // error_code overload: the throwing create_directories could propagate a
+  // filesystem_error out of InitLogging during startup (e.g. an exe dir that
+  // narrowed badly elsewhere). A failed log dir means "no file sink", never
+  // a crash before the window exists.
+  std::error_code create_ec;
+  std::filesystem::create_directories(logs_dir, create_ec);
+  if (create_ec) {
+    std::fprintf(stderr, "logging: cannot create log directory %s: %s\n",
+                 rex::path_to_utf8(logs_dir).c_str(), create_ec.message().c_str());
+    return {};
+  }
 
   int max_seq = 0;
   std::string prefix = std::string(app_name) + "_";
@@ -99,7 +115,7 @@ std::filesystem::path NextSequentialLogPath(const std::filesystem::path& logs_di
   for (const auto& entry : std::filesystem::directory_iterator(logs_dir, ec)) {
     if (!entry.is_regular_file())
       continue;
-    auto stem = entry.path().stem().string();
+    auto stem = rex::path_to_utf8(entry.path().stem());
     if (stem.starts_with(prefix)) {
       auto num_str = stem.substr(prefix.size());
       int num = 0;
@@ -235,10 +251,13 @@ void InitLogging(const LogConfig& config) {
     g_console_sink = sink;
   }
 
-  // File sink (rotating) with sequential naming fallback
-  std::string resolved_path;
+  // File sink (rotating) with sequential naming fallback. The path stays a
+  // std::filesystem::path end-to-end; LogConfig's log_file/log_dir strings
+  // are UTF-8 and are converted with rex::to_path, never the implicit
+  // ANSI-code-page construction that mangled non-ASCII install paths.
+  std::filesystem::path resolved_path;
   if (config.log_file) {
-    resolved_path = config.log_file;
+    resolved_path = rex::to_path(config.log_file);
     // Fresh single log each launch (QoL): delete the previous one first so a
     // fixed log_file is replaced, not appended-to, and files don't stack up.
     if (!resolved_path.empty() && REXCVAR_GET(log_new_file_per_launch)) {
@@ -246,16 +265,32 @@ void InitLogging(const LogConfig& config) {
     }
   } else if (!config.app_name.empty()) {
     auto log_dir = config.log_dir.empty() ? std::filesystem::current_path() / "logs"
-                                          : std::filesystem::path(config.log_dir);
-    resolved_path = NextSequentialLogPath(log_dir, config.app_name).string();
+                                          : rex::to_path(config.log_dir);
+    resolved_path = NextSequentialLogPath(log_dir, config.app_name);
   }
   if (!resolved_path.empty()) {
-    auto sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
-        resolved_path, static_cast<size_t>(REXCVAR_GET(log_max_file_size_mb)) * 1024 * 1024,
+    try {
+#if defined(_WIN32) && defined(SPDLOG_WCHAR_FILENAMES)
+      // Wide filename: spdlog opens via _wfsopen, so any Unicode path works.
+      // Without SPDLOG_WCHAR_FILENAMES the narrow filename goes through the
+      // ANSI code page in _fsopen and a Cyrillic/CJK exe dir gets no log at
+      // all - the user loses their diagnostics exactly when they need them.
+      spdlog::filename_t sink_filename = resolved_path.wstring();
+#else
+      spdlog::filename_t sink_filename = resolved_path.string();
+#endif
+      auto sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
+        sink_filename, static_cast<size_t>(REXCVAR_GET(log_max_file_size_mb)) * 1024 * 1024,
         static_cast<size_t>(REXCVAR_GET(log_max_files)), false);
-    sink->set_level(spdlog::level::trace);
-    sink->set_pattern(config.file_pattern);
-    g_file_sink = sink;
+      sink->set_level(spdlog::level::trace);
+      sink->set_pattern(config.file_pattern);
+      g_file_sink = sink;
+    } catch (const spdlog::spdlog_ex& e) {
+      // A file sink that cannot open must not take startup down with it.
+      // (No REXLOG here: we hold g_mutex and the macros can re-enter it.)
+      std::fprintf(stderr, "logging: cannot open log file %s: %s\n",
+                   rex::path_to_utf8(resolved_path).c_str(), e.what());
+    }
   }
 
   g_extra_sinks = config.extra_sinks;
@@ -561,7 +596,15 @@ std::map<std::string, std::string> ParseCategoryLevelsFromConfig(
     return result;
 
   try {
-    auto config = toml::parse_file(config_path.string());
+    // Path-native stream, not parse_file(path.string()): the narrow
+    // conversion cannot represent (and on MSVC may throw for) characters
+    // outside the ANSI code page - the same construct as the config
+    // loader had, and this one ran before logging was even up.
+    std::ifstream file(config_path, std::ios::binary);
+    if (!file) {
+      return result;
+    }
+    auto config = toml::parse(file, rex::path_to_utf8(config_path));
     auto* log_table = config["log"].as_table();
     if (!log_table)
       return result;

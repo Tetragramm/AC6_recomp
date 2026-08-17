@@ -350,10 +350,20 @@ TextureSwapManifestCacheEntry LoadTextureSwapManifestCacheEntry(const std::files
 
   toml::table manifest;
   try {
-    manifest = toml::parse_file(manifest_path.string());
+    // Path-native stream + path_to_utf8 in the log line: parse_file(.string())
+    // narrows through the ANSI code page and fails on non-ASCII install
+    // paths (the same construct as the config-loader bug).
+    std::ifstream manifest_file(manifest_path, std::ios::binary);
+    if (!manifest_file) {
+      entry.parse_failed = true;
+      REXLOG_WARN("Texture swap manifest {}: cannot open", rex::path_to_utf8(manifest_path));
+      return entry;
+    }
+    manifest = toml::parse(manifest_file, rex::path_to_utf8(manifest_path));
   } catch (const toml::parse_error& err) {
     entry.parse_failed = true;
-    REXLOG_WARN("Texture swap manifest {}: parse error: {}", manifest_path.string(), err.description());
+    REXLOG_WARN("Texture swap manifest {}: parse error: {}", rex::path_to_utf8(manifest_path),
+                err.description());
     return entry;
   }
 

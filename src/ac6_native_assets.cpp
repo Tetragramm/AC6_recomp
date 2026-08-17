@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <fstream>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -14,6 +15,7 @@
 
 #include <rex/cvar.h>
 #include <rex/crypto/sha256.h>
+#include <rex/filesystem.h>
 #include <rex/logging.h>
 
 REXCVAR_DEFINE_BOOL(
@@ -334,10 +336,20 @@ void LoadManifestForRoot(NativeAssetRegistryState& state, RootDescriptor& root) 
 
   toml::table manifest;
   try {
-    manifest = toml::parse_file(manifest_path.string());
+    // Path-native stream + path_to_utf8 in the log line: parse_file(.string())
+    // narrows through the ANSI code page and fails on non-ASCII install
+    // paths (the same construct as the config-loader bug).
+    std::ifstream manifest_file(manifest_path, std::ios::binary);
+    if (!manifest_file) {
+      ++state.manifest_error_count;
+      REXLOG_WARN("AC6 native assets: failed to open {}", rex::path_to_utf8(manifest_path));
+      return;
+    }
+    manifest = toml::parse(manifest_file, rex::path_to_utf8(manifest_path));
   } catch (const toml::parse_error& err) {
     ++state.manifest_error_count;
-    REXLOG_WARN("AC6 native assets: failed to parse {}: {}", manifest_path.string(), err.description());
+    REXLOG_WARN("AC6 native assets: failed to parse {}: {}", rex::path_to_utf8(manifest_path),
+                err.description());
     return;
   }
 

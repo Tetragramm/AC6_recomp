@@ -70,7 +70,9 @@ struct LogConfig {
    *  the platform debug sink created by InitLoggingEarly(). */
   bool log_to_console = false;
 
-  /** Path to a log file, or nullptr for no file logging. */
+  /** Path to a log file, or nullptr for no file logging. UTF-8 (the cvar/toml
+   *  encoding); InitLogging converts it with rex::to_path, never through the
+   *  ANSI code page. */
   const char* log_file = nullptr;
 
   /** spdlog pattern string for the stdout console sink. */
@@ -109,6 +111,8 @@ struct LogConfig {
   bool category_sinks_exclusive = false;
 
   std::string app_name;
+  /** Directory for auto-named sequential logs. UTF-8 (produce it with
+   *  rex::path_to_utf8); InitLogging converts back with rex::to_path. */
   std::string log_dir;
 };
 
