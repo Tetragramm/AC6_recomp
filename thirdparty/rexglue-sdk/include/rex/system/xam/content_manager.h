@@ -174,6 +174,11 @@ struct DiscoveredContainer {
   // A package can be a raw container file or an already-extracted folder; both
   // mount, ContentPackage picks the device by what the path is.
   bool is_extracted_folder = false;
+  // OR of the license bits in the container's STFS header (0 for extracted
+  // folders, which carry no header). Reported at startup so a partial
+  // per-colour mask is visible in a support log; the EFFECTIVE license is
+  // still decided at OpenContent (license_mask override).
+  uint32_t header_license = 0;
 };
 
 class ContentManager {
@@ -227,6 +232,9 @@ class ContentManager {
   // indexed, so call after the module is loaded. What the user placed in dlc
   // takes priority over an ambient extracted install - same rule as the assets
   // folder (and Windows' local-DLL search order).
+  // The scan report (one line per scanned root with its resolved path and
+  // candidate count, plus one line per package) logs at error level so it is
+  // present in a default config's log, even when nothing was found at all.
   void DiscoverContainers(const std::filesystem::path& dlc_dir);
 
   // Torn-container self-healing: if the package's write-in-progress

@@ -935,20 +935,38 @@ static bool IsHexName(const std::string& text) {
 void ContentManager::DiscoverContainersInDir(const std::filesystem::path& dir, const char* source,
                                              bool recursive, bool index_directories,
                                              uint32_t title_id) {
+  // The whole scan report - the per-root lines here and the per-package lines
+  // in DiscoverContainers - logs at error level so it survives performance
+  // mode's log_level=error session default (the same reason the AC6 config
+  // summary logs at error). "Scanned <path>: 0 candidates" is the line a
+  // support conversation needs from a user whose DLC does not load: it
+  // separates wrong-location from wrong-content instantly. A handful of lines
+  // per boot, bounded by what the user placed on disk.
   std::error_code ec;
   if (dir.empty() || !std::filesystem::is_directory(dir, ec) || ec) {
+    REXSYS_ERROR("DLC scan ({}): \"{}\" - folder not present, 0 candidate package(s)", source,
+                 rex::path_to_utf8(dir));
     return;
   }
+  const size_t count_before = containers_.size();
+  // Entries that do not look like content at all (a zip, a renamed folder's
+  // stray files) are summarised on the per-root line below: count plus one
+  // example, never per-file.
+  size_t unrecognized_count = 0;
+  std::string first_unrecognized;
 
   auto index_package = [&](const std::filesystem::path& path, XContentType content_type,
-                           std::u16string display_name, bool is_extracted_folder) {
+                           std::u16string display_name, bool is_extracted_folder,
+                           uint32_t header_license) {
     // Key = the name enumeration hands to the game (42-char field).
     auto key_name = rex::path_to_utf8(path.filename());
     if (key_name.size() > 42) {
       key_name.resize(42);
     }
     if (containers_.count(string::string_key_case(key_name))) {
-      REXSYS_DEBUG("ContentManager: duplicate package name {}, keeping the first found", key_name);
+      REXSYS_ERROR("ContentManager: duplicate package name {}, keeping the first found (ignoring "
+                   "{})",
+                   key_name, rex::path_to_utf8(path));
       return;
     }
     if (display_name.empty()) {
@@ -968,6 +986,7 @@ void ContentManager::DiscoverContainersInDir(const std::filesystem::path& dir, c
     package.display_name = std::move(display_name);
     package.source = source;
     package.is_extracted_folder = is_extracted_folder;
+    package.header_license = header_license;
     containers_.insert({string::string_key_case::create(key_name), std::move(package)});
   };
 
@@ -976,27 +995,40 @@ void ContentManager::DiscoverContainersInDir(const std::filesystem::path& dir, c
     if (!header) {
       // Not an STFS/LIVE/PIRS container (thumbnails, .header sidecars, ...).
       REXSYS_DEBUG("ContentManager: ignoring non-container file {}", rex::path_to_utf8(path));
+      if (++unrecognized_count == 1) {
+        first_unrecognized = rex::path_to_utf8(path.filename());
+      }
       return;
     }
+    // From here down the file IS a recognized container; a skip is a
+    // "recognized but not loaded" decision, which is exactly what a support
+    // log must show, so these log at error level.
     const uint32_t container_title = header->metadata.execution_info.title_id;
     if (container_title != title_id) {
-      REXSYS_DEBUG("ContentManager: ignoring container for another title ({:08X}): {}",
+      REXSYS_ERROR("ContentManager: ignoring container for another title ({:08X}): {}",
                    container_title, rex::path_to_utf8(path));
       return;
     }
     const XContentType content_type = header->metadata.content_type;
     if (uint32_t(content_type) == kTitleUpdateContentType) {
-      REXSYS_DEBUG("ContentManager: title update package present (not used by this port): {}",
+      REXSYS_ERROR("ContentManager: title update package present (not used by this port): {}",
                    rex::path_to_utf8(path.filename()));
       return;
     }
     if (content_type != XContentType::kMarketplaceContent) {
-      REXSYS_DEBUG("ContentManager: ignoring container of content type {:08X}: {}",
+      REXSYS_ERROR("ContentManager: ignoring container of content type {:08X}: {}",
                    uint32_t(content_type), rex::path_to_utf8(path));
       return;
     }
 
-    index_package(path, content_type, header->metadata.display_name(XLanguage::kEnglish), false);
+    uint32_t header_license = 0;
+    for (size_t i = 0; i < 0x10; i++) {
+      if (header->header.licenses[i].license_flags) {
+        header_license |= header->header.licenses[i].license_bits;
+      }
+    }
+    index_package(path, content_type, header->metadata.display_name(XLanguage::kEnglish), false,
+                  header_license);
   };
 
   // Recognises an ALREADY-EXTRACTED package folder, so users who unpacked
@@ -1023,12 +1055,12 @@ void ContentManager::DiscoverContainersInDir(const std::filesystem::path& dir, c
     }
 
     if (uint32_t(content_type) == kTitleUpdateContentType) {
-      REXSYS_DEBUG("ContentManager: title update package present (not used by this port): {}",
+      REXSYS_ERROR("ContentManager: title update package present (not used by this port): {}",
                    name);
       return true;
     }
     if (content_type != XContentType::kMarketplaceContent) {
-      REXSYS_DEBUG("ContentManager: ignoring extracted package of content type {:08X}: {}",
+      REXSYS_ERROR("ContentManager: ignoring extracted package of content type {:08X}: {}",
                    uint32_t(content_type), rex::path_to_utf8(path));
       return true;
     }
@@ -1047,7 +1079,7 @@ void ContentManager::DiscoverContainersInDir(const std::filesystem::path& dir, c
       return false;
     }
 
-    index_package(path, content_type, std::u16string(), true);
+    index_package(path, content_type, std::u16string(), true, 0);
     return true;
   };
 
@@ -1073,6 +1105,21 @@ void ContentManager::DiscoverContainersInDir(const std::filesystem::path& dir, c
       }
     }
   }
+
+  // The per-root line, emitted even - especially - when the count is zero:
+  // silence diagnoses nothing. When nothing in the root was recognized, the
+  // same line names one of the ignored entries - the user whose files sit
+  // right there deserves better than a bare zero.
+  const size_t found = containers_.size() - count_before;
+  std::string unrecognized_note;
+  if (unrecognized_count > 0) {
+    unrecognized_note = fmt::format(", {} unrecognized entr(ies) ignored", unrecognized_count);
+    if (found == 0) {
+      unrecognized_note += fmt::format(" (first: \"{}\")", first_unrecognized);
+    }
+  }
+  REXSYS_ERROR("DLC scan ({}): \"{}\" - {} candidate package(s){}", source, rex::path_to_utf8(dir),
+               found, unrecognized_note);
 }
 
 void ContentManager::DiscoverContainers(const std::filesystem::path& dlc_dir) {
@@ -1094,7 +1141,9 @@ void ContentManager::DiscoverContainers(const std::filesystem::path& dlc_dir) {
 
   // Startup report, one line per package: "did my DLC install work?" becomes
   // a log grep instead of a guess. Containers take priority, so a folder with
-  // a same-named container is the overridden one.
+  // a same-named container is the overridden one. Error level, like the scan
+  // lines above: a default config runs at log_level=error (performance mode),
+  // and this report is precisely what a support conversation needs.
   size_t folder_count = 0;
   auto package_root = ResolvePackageRoot(0, XContentType::kMarketplaceContent, title_id);
   auto file_infos = rex::filesystem::ListFiles(package_root);
@@ -1114,8 +1163,8 @@ void ContentManager::DiscoverContainers(const std::filesystem::path& dlc_dir) {
     if (overriding) {
       note = fmt::format(" (overridden by {})", overriding->source);
     }
-    REXSYS_INFO("DLC: \"{}\" [{}] - extracted folder{}", display.empty() ? name : display, name,
-                note);
+    REXSYS_ERROR("DLC: \"{}\" [{}] - extracted folder{}", display.empty() ? name : display, name,
+                 note);
     folder_count++;
   }
 
@@ -1133,15 +1182,23 @@ void ContentManager::DiscoverContainers(const std::filesystem::path& dlc_dir) {
     if (display.empty()) {
       display = std::string(entry->first.view());
     }
-    REXSYS_INFO("DLC: \"{}\" [{}] - {} ({}): {}", display, entry->first.view(),
-                container.is_extracted_folder ? "extracted folder" : "container", container.source,
-                rex::path_to_utf8(container.path));
+    // Containers carry their STFS header's license bits; a PARTIAL mask here
+    // (e.g. 0x0000000F) is the "pack loads but colours are hidden" class,
+    // unless the license_mask override (reported in the summary) covers it.
+    std::string license_note;
+    if (!container.is_extracted_folder) {
+      license_note = fmt::format(", header license 0x{:08X}", container.header_license);
+    }
+    REXSYS_ERROR("DLC: \"{}\" [{}] - {} ({}{}): {}", display, entry->first.view(),
+                 container.is_extracted_folder ? "extracted folder" : "container",
+                 container.source, license_note, rex::path_to_utf8(container.path));
     extracted_count += container.is_extracted_folder ? 1 : 0;
   }
-  REXSYS_INFO(
+  REXSYS_ERROR(
       "DLC: {} extracted folder(s) in the content root, {} package(s) mounted with priority "
-      "({} container(s), {} extracted folder(s))",
-      folder_count, containers_.size(), containers_.size() - extracted_count, extracted_count);
+      "({} container(s), {} extracted folder(s)), effective license mask 0x{:08X}",
+      folder_count, containers_.size(), containers_.size() - extracted_count, extracted_count,
+      REXCVAR_GET(license_mask));
 }
 
 }  // namespace xam
