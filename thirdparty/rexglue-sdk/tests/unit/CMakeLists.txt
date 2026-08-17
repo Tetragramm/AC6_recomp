@@ -3,6 +3,7 @@
 add_executable(unit_tests
     memory/heap_allocation_test.cpp
     kernel/object_table_test.cpp
+    kernel/xam_user_alias_test.cpp
     core/cvar_test.cpp
     core/fiber_test.cpp
     core/sha256_test.cpp

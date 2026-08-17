@@ -25,6 +25,25 @@
 
 REXCVAR_DEFINE_UINT32(user_language, 1, "Kernel", "User's language ID");
 
+// COMPAT SHIM - revisit when multiplayer work starts.
+// The recomp has exactly ONE synthetic profile and it lives at user index 0,
+// but on a real 360 the user slot follows the controller port: a pad that
+// enumerates as XInput device 1-3 (wireless dongle, HOTAS enumerated first,
+// second pad) binds the player to that slot, the game queries THAT index,
+// reads "not signed in", and shows "Gamer Profile not selected". With this
+// on, user-index-keyed profile queries answer with the one profile, signed
+// in, for ANY index 0-3 - the same profile for all four, never four
+// profiles. The profile OBJECT stays singular and real (settings storage,
+// XUID, identity untouched); this is presentation-level aliasing only, which
+// is also why it must be revisited for multiplayer, where per-player
+// identity becomes real. XamUserCheckPrivilege is deliberately NOT aliased
+// (DLC licensing territory).
+REXCVAR_DEFINE_BOOL(ac6_profile_always_signed_in, true, "AC6/Fixes",
+                    "Answer profile queries for any user index 0-3 with the one synthetic "
+                    "profile, signed in. Fixes 'Gamer Profile not selected' when the pad "
+                    "enumerates at an XInput slot other than 0 (the Steam Input workaround's "
+                    "actual mechanism). Off restores index-0-only behaviour.");
+
 namespace rex {
 namespace kernel {
 namespace xam {
@@ -51,6 +70,16 @@ std::atomic<uint32_t> g_get_xuid_indices_seen{0};
 
 }  // namespace
 
+// The alias itself (declared in private.h for the unit test): valid indices
+// 0-3 all map to 0 while ac6_profile_always_signed_in is on; index 0 and
+// invalid indices (>= 4) always pass through, so error paths are unchanged.
+uint32_t XamEffectiveUserIndex(uint32_t user_index) {
+  if (user_index != 0 && user_index < 4 && REXCVAR_GET(ac6_profile_always_signed_in)) {
+    return 0;
+  }
+  return user_index;
+}
+
 ppc_hresult_result_t XamUserGetXUID_entry(ppc_u32_t user_index, ppc_u32_t type_mask,
                                           ppc_pu64_t xuid_ptr) {
   LogUserIndexOnce(g_get_xuid_indices_seen, "XamUserGetXUID", user_index);
@@ -59,10 +88,11 @@ ppc_hresult_result_t XamUserGetXUID_entry(ppc_u32_t user_index, ppc_u32_t type_m
   if (!xuid_ptr) {
     return X_E_INVALIDARG;
   }
+  const uint32_t effective_index = XamEffectiveUserIndex(user_index);
   uint32_t result = X_E_NO_SUCH_USER;
   uint64_t xuid = 0;
   if (user_index < 4) {
-    if (user_index == 0) {
+    if (effective_index == 0) {
       const auto& user_profile = REX_KERNEL_STATE()->user_profile();
       auto type = user_profile->type() & type_mask;
       if (type & (2 | 4)) {
@@ -86,7 +116,7 @@ ppc_u32_result_t XamUserGetSigninState_entry(ppc_u32_t user_index) {
   LogUserIndexOnce(g_signin_state_indices_seen, "XamUserGetSigninState", user_index);
   uint32_t signin_state = 0;
   if (user_index < 4) {
-    if (user_index == 0) {
+    if (XamEffectiveUserIndex(user_index) == 0) {
       const auto& user_profile = REX_KERNEL_STATE()->user_profile();
       signin_state = user_profile->signin_state();
     }
@@ -111,7 +141,7 @@ ppc_hresult_result_t XamUserGetSigninInfo_entry(ppc_u32_t user_index, ppc_u32_t 
   }
 
   std::memset(info, 0, sizeof(X_USER_SIGNIN_INFO));
-  if (user_index) {
+  if (XamEffectiveUserIndex(user_index)) {
     return X_E_NO_SUCH_USER;
   }
 
@@ -128,7 +158,7 @@ ppc_u32_result_t XamUserGetName_entry(ppc_u32_t user_index, ppc_pchar_t buffer,
     return X_E_INVALIDARG;
   }
 
-  if (user_index) {
+  if (XamEffectiveUserIndex(user_index)) {
     return X_E_NO_SUCH_USER;
   }
 
@@ -233,7 +263,11 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
   // Title ID = 0 means us.
   // 0xfffe07d1 = profile?
 
-  if (!xuids && user_index) {
+  // XamEffectiveUserIndex: profile settings are the "Gamer Profile" data the
+  // game actually reads per slot; aliasing signin state but failing these
+  // would leave the profile NOT following the player. The echoed
+  // out_setting->user_index below stays the index the game asked about.
+  if (!xuids && XamEffectiveUserIndex(user_index)) {
     // Only support user 0.
     if (overlapped) {
       REX_KERNEL_STATE()->CompleteOverlappedImmediate(
@@ -334,7 +368,9 @@ ppc_u32_result_t XamUserWriteProfileSettings_entry(ppc_u32_t title_id, ppc_u32_t
     return X_ERROR_INVALID_PARAMETER;
   }
 
-  if (user_index) {
+  // XamEffectiveUserIndex: the write side of the same aliasing as the read
+  // side above - there is only one profile object either way.
+  if (XamEffectiveUserIndex(user_index)) {
     // Only support user 0.
     if (overlapped) {
       REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped.guest_address(),
