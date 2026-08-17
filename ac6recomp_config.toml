@@ -10796,3 +10796,82 @@ registers = ["r3"]
 address = 0x822CD758
 name = "ac6PacBlockConsumerProbe"
 registers = ["r3"]
+
+# Storage job submit-order fix (ac6_fix_storage_submit_order).
+#
+# Twelve call sites submit an async storage job to JobPoolB::Submit (0x821D4A78)
+# and only store the job's operation code to [job+4] AFTER the call returns; the
+# pool-B worker runs job->vtbl[1] as soon as the job is queued, so a fast worker
+# reads a stale operation code (previous op on the reused object). The retail
+# title update reorders every one of these sites to store the code BEFORE the
+# submit call (verified instruction-level at all 12). These hooks fire at each
+# `bl` site, where r5 already holds the job pointer (Submit's third argument),
+# and perform the same early store. The original post-call store still runs and
+# re-stores the same value, which is harmless: the code is a submit-time input
+# the worker only reads. Implementation: src/ac6_backend_fixes/
+# ac6_storage_submit_order_fix.cpp.
+#
+# Sites: 7 per-operation wrappers 0x821D3BE8..0x821D4078 (ops 2,3,6,7,A,B,C),
+# 0x821C72F8 (op D), 0x821C88C0 (ops 8,9), 0x821C8FF0 (op 0x10) -- these are the
+# save/replay/content-cache layer under sub_82158D90 and CResourceLoaderDpl --
+# plus 0x821C59C0 where the op code is carried in r29.
+
+[[midasm_hook]]
+address = 0x821D3C8C
+name = "ac6StorageOrderHookOp2"
+registers = ["r5"]
+
+[[midasm_hook]]
+address = 0x821D3D0C
+name = "ac6StorageOrderHookOp3"
+registers = ["r5"]
+
+[[midasm_hook]]
+address = 0x821D3DC8
+name = "ac6StorageOrderHookOp6"
+registers = ["r5"]
+
+[[midasm_hook]]
+address = 0x821D3E58
+name = "ac6StorageOrderHookOp7"
+registers = ["r5"]
+
+[[midasm_hook]]
+address = 0x821D3F70
+name = "ac6StorageOrderHookOpA"
+registers = ["r5"]
+
+[[midasm_hook]]
+address = 0x821D4030
+name = "ac6StorageOrderHookOpB"
+registers = ["r5"]
+
+[[midasm_hook]]
+address = 0x821D40F0
+name = "ac6StorageOrderHookOpC"
+registers = ["r5"]
+
+[[midasm_hook]]
+address = 0x821C7538
+name = "ac6StorageOrderHookOpD"
+registers = ["r5"]
+
+[[midasm_hook]]
+address = 0x821C8EC4
+name = "ac6StorageOrderHookOp8"
+registers = ["r5"]
+
+[[midasm_hook]]
+address = 0x821C8F78
+name = "ac6StorageOrderHookOp9"
+registers = ["r5"]
+
+[[midasm_hook]]
+address = 0x821C9298
+name = "ac6StorageOrderHookOp10"
+registers = ["r5"]
+
+[[midasm_hook]]
+address = 0x821C5A78
+name = "ac6StorageOrderHookVar"
+registers = ["r5", "r29"]
