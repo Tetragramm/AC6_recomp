@@ -59,6 +59,30 @@ std::string FlagNameToEnvVar(std::string_view name) {
   return result;
 }
 
+bool ValidateConstraints(const FlagEntry& entry, std::string_view value);
+
+// Config-load path for one flag when the command line already set it: the
+// command line wins for the LIVE value (cmdline > toml > default),
+// but the toml value must still become the user-owned config value or the
+// next SaveConfig would silently drop the user's saved setting.
+// Returns true when the flag was handled here (skip the normal set).
+bool RecordConfigValueOverriddenByCmdline(const std::string& name, const std::string& value) {
+  std::lock_guard lock(GetRegistryMutex());
+  auto it = GetRegistryIndex().find(name);
+  if (it == GetRegistryIndex().end()) {
+    return false;
+  }
+  auto& entry = GetRegistryStorage()[it->second];
+  if (!entry.cmdline_set) {
+    return false;
+  }
+  if (ValidateConstraints(entry, value)) {
+    entry.user_set = true;
+    entry.user_value = value;
+  }
+  return true;
+}
+
 // Recursively apply TOML values
 void ApplyTomlTable(const toml::table& table, const std::string& prefix) {
   for (const auto& [key, value] : table) {
@@ -81,7 +105,9 @@ void ApplyTomlTable(const toml::table& table, const std::string& prefix) {
         continue;
       }
 
-      if (SetFlagByName(full_key, value_str)) {
+      if (RecordConfigValueOverriddenByCmdline(full_key, value_str)) {
+        REXLOG_DEBUG("Config: {} = {} (command line takes precedence)", full_key, value_str);
+      } else if (SetFlagByName(full_key, value_str)) {
         REXLOG_DEBUG("Config: {} = {}", full_key, value_str);
       } else {
         REXLOG_WARN("Config: unknown cvar '{}'", full_key);
@@ -592,11 +618,20 @@ std::vector<std::string> Init(int argc, char** argv) {
     if (entry.type == FlagType::Boolean) {
       app.add_flag_function(
           "--" + entry.name + ",!--no-" + entry.name,
-          [&entry](int64_t count) { entry.setter(count > 0 ? "true" : "false"); },
+          [&entry](int64_t count) {
+            if (entry.setter(count > 0 ? "true" : "false")) {
+              entry.cmdline_set = true;
+            }
+          },
           entry.description);
     } else {
       app.add_option_function<std::string>(
-          "--" + entry.name, [&entry](const std::string& val) { entry.setter(val); },
+          "--" + entry.name,
+          [&entry](const std::string& val) {
+            if (entry.setter(val)) {
+              entry.cmdline_set = true;
+            }
+          },
           entry.description);
     }
   }
@@ -713,6 +748,7 @@ void ResetAllForTesting() {
       entry.has_session_default = false;
       entry.session_default.clear();
       entry.session_driver.clear();
+      entry.cmdline_set = false;
     }
   }
   ClearPendingRestartFlags();

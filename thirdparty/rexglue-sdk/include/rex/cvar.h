@@ -165,6 +165,13 @@ struct FlagEntry {
   bool has_session_default = false;
   std::string session_default;
   std::string session_driver;
+  // Set by cvar::Init when the value came from the command line. Config-file
+  // load skips applying to these entries so per-launch overrides keep their
+  // precedence (cmdline > toml > default) even for cvars consumed after
+  // LoadConfig; the toml value is still recorded as
+  // user_set/user_value so the next SaveConfig round-trips the user's saved
+  // choice instead of dropping it.
+  bool cmdline_set = false;
 };
 
 std::vector<FlagEntry>& GetRegistry();

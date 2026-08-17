@@ -342,39 +342,6 @@ bool ReXApp::ResolveGameSource(const std::filesystem::path& exe_dir,
 bool ReXApp::OnInitialize() {
   auto exe_dir = rex::filesystem::GetExecutableFolder();
 
-  // Game directory: positional arg or default to exe_dir/assets
-  std::filesystem::path game_dir;
-  if (auto arg = GetArgument("game_directory")) {
-    game_dir = *arg;
-  } else {
-    game_dir = exe_dir / "assets";
-  }
-
-  // User data: cvar override, or platform user directory
-  std::filesystem::path user_dir;
-  std::string user_data_cvar = REXCVAR_GET(user_data_root);
-  if (!user_data_cvar.empty()) {
-    // to_path: the toml string is UTF-8, not the ANSI codepage a bare path
-    // construction would assume on Windows (same rule as game_iso/dlc_dir).
-    user_dir = rex::to_path(user_data_cvar);
-  } else {
-    user_dir = rex::filesystem::GetUserFolder() / GetName();
-  }
-
-  // Update data: cvar override, or empty (opt-in)
-  std::filesystem::path update_dir;
-  std::string update_data_cvar = REXCVAR_GET(update_data_root);
-  if (!update_data_cvar.empty()) {
-    update_dir = rex::to_path(update_data_cvar);
-  }
-
-  // Allow subclass to override path defaults
-  PathConfig path_config{game_dir, user_dir, update_dir};
-  OnConfigurePaths(path_config);
-  game_data_root_ = std::move(path_config.game_data_root);
-  user_data_root_ = std::move(path_config.user_data_root);
-  update_data_root_ = std::move(path_config.update_data_root);
-
   auto config_path = exe_dir / (std::string(GetName()) + ".toml");
 
   // Load saved config (CVARs) before anything reads them
@@ -445,6 +412,47 @@ bool ReXApp::OnInitialize() {
   }
 
   REXLOG_INFO("{} starting", GetName());
+
+  // Data-root resolution. Runs after LoadConfig, next to the game-data
+  // resolution below and for the same reason: these cvars used to be
+  // consumed at the top of this function, BEFORE the toml was parsed, so a
+  // user_data_root/update_data_root set in the config file silently did
+  // nothing - only the command line ever worked. Nothing between
+  // LoadConfig and this point derives a path from the user root (log and
+  // crash paths come from log_file/exe_dir).
+
+  // Game directory: positional arg or default to exe_dir/assets
+  std::filesystem::path game_dir;
+  if (auto arg = GetArgument("game_directory")) {
+    game_dir = *arg;
+  } else {
+    game_dir = exe_dir / "assets";
+  }
+
+  // User data: cvar override, or platform user directory
+  std::filesystem::path user_dir;
+  std::string user_data_cvar = REXCVAR_GET(user_data_root);
+  if (!user_data_cvar.empty()) {
+    // to_path: the toml string is UTF-8, not the ANSI codepage a bare path
+    // construction would assume on Windows (same rule as game_iso/dlc_dir).
+    user_dir = rex::to_path(user_data_cvar);
+  } else {
+    user_dir = rex::filesystem::GetUserFolder() / GetName();
+  }
+
+  // Update data: cvar override, or empty (opt-in)
+  std::filesystem::path update_dir;
+  std::string update_data_cvar = REXCVAR_GET(update_data_root);
+  if (!update_data_cvar.empty()) {
+    update_dir = rex::to_path(update_data_cvar);
+  }
+
+  // Allow subclass to override path defaults
+  PathConfig path_config{game_dir, user_dir, update_dir};
+  OnConfigurePaths(path_config);
+  game_data_root_ = std::move(path_config.game_data_root);
+  user_data_root_ = std::move(path_config.user_data_root);
+  update_data_root_ = std::move(path_config.update_data_root);
 
   // Resolve where the game's data comes from. Runs after LoadConfig so the
   // game_iso / iso_direct toml overrides apply.
