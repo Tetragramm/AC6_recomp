@@ -202,8 +202,8 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
     }
 
     XCONTENT_AGGREGATE_DATA content_data;
-    if (XSUCCEEDED(ReadContentHeaderFile(rex::path_to_utf8(file_info.name), xuid, title_id,
-                                         content_type, content_data))) {
+    if (ReadContentHeaderFile(rex::path_to_utf8(file_info.name), xuid, title_id, content_type,
+                              content_data) == X_ERROR_SUCCESS) {
       result.emplace_back(std::move(content_data));
     } else {
       content_data.device_id = device_id;
@@ -973,8 +973,8 @@ void ContentManager::DiscoverContainersInDir(const std::filesystem::path& dir, c
       // An extracted folder carries no header of its own, but the .header
       // sidecar in the content root still names it when one was written.
       XCONTENT_AGGREGATE_DATA header_data;
-      if (XSUCCEEDED(ReadContentHeaderFile(key_name, 0, title_id,
-                                           XContentType::kMarketplaceContent, header_data))) {
+      if (ReadContentHeaderFile(key_name, 0, title_id, XContentType::kMarketplaceContent,
+                                header_data) == X_ERROR_SUCCESS) {
         display_name = header_data.display_name();
       }
     }
@@ -1154,8 +1154,8 @@ void ContentManager::DiscoverContainers(const std::filesystem::path& dlc_dir) {
     auto name = rex::path_to_utf8(file_info.name);
     std::string display;
     XCONTENT_AGGREGATE_DATA content_data;
-    if (XSUCCEEDED(ReadContentHeaderFile(name, 0, title_id, XContentType::kMarketplaceContent,
-                                         content_data))) {
+    if (ReadContentHeaderFile(name, 0, title_id, XContentType::kMarketplaceContent,
+                              content_data) == X_ERROR_SUCCESS) {
       display = rex::string::to_utf8(content_data.display_name());
     }
     const auto* overriding = FindContainer(name, XContentType::kMarketplaceContent);
