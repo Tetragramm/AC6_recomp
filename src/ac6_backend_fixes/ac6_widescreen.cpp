@@ -28,11 +28,17 @@
 // the presenter is forced to letterbox: menus, hangar, briefing, FMV and the
 // attract demo render exactly vanilla.
 
+#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include "ac6_win_compat_posix.h"
+
+#include <thread>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -42,6 +48,7 @@
 #include <mutex>
 #include <vector>
 
+#include <native/memory/utils.h>
 #include <native/ui/presenter.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
@@ -206,6 +213,7 @@ uint32_t HostBitsOf(float value) {
 // GPU-write-watched physical page is still recovered transparently (like any
 // guest write); only genuinely unrecoverable access violations land here and
 // are reported as failure instead of crashing the process.
+#if defined(_WIN32)
 bool SafeReadU32(const uint32_t* p, uint32_t* out) noexcept {
   __try {
     *out = *p;
@@ -223,6 +231,25 @@ bool SafeWriteU32(uint32_t* p, uint32_t value) noexcept {
     return false;
   }
 }
+#else
+// POSIX: reads go through process_vm_readv so an unmapped page reports
+// failure instead of faulting (see ac6_win_compat_posix.h). Writes validate
+// the mapping with a probing read first, then store directly - a direct
+// store to a GPU-write-watched page faults into the SDK's recovery handler
+// and is tracked like any guest write, matching the Windows semantics.
+bool SafeReadU32(const uint32_t* p, uint32_t* out) noexcept {
+  return Ac6SafeMemRead(out, p, sizeof(*out));
+}
+
+bool SafeWriteU32(uint32_t* p, uint32_t value) noexcept {
+  uint32_t probe;
+  if (!Ac6SafeMemRead(&probe, p, sizeof(probe))) {
+    return false;
+  }
+  *p = value;
+  return true;
+}
+#endif
 
 // Big-endian guest dword read through the translated view, SEH-safe.
 bool SafeReadGuestU32(rex::memory::Memory* memory, uint32_t guest_ea, uint32_t* out) {
@@ -257,6 +284,7 @@ uint32_t ReadCurrentScreenId(rex::memory::Memory* memory) {
 // Scalar-only frame so __try is legal. Finds dwords equal to the big-endian
 // 16:9 aspect whose neighbors look like a camera (fov, near, far in sane
 // ranges); returns match count, stores up to max_out dword indices.
+#if defined(_WIN32)
 size_t WideScanRegionRaw(const uint32_t* words, size_t count, uint32_t aspect_pattern,
                          uint32_t prev_pattern, uint32_t* out_indices,
                          size_t max_out) noexcept {
@@ -286,6 +314,49 @@ size_t WideScanRegionRaw(const uint32_t* words, size_t count, uint32_t aspect_pa
   }
   return n;
 }
+#else
+// POSIX: no in-place SEH scan - copy the region through process_vm_readv in
+// bounded chunks (with a 3-dword overlap for the neighbor window) and scan
+// the local copies. A chunk whose pages vanished mid-sweep is skipped, like
+// the aborted scan on Windows.
+size_t WideScanRegionRaw(const uint32_t* words, size_t count, uint32_t aspect_pattern,
+                         uint32_t prev_pattern, uint32_t* out_indices,
+                         size_t max_out) noexcept {
+  constexpr size_t kChunkWords = size_t(64) * 1024;  // 256 KiB per copy
+  static thread_local std::vector<uint32_t> buf;     // patcher thread only
+  buf.resize(kChunkWords + 3);
+  size_t n = 0;
+  for (size_t cbase = 0; cbase + 3 < count; cbase += kChunkWords) {
+    size_t cend = std::min(cbase + kChunkWords + 3, count);
+    if (!Ac6SafeMemRead(buf.data(), words + cbase, (cend - cbase) * sizeof(uint32_t))) {
+      continue;
+    }
+    size_t i_end = std::min(cbase + kChunkWords + 1, count - 2);
+    for (size_t i = cbase + 1; i < i_end; ++i) {
+      const uint32_t* c = buf.data() + (i - cbase);
+      if (c[0] != aspect_pattern && (!prev_pattern || c[0] != prev_pattern)) {
+        continue;
+      }
+      uint32_t w;
+      float fov, near_plane, far_plane;
+      w = _byteswap_ulong(c[-1]);
+      std::memcpy(&fov, &w, sizeof(fov));
+      w = _byteswap_ulong(c[1]);
+      std::memcpy(&near_plane, &w, sizeof(near_plane));
+      w = _byteswap_ulong(c[2]);
+      std::memcpy(&far_plane, &w, sizeof(far_plane));
+      if (fov > 0.05f && fov < 2.0f && near_plane > 0.005f && near_plane < 10.0f &&
+          far_plane > 1000.0f && far_plane < 200000.0f) {
+        if (n < max_out) {
+          out_indices[n] = uint32_t(i);
+        }
+        ++n;
+      }
+    }
+  }
+  return n;
+}
+#endif
 
 // The previously applied target's big-endian pattern (0 = none) - lets the
 // static defaults be retargeted when the auto-derived aspect changes (window
@@ -307,11 +378,20 @@ void PatchStaticDefaults(rex::memory::Memory* memory, uint32_t aspect_pattern,
     // Early in boot the page may not be committed yet (this runs from ~2s
     // after graphics init, during the startup logo) - skip and retry on the
     // next sweep rather than touching it.
+#if defined(_WIN32)
     MEMORY_BASIC_INFORMATION mbi{};
     if (!VirtualQuery(host, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT ||
         (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
       continue;
     }
+#else
+    size_t region_len = 0;
+    rex::memory::PageAccess region_access = rex::memory::PageAccess::kNoAccess;
+    if (!rex::memory::QueryProtect(host, region_len, region_access) ||
+        region_access == rex::memory::PageAccess::kNoAccess) {
+      continue;
+    }
+#endif
     uint32_t cur;
     if (!SafeReadU32(host, &cur)) {
       continue;
@@ -333,6 +413,7 @@ void PatchStaticDefaults(rex::memory::Memory* memory, uint32_t aspect_pattern,
     }
     // The XEX image copy may be mapped read-only - unprotect before writing
     // (kept writable; this field is re-checked every sweep anyway).
+#if defined(_WIN32)
     bool need_unprotect =
         !(mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE |
                          PAGE_EXECUTE_WRITECOPY));
@@ -348,6 +429,25 @@ void PatchStaticDefaults(rex::memory::Memory* memory, uint32_t aspect_pattern,
         continue;
       }
     }
+#else
+    bool need_unprotect = region_access != rex::memory::PageAccess::kReadWrite &&
+                          region_access != rex::memory::PageAccess::kExecuteReadWrite;
+    if (need_unprotect) {
+      // mprotect (unlike VirtualProtect) requires a page-aligned base.
+      size_t page = rex::memory::page_size();
+      void* page_base =
+          reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(host) & ~uintptr_t(page - 1));
+      if (!rex::memory::Protect(page_base, page, rex::memory::PageAccess::kReadWrite)) {
+        if (unexpected_logs < 4) {
+          ++unexpected_logs;
+          REXLOG_ERROR("[AC6-WIDE] static default @ 0x{:08X}: read-only and unprotect "
+                       "failed, skipping",
+                       guest);
+        }
+        continue;
+      }
+    }
+#endif
     if (SafeWriteU32(host, target_bits) && patch_logs < 8) {
       ++patch_logs;
       REXLOG_ERROR("[AC6-WIDE] static default @ 0x{:08X}: 1.77778 -> {:g}{}", guest, target,
@@ -380,6 +480,7 @@ uint32_t WidescreenSweep(rex::memory::Memory* memory, uint32_t match_a, uint32_t
   uint64_t guest = 0x00010000;
   while (guest < kGuestScanEnd) {
     uint8_t* host = memory->TranslateVirtual(uint32_t(guest));
+#if defined(_WIN32)
     MEMORY_BASIC_INFORMATION mbi{};
     if (!VirtualQuery(host, &mbi, sizeof(mbi)) || !mbi.RegionSize) {
       break;
@@ -395,6 +496,29 @@ uint32_t WidescreenSweep(rex::memory::Memory* memory, uint32_t match_a, uint32_t
                         PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY));
     bool writable = (mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE |
                                     PAGE_EXECUTE_WRITECOPY)) != 0;
+#else
+    // QueryProtect reports the /proc/self/maps region containing host and the
+    // length remaining from host to that region's end. The guest range is one
+    // continuous reservation, so an unqueryable hole (should not happen) is
+    // stepped over one allocation granule at a time rather than aborting.
+    size_t region_len = 0;
+    rex::memory::PageAccess region_access = rex::memory::PageAccess::kNoAccess;
+    uint64_t len;
+    bool readable, writable;
+    if (rex::memory::QueryProtect(host, region_len, region_access)) {
+      len = std::min(uint64_t(region_len), kGuestScanEnd - guest);
+      readable = region_access != rex::memory::PageAccess::kNoAccess;
+      writable = region_access == rex::memory::PageAccess::kReadWrite ||
+                 region_access == rex::memory::PageAccess::kExecuteReadWrite;
+    } else {
+      len = std::min(uint64_t(rex::memory::allocation_granularity()), kGuestScanEnd - guest);
+      readable = false;
+      writable = false;
+    }
+    if (!len) {
+      break;
+    }
+#endif
     if (readable) {
       size_t found = WideScanRegionRaw(reinterpret_cast<const uint32_t*>(host), size_t(len / 4),
                                        match_a, match_b, indices, kMaxRegionMatches);
@@ -602,7 +726,11 @@ void WidescreenInit(rex::memory::Memory* memory) {
                    REXCVAR_GET(ac6_widescreen_cinematics) ? 1 : 0,
                    REXCVAR_GET(present_letterbox) ? 1 : 0);
     }
+#if defined(_WIN32)
     CreateThread(nullptr, 0, WidescreenThread, nullptr, 0, nullptr);
+#else
+    std::thread([] { WidescreenThread(nullptr); }).detach();
+#endif
   });
 }
 

@@ -20,11 +20,15 @@
 // registry, so the game stays self-consistent downstream. The emulator sees
 // an ordinary full-res surface - no RT-cache changes needed.
 
+#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include "ac6_win_compat_posix.h"
+#endif
 
 #include <atomic>
 #include <cstdint>
@@ -287,6 +291,7 @@ namespace {
 std::atomic<uint32_t> g_downscaler_resolve_pending{0};
 std::atomic<uint32_t> g_mask_base{0};
 
+#if defined(_WIN32)
 bool SafeCopyU32Array(const uint32_t* host, uint32_t* out, uint32_t count) noexcept {
     __try {
         for (uint32_t i = 0; i < count; ++i) {
@@ -297,6 +302,11 @@ bool SafeCopyU32Array(const uint32_t* host, uint32_t* out, uint32_t count) noexc
         return false;
     }
 }
+#else
+bool SafeCopyU32Array(const uint32_t* host, uint32_t* out, uint32_t count) noexcept {
+    return Ac6SafeMemRead(out, host, size_t(count) * sizeof(uint32_t));
+}
+#endif
 }  // namespace
 
 bool FxFixDownscalerDraw(uint64_t ps_ucode_hash, uint32_t* surface_info,
