@@ -185,24 +185,23 @@ class PosixFileHandle : public FileHandle {
 
 std::unique_ptr<FileHandle> FileHandle::OpenExisting(const std::filesystem::path& path,
                                                      uint32_t desired_access) {
-  int open_access = 0;
-  if (desired_access & FileAccess::kGenericRead) {
-    open_access |= O_RDONLY;
-  }
-  if (desired_access & FileAccess::kGenericWrite) {
-    open_access |= O_WRONLY;
-  }
-  if (desired_access & FileAccess::kGenericExecute) {
-    open_access |= O_RDONLY;
-  }
-  if (desired_access & FileAccess::kGenericAll) {
-    open_access |= O_RDWR;
-  }
-  if (desired_access & FileAccess::kFileReadData) {
-    open_access |= O_RDONLY;
-  }
-  if (desired_access & FileAccess::kFileWriteData) {
-    open_access |= O_WRONLY;
+  // O_RDONLY/O_WRONLY/O_RDWR are values (0/1/2), NOT bit flags, so they cannot
+  // be OR-ed together the way the Win32 access bits can: read|write OR-ed to
+  // O_WRONLY and every later read on the handle failed with EBADF. Decide what
+  // the caller wants first, then pick the one matching mode.
+  const bool wants_read =
+      (desired_access & (FileAccess::kGenericRead | FileAccess::kGenericExecute |
+                         FileAccess::kGenericAll | FileAccess::kFileReadData)) != 0;
+  const bool wants_write =
+      (desired_access & (FileAccess::kGenericWrite | FileAccess::kGenericAll |
+                         FileAccess::kFileWriteData | FileAccess::kFileAppendData)) != 0;
+  int open_access;
+  if (wants_read && wants_write) {
+    open_access = O_RDWR;
+  } else if (wants_write) {
+    open_access = O_WRONLY;
+  } else {
+    open_access = O_RDONLY;
   }
   if (desired_access & FileAccess::kFileAppendData) {
     open_access |= O_APPEND;
