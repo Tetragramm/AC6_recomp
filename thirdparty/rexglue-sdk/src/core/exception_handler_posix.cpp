@@ -205,6 +205,56 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
       return;
     }
   }
+
+  // Nothing claimed the fault. Returning now would restart the faulting
+  // instruction with the context untouched, and it would fault again, forever:
+  // a genuine fault in recompiled code (a guest null dereference lands on the
+  // PROT_NONE guard page at guest address 0) becomes a silent 100%-CPU hang
+  // instead of a crash anyone can read. Windows lets an unclaimed exception
+  // fall through to the default handler; do the same here by putting the
+  // previous handler back and letting the re-executed instruction reach it.
+  //
+  // One retry first: a write-watch fault can legitimately go unclaimed when
+  // another thread unprotects the page in between, and that one does resolve on
+  // re-execution. A fault that repeats at the same PC and address is real.
+#if REX_ARCH_AMD64
+  const uint64_t fault_pc = uint64_t(mcontext.gregs[REG_RIP]);
+#elif REX_ARCH_ARM64
+  const uint64_t fault_pc = uint64_t(mcontext.pc);
+#else
+  const uint64_t fault_pc = 0;
+#endif
+  const uint64_t fault_address = reinterpret_cast<uint64_t>(signal_info->si_addr);
+
+  static thread_local uint64_t last_unclaimed_pc = 0;
+  static thread_local uint64_t last_unclaimed_address = 0;
+  static thread_local bool have_last_unclaimed = false;
+
+  if (!have_last_unclaimed || last_unclaimed_pc != fault_pc ||
+      last_unclaimed_address != fault_address) {
+    last_unclaimed_pc = fault_pc;
+    last_unclaimed_address = fault_address;
+    have_last_unclaimed = true;
+    return;
+  }
+
+  // Repeating, so it will never resolve. Restore whatever handled this signal
+  // before us - the crash reporter, or SIG_DFL - and return so the instruction
+  // faults once more, into that handler.
+  struct sigaction* previous = nullptr;
+  if (signal_number == SIGSEGV) {
+    previous = &original_sigsegv_handler_;
+  } else if (signal_number == SIGILL) {
+    previous = &original_sigill_handler_;
+  }
+  if (previous) {
+    sigaction(signal_number, previous, nullptr);
+  } else {
+    struct sigaction default_action;
+    std::memset(&default_action, 0, sizeof(default_action));
+    default_action.sa_handler = SIG_DFL;
+    sigaction(signal_number, &default_action, nullptr);
+  }
 }
 
 void ExceptionHandler::Install(Handler fn, void* data) {
