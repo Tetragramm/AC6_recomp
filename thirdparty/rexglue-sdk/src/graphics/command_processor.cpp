@@ -1092,24 +1092,37 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   {
     static std::unique_ptr<rex::ui::RenderDocAPI> rdoc = rex::ui::RenderDocAPI::CreateIfConnected();
     static bool capturing = false;
+    static int frames_pending = 0;
     static uint64_t guest_frame = 0;
     static const char* kTrigger = "/tmp/ac6_capture_now";
+    // Capturing several CONSECUTIVE guest frames from one trigger matters:
+    // effects like auto-exposure read what the previous frame resolved, so a
+    // single frame cannot show where a value came from. Doing it from one
+    // trigger also avoids losing a re-arm that lands while a capture is being
+    // serialised, which is what happens if the trigger file is consumed late.
+    constexpr int kFramesPerTrigger = 2;
     ++guest_frame;
     if (rdoc && rdoc->api_1_0_0()) {
       const RENDERDOC_API_1_0_0* api = rdoc->api_1_0_0();
       if (capturing) {
         api->EndFrameCapture(nullptr, nullptr);
         capturing = false;
-        std::error_code trigger_ec;
-        std::filesystem::remove(kTrigger, trigger_ec);
-        REXGPU_ERROR("GUESTCAP: captured guest frame {}", guest_frame - 1);
-      } else if ((guest_frame % 15) == 0) {
+        REXGPU_ERROR("GUESTCAP: captured guest frame {} ({} more to go)", guest_frame - 1,
+                     frames_pending);
+      }
+      if (frames_pending == 0 && (guest_frame % 15) == 0) {
         std::error_code trigger_ec;
         if (std::filesystem::exists(kTrigger, trigger_ec)) {
-          REXGPU_ERROR("GUESTCAP: arming capture of guest frame {}", guest_frame);
-          api->StartFrameCapture(nullptr, nullptr);
-          capturing = true;
+          std::filesystem::remove(kTrigger, trigger_ec);
+          frames_pending = kFramesPerTrigger;
+          REXGPU_ERROR("GUESTCAP: armed, capturing {} consecutive guest frames from {}",
+                       kFramesPerTrigger, guest_frame);
         }
+      }
+      if (frames_pending > 0) {
+        api->StartFrameCapture(nullptr, nullptr);
+        capturing = true;
+        --frames_pending;
       }
     }
   }
