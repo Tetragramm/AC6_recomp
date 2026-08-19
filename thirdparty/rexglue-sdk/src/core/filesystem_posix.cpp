@@ -151,14 +151,30 @@ class PosixFileHandle : public FileHandle {
   bool Read(size_t file_offset, void* buffer, size_t buffer_length,
             size_t* out_bytes_read) override {
     ssize_t out = pread(handle_, buffer, buffer_length, file_offset);
-    *out_bytes_read = out;
-    return out >= 0 ? true : false;
+    if (out < 0) {
+      *out_bytes_read = 0;
+      return false;
+    }
+    *out_bytes_read = size_t(out);
+    // A read that starts at or past the end must FAIL, so HostPathFile turns it
+    // into X_STATUS_END_OF_FILE the way the guest kernel does. Win32 ReadFile
+    // does this for us (ERROR_HANDLE_EOF); pread just returns 0, which used to
+    // reach the guest as "success, zero bytes, position unchanged" - a loader
+    // reading a file to its end then never terminates.
+    return out != 0 || buffer_length == 0;
   }
   bool Write(size_t file_offset, const void* buffer, size_t buffer_length,
              size_t* out_bytes_written) override {
     ssize_t out = pwrite(handle_, buffer, buffer_length, file_offset);
-    *out_bytes_written = out;
-    return out >= 0 ? true : false;
+    if (out < 0) {
+      *out_bytes_written = 0;
+      return false;
+    }
+    *out_bytes_written = size_t(out);
+    // Short or zero-length writes are failures (a full disk reports one), and
+    // the atomic write path must see them as such rather than committing a
+    // truncated temp over a good file.
+    return size_t(out) == buffer_length;
   }
   bool SetLength(size_t length) override { return ftruncate(handle_, length) >= 0 ? true : false; }
   void Flush() override { fsync(handle_); }
