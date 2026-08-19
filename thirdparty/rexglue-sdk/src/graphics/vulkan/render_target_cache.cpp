@@ -3937,6 +3937,17 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
                                         builder.makeUintConstant(8), builder.makeUintConstant(24));
         }
       }
+    } else if (mode.output == TransferOutput::kStencilBit &&
+               source_stencil[0] != spv::NoResult) {
+      // A stencil bit transfer from a depth / stencil source binds only the
+      // stencil texture - the depth is not needed and deliberately not bound -
+      // so neither branch above runs and `packed` would be left unset. The
+      // stencil bit output below only kills the sample when the bit is clear,
+      // and that check is skipped entirely when `packed` is NoResult, so every
+      // sample would keep its bit and the destination stencil would come out as
+      // 0xFF everywhere regardless of the source. Supply the stencil, which is
+      // all the kill needs, in bits 0:7.
+      packed = source_stencil[0];
     }
     switch (mode.output) {
       case TransferOutput::kColor: {
