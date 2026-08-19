@@ -14,7 +14,10 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <mutex>
+#include <shared_mutex>
 #include <string>
+#include <unordered_map>
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -198,6 +201,73 @@ static PageAccess PermsToPageAccess(const char perms[5]) {
   return w ? PageAccess::kReadWrite : PageAccess::kReadOnly;
 }
 
+
+// Shadow table of page protections for mappings this process manages.
+//
+// QueryProtect's only portable implementation is to parse /proc/self/maps,
+// which costs a ~95 KB file read and a getline loop per call. That is fine for
+// occasional queries, but the guest write-watch SIGSEGV handler calls it for
+// *every* faulting guest write while holding the global critical region (see
+// MMIOHandler::ExceptionCallback), so under a load that writes a lot of guest
+// memory - a mission streaming geometry - every thread serialises behind
+// millisecond-long file parses and the title starves. Windows does not have
+// this problem because VirtualQuery is a cheap syscall.
+//
+// Every mapping the emulator creates or reprotects goes through AllocFixed /
+// Protect / DeallocFixed below, so their protections can simply be remembered
+// here and answered in O(1). Anything not in the table (the executable's own
+// segments, loader mappings) still falls back to reading /proc/self/maps, so
+// this is an accelerator and never a source of new answers.
+class ProtectShadow {
+ public:
+  static ProtectShadow& Get() {
+    static ProtectShadow instance;
+    return instance;
+  }
+
+  void Set(void* base_address, size_t length, PageAccess access) {
+    if (!base_address || !length) {
+      return;
+    }
+    const size_t page = page_size();
+    uintptr_t first = reinterpret_cast<uintptr_t>(base_address) & ~uintptr_t(page - 1);
+    uintptr_t last = (reinterpret_cast<uintptr_t>(base_address) + length - 1) & ~uintptr_t(page - 1);
+    std::unique_lock lock(mutex_);
+    for (uintptr_t p = first; p <= last; p += page) {
+      pages_[p] = static_cast<uint8_t>(access);
+    }
+  }
+
+  void Erase(void* base_address, size_t length) {
+    if (!base_address || !length) {
+      return;
+    }
+    const size_t page = page_size();
+    uintptr_t first = reinterpret_cast<uintptr_t>(base_address) & ~uintptr_t(page - 1);
+    uintptr_t last = (reinterpret_cast<uintptr_t>(base_address) + length - 1) & ~uintptr_t(page - 1);
+    std::unique_lock lock(mutex_);
+    for (uintptr_t p = first; p <= last; p += page) {
+      pages_.erase(p);
+    }
+  }
+
+  bool Lookup(void* address, PageAccess& access_out) const {
+    const size_t page = page_size();
+    uintptr_t key = reinterpret_cast<uintptr_t>(address) & ~uintptr_t(page - 1);
+    std::shared_lock lock(mutex_);
+    auto it = pages_.find(key);
+    if (it == pages_.end()) {
+      return false;
+    }
+    access_out = static_cast<PageAccess>(it->second);
+    return true;
+  }
+
+ private:
+  mutable std::shared_mutex mutex_;
+  std::unordered_map<uintptr_t, uint8_t> pages_;
+};
+
 }  // namespace
 #endif  // REX_PLATFORM_LINUX
 
@@ -236,6 +306,10 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
 
   void* result = mmap(base_address, length, prot_initial, flags, -1, 0);
   if (result != MAP_FAILED) {
+    ProtectShadow::Get().Set(result, length,
+                             allocation_type == AllocationType::kReserve
+                                 ? PageAccess::kNoAccess
+                                 : access);
     return result;
   }
 #if defined(MAP_FIXED_NOREPLACE) && REX_PLATFORM_LINUX
@@ -247,6 +321,7 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
     // Verify the entire range is mapped before using mprotect
     if (IsRangeFullyMapped(base_address, length)) {
       if (mprotect(base_address, length, static_cast<int>(prot_requested)) == 0) {
+        ProtectShadow::Get().Set(base_address, length, access);
         return base_address;
       }
     }
@@ -263,13 +338,20 @@ bool DeallocFixed(void* base_address, size_t length, DeallocationType deallocati
       if (mprotect(base_address, length, PROT_NONE) != 0) {
         return false;
       }
+      ProtectShadow::Get().Set(base_address, length, PageAccess::kNoAccess);
 #if defined(MADV_DONTNEED)
       (void)madvise(base_address, length, MADV_DONTNEED);
 #endif
       return true;
     }
     case DeallocationType::kRelease: {
-      return munmap(base_address, length) == 0;
+      if (munmap(base_address, length) != 0) {
+        return false;
+      }
+      // The address range is gone; drop it so a later mapping at the same
+      // address cannot inherit a stale answer.
+      ProtectShadow::Get().Erase(base_address, length);
+      return true;
     }
     default:
       // how we get here? :(
@@ -298,7 +380,11 @@ bool Protect(void* base_address, size_t length, PageAccess access, PageAccess* o
 #endif
 
   uint32_t prot = ToPosixProtectFlags(access);
-  return mprotect(base_address, length, prot) == 0;
+  if (mprotect(base_address, length, prot) != 0) {
+    return false;
+  }
+  ProtectShadow::Get().Set(base_address, length, access);
+  return true;
 }
 
 bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
@@ -309,6 +395,17 @@ bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
 #else
   access_out = PageAccess::kNoAccess;
   length = 0;
+
+  // Fast path: a mapping we made ourselves. This keeps the guest write-watch
+  // fault handler off the /proc/self/maps parse below.
+  PageAccess shadow_access;
+  if (ProtectShadow::Get().Lookup(base_address, shadow_access)) {
+    const size_t page = page_size();
+    uintptr_t addr_in_page = reinterpret_cast<uintptr_t>(base_address) & (page - 1);
+    length = page - addr_in_page;
+    access_out = shadow_access;
+    return true;
+  }
 
   LinuxMapEntry e;
   if (!FindEntryForAddress(base_address, e)) {
