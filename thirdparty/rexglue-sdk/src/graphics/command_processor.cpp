@@ -11,11 +11,16 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <filesystem>
+#include <memory>
+#include <system_error>
 #include <cmath>
 #include <cstring>
 #include <string_view>
 
 #include <fmt/format.h>
+
+#include <rex/ui/renderdoc_api.h>
 
 #include <rex/cvar.h>
 #include <rex/dbg.h>
@@ -1076,6 +1081,39 @@ bool CommandProcessor::ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader, 
 bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, uint32_t packet,
                                                   uint32_t count) {
   SCOPE_profile_cpu_f("gpu");
+
+  // ---- GUESTCAP (temporary) ----
+  // A RenderDoc capture triggered by F12 brackets a HOST present, and this
+  // emulator presents independently of guest rendering - so those captures
+  // contain only the final blit, or at best a random slice of one tile. Bracket
+  // an actual guest frame (swap to swap) instead, so a capture holds both
+  // predicated tiles and every draw between them.
+  // Armed by creating the trigger file; one guest frame is then captured.
+  {
+    static std::unique_ptr<rex::ui::RenderDocAPI> rdoc = rex::ui::RenderDocAPI::CreateIfConnected();
+    static bool capturing = false;
+    static uint64_t guest_frame = 0;
+    static const char* kTrigger = "/tmp/ac6_capture_now";
+    ++guest_frame;
+    if (rdoc && rdoc->api_1_0_0()) {
+      const RENDERDOC_API_1_0_0* api = rdoc->api_1_0_0();
+      if (capturing) {
+        api->EndFrameCapture(nullptr, nullptr);
+        capturing = false;
+        std::error_code trigger_ec;
+        std::filesystem::remove(kTrigger, trigger_ec);
+        REXGPU_ERROR("GUESTCAP: captured guest frame {}", guest_frame - 1);
+      } else if ((guest_frame % 15) == 0) {
+        std::error_code trigger_ec;
+        if (std::filesystem::exists(kTrigger, trigger_ec)) {
+          REXGPU_ERROR("GUESTCAP: arming capture of guest frame {}", guest_frame);
+          api->StartFrameCapture(nullptr, nullptr);
+          capturing = true;
+        }
+      }
+    }
+  }
+  // ---- end GUESTCAP ----
 
   rex::debug::Profiler::Flip();
 
