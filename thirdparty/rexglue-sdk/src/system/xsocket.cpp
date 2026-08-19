@@ -51,6 +51,19 @@ X_STATUS XSocket::Initialize(AddressFamily af, Type type, Protocol proto) {
     return X_STATUS_UNSUCCESSFUL;
   }
 
+#if !REX_PLATFORM_WIN32
+  // Xbox 360 sockets are NON-blocking by default (titles must opt into
+  // blocking mode via ioctlsocket). Guest code relies on that: AC6 parks its
+  // main thread in recvfrom at boot and expects an immediate WSAEWOULDBLOCK
+  // when nothing is pending, but a BSD socket defaults to blocking and hangs
+  // the thread forever.
+  {
+    uint32_t nonblocking = 1;
+    rex::net::socket_ioctl(native_handle_, 0x8004667E /* WinSock FIONBIO */,
+                           reinterpret_cast<uint8_t*>(&nonblocking));
+  }
+#endif
+
   return X_STATUS_SUCCESS;
 }
 

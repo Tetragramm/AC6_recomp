@@ -894,7 +894,31 @@ ppc_u32_result_t NetDll_recvfrom_entry(ppc_u32_t caller, ppc_u32_t socket_handle
     uint32_t error_code = WSAGetLastError();
     XThread::SetLastError(error_code);
 #else
-    XThread::SetLastError(0x0);
+    // Map errno to the WSA error code the guest expects; a non-blocking
+    // socket with nothing pending must report WSAEWOULDBLOCK, not 0, or the
+    // game treats the empty read as a hard failure.
+    uint32_t error_code;
+    switch (errno) {
+      case EAGAIN:
+#if EWOULDBLOCK != EAGAIN
+      case EWOULDBLOCK:
+#endif
+        error_code = 0x2733;  // WSAEWOULDBLOCK
+        break;
+      case EINTR:
+        error_code = 0x2714;  // WSAEINTR
+        break;
+      case EMSGSIZE:
+        error_code = 0x2738;  // WSAEMSGSIZE
+        break;
+      case ECONNRESET:
+        error_code = 0x2746;  // WSAECONNRESET
+        break;
+      default:
+        error_code = 0x2745;  // WSAENETDOWN-ish generic failure (WSAESHUTDOWN)
+        break;
+    }
+    XThread::SetLastError(error_code);
 #endif
   }
 
