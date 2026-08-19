@@ -9,17 +9,33 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
+#include <string>
 #include <utility>
 
 #include <SPIRV/GLSL.std.450.h>
 
 #include <rex/assert.h>
+#include <rex/cvar.h>
 #include <rex/graphics/pipeline/render_target/cache.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/math.h>
+
+// ---- SHADER PROBE (temporary diagnostic) ----
+// There is no SPIR-V shader debugger available for these shaders (RenderDoc's
+// DebugPixel refuses them and NVIDIA exposes no second disassembler), so the
+// way to see an intermediate value is to make the shader export it. With
+// probe_shader_hash set to a guest pixel shader's ucode hash, that shader
+// writes register probe_register instead of its colour, scaled by probe_scale
+// so values above 1.0 stay distinguishable.
+REXCVAR_DEFINE_STRING(probe_shader_hash, "", "GPU",
+                      "Pixel shader ucode hash (hex) whose register to export instead of colour");
+REXCVAR_DEFINE_INT32(probe_register, 0, "GPU", "Guest register index to export when probing");
+REXCVAR_DEFINE_DOUBLE(probe_scale, 1.0, "GPU", "Scale applied to the probed register");
 
 namespace rex::graphics {
 
@@ -921,6 +937,27 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
       color_targets_remaining &= ~(UINT32_C(1) << color_target_index);
       spv::Id color_variable = output_or_var_fragment_data_[color_target_index];
       spv::Id color = builder_->createLoad(color_variable, spv::NoPrecision);
+
+      // ---- SHADER PROBE (temporary) ----
+      if (color_target_index == 0 && var_main_registers_ != spv::NoResult) {
+        const std::string& probe_hash = REXCVAR_GET(probe_shader_hash);
+        if (!probe_hash.empty()) {
+          uint64_t wanted = std::strtoull(probe_hash.c_str(), nullptr, 16);
+          if (wanted != 0 && wanted == current_shader().ucode_data_hash()) {
+            id_vector_temp_.clear();
+            id_vector_temp_.push_back(
+                builder_->makeIntConstant(int(REXCVAR_GET(probe_register) < 0 ? 0 : REXCVAR_GET(probe_register))));
+            spv::Id probed = builder_->createLoad(
+                builder_->createAccessChain(spv::StorageClassFunction, var_main_registers_,
+                                            id_vector_temp_),
+                spv::NoPrecision);
+            color = builder_->createNoContractionBinOp(
+                spv::OpVectorTimesScalar, type_float4_, probed,
+                builder_->makeFloatConstant(float(REXCVAR_GET(probe_scale))));
+          }
+        }
+      }
+      // ---- end SHADER PROBE ----
 
       // Apply the exponent bias after the alpha test and alpha to coverage
       // because they need the unbiased alpha from the shader.
