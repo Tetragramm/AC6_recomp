@@ -1415,8 +1415,8 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
             builder_->createUnaryOp(spv::OpLogicalNot, type_bool_, is_all_signed);
 
         // Load the fetch constant word 4, needed unconditionally for LOD
-        // biasing, for result exponent biasing, and conditionally for stacked
-        // texture filtering.
+        // biasing and conditionally for stacked texture filtering. The result
+        // exponent bias comes from word 3, loaded separately below.
         id_vector_temp_.clear();
         id_vector_temp_.push_back(const_int_0_);
         id_vector_temp_.push_back(
@@ -2036,10 +2036,26 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
         }
 
         // Apply the exponent bias from the bits 13:18 of the fetch constant
-        // word 4.
+        // word 3 - `int32_t exp_adjust : 6` at +13 of dword_3, not of dword_4.
+        // Bits 13:18 of word 4 are the middle of `lod_bias : 10` at +12, so
+        // reading them here multiplied every sampled texel by 2^(LOD bias
+        // bits), which blows out any texture with a non-zero LOD bias while
+        // leaving textures with a zero bias correct.
+        id_vector_temp_.clear();
+        id_vector_temp_.push_back(const_int_0_);
+        id_vector_temp_.push_back(
+            builder_->makeIntConstant(int((fetch_constant_word_0_index + 3) >> 2)));
+        id_vector_temp_.push_back(
+            builder_->makeIntConstant(int((fetch_constant_word_0_index + 3) & 3)));
+        spv::Id fetch_constant_word_3_signed = builder_->createUnaryOp(
+            spv::OpBitcast, type_int_,
+            builder_->createLoad(
+                builder_->createAccessChain(spv::StorageClassUniform, uniform_fetch_constants_,
+                                            id_vector_temp_),
+                spv::NoPrecision));
         spv::Id result_exponent_bias = builder_->createBinBuiltinCall(
             type_float_, ext_inst_glsl_std_450_, GLSLstd450Ldexp, const_float_1_,
-            builder_->createTriOp(spv::OpBitFieldSExtract, type_int_, fetch_constant_word_4_signed,
+            builder_->createTriOp(spv::OpBitFieldSExtract, type_int_, fetch_constant_word_3_signed,
                                   builder_->makeUintConstant(13), builder_->makeUintConstant(6)));
         {
           uint32_t result_remaining_components = used_result_nonzero_components;
