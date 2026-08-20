@@ -36,6 +36,8 @@ autoresearch/
 *.bak
 *.tmp
 *.md
+# ...but docs/ is the curated documentation folder, not scratch space.
+!docs/*.md
 tmp_*.py
 build_*.txt
 *.log

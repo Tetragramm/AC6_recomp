@@ -26,7 +26,7 @@ See [Important console variables](#important-console-variables).
 - **High quality terrain.** Terrain is drawn at the full resolution shipped on the disc, twice what the console rendered. Cracks and seams that appear over mountains are also removed.
 - **Resolution scaling.** Render internally at 2× (1440p) or 3× (2160p) and beyond for a much sharper image.
 - **Ultrawide support.** Optional hor+ widescreen in missions and cutscenes.
-- **AC7-like keyboard and mouse controls.** Mouse steering, remappable bindings, live-reloaded from a config file. Controllers work out of the box, including a virtual pad when none is connected.
+- **AC7-like keyboard and mouse controls.** Mouse steering, remappable bindings, live-reloaded from a config file (Windows only for now). Controllers work out of the box on both platforms, including a virtual pad when none is connected.
 - **Japanese language support.**
 - **Texture replacement modding** — see [Modding docs](#modding-docs).
 
@@ -44,24 +44,28 @@ See [Important console variables](#important-console-variables).
 
 | | |
 |---|---|
-| **OS** | Windows 10 or 11, 64-bit |
+| **OS** | Windows 10 or 11, 64-bit, or Linux (64-bit) |
 | **CPU** | **Must support AVX2** — Intel 4th-gen Core (2013) or newer, AMD Zen (2017) or newer. |
-| **GPU** | Direct3D 12 capable |
+| **GPU** | Direct3D 12 capable on Windows, Vulkan 1.2 capable on Linux |
 | **Game data** | Your own legally obtained copy of Ace Combat 6 (US region only! Europe and Japan is not supported) |
 
 *Note that the system requirement does not guarantees that the recomp will perform well on your system!*
+
+The Linux build is newer than the Windows one and some features are still
+Windows-only — most visibly keyboard and mouse. See
+[Building on Linux](docs/BUILDING_LINUX.md) for the platform differences.
 
 ### Steps
 
 1. **Get a build.** Either download from release, or build from source (see [How to build](#how-to-build)).
 
-2. **Provide the game data.** Put *one* of the following next to `ac6recomp.exe`:
+2. **Provide the game data.** Put *one* of the following next to the executable:
    - the game's `.iso` disc image **or**
    - an `assets/` folder containing the extracted game files.
 
 4. **(Optional) Add DLC.** Extracted DLC packages can be placed next to the executable, inside a folder named `dlc/`.
 
-5. **Run `ac6recomp.exe`.** On first run it creates `ac6recomp.toml` beside the executable, which contains the game settings.
+5. **Run the executable** — `ac6recomp.exe` on Windows, `./ac6recomp` on Linux. On first run it creates `ac6recomp.toml` beside the executable, which contains the game settings.
 
 6. **In-game keys:**
    - `F3` - toggle FPS overlay
@@ -90,9 +94,11 @@ Settings live in **`ac6recomp.toml`** next to the executable. Most can also be c
 | `ac6_widescreen_cinematics` | `true` | With ultrawide on, also widen in-engine cinematics. They are staged for 16:9, so this can expose set edges |
 | `ac6_terrain_hd` | `true` | Draw terrain at the full shipped resolution (2× what the console drew), which also removes terrain cracks |
 | `ac6_fullres_effects` | `false` | Draw clouds, smokes, trails, and afterburner effect at native resolution (2× what the console drew), slightly affects performance |
-| `ac6_cursor_hide_seconds` | `3.0` | Hide the mouse cursor after this many idle seconds. `0` = never hide |
-| `ac6_kbm_enabled` | `false` | **Enable keyboard and mouse controls.** Off by default — controllers work out of the box |
-| `ac6_kbm_config` | `ac6_input.toml` | Path to the key bindings file. Edits are picked up live |
+| `ac6_cursor_hide_seconds` | `3.0` | Hide the mouse cursor after this many idle seconds. `0` = never hide. Windows only |
+| `ac6_kbm_enabled` | `false` | **Enable keyboard and mouse controls.** Off by default — controllers work out of the box. Windows only; on Linux use `mnk_mode` instead |
+| `ac6_kbm_config` | `ac6_input.toml` | Path to the key bindings file. Edits are picked up live. Windows only |
+| `mnk_mode` | `false` | Keyboard/mouse as a virtual controller. The Linux keyboard option; works on Windows too |
+| `mnk_sensitivity` | `1.0` | Mouse sensitivity for `mnk_mode` |
 | `ac6_texture_swaps_enabled` | `false` | Enable texture replacement mods (see [Modding docs](#modding-docs)) |
 
 For 1440p, set both `draw_resolution_scale_x` and `draw_resolution_scale_y` to `2`. For 2160p or 4K, set them to `3`.
@@ -118,9 +124,16 @@ These are on by default and exist so a problem can be isolated. Turning one off 
 
 ## Default keybinds
 
-Controllers work with no configuration. **Keyboard and mouse are off by default**. Set `ac6_kbm_enabled = true` to enable them.
+Controllers work with no configuration on both platforms. **Keyboard and mouse are off by default**. Set `ac6_kbm_enabled = true` to enable them.
 
 Bindings live in `ac6_input.toml`, created next to the executable on first run after `ac6_kbm_enabled` is enabled. By default, the keybinds are similar to Ace Combat 7.
+
+> [!IMPORTANT]
+> `ac6_kbm_enabled` and `ac6_input.toml` are **Windows-only today** — the key
+> polling and cursor handling behind them are Win32. On Linux, use the SDK's
+> keyboard/mouse pad emulation instead (`mnk_mode = true` in `ac6recomp.toml`),
+> which gives a virtual controller rather than the bindings below. See
+> [Building on Linux](docs/BUILDING_LINUX.md#keyboard-and-mouse).
 
 ### Flight
 
@@ -155,6 +168,11 @@ Bindings live in `ac6_input.toml`, created next to the executable on first run a
 
 ## How to build
 
+Windows builds the Direct3D 12 backend with MSVC; Linux builds the Vulkan
+backend with Clang. **Linux instructions live in
+[docs/BUILDING_LINUX.md](docs/BUILDING_LINUX.md)** — the rest of this section is
+Windows.
+
 ### Option A: Automatic setup (recommended)
 
 The automated build script handles environment setup, ISO extraction, and the multi-step CMake build:
@@ -180,6 +198,10 @@ cmake --build --preset win-amd64-relwithdebinfo
 
 The executable is placed at `out/build/win-amd64-relwithdebinfo/ac6recomp.exe`.
 
+The preset is run twice on purpose: codegen generates the recompiled PowerPC
+sources, and the second configure is what makes the build see them. Skipping it
+is the most common build failure on both platforms.
+
 On Windows, use the preset commands above rather than plain `cmake -L` in the repo root. If you previously configured from an `x86` Visual Studio prompt or with the wrong compiler on `PATH`, delete `out/build/win-amd64-relwithdebinfo` and re-run the preset from a normal 64-bit PowerShell/CMD window or an x64 Native Tools prompt.
 
 ---
@@ -201,6 +223,10 @@ Users must supply their own legally obtained game files locally.
 
 - [Texture Swap Modding Guide](docs/TEXTURE_SWAP_MODDING_GUIDE.txt)
 - [Texture Swap Reference](docs/TEXTURE_SWAPS.txt)
+
+## Other docs
+
+- [Building on Linux](docs/BUILDING_LINUX.md) — Linux build, platform differences, and debugging
 
 
 ## Project layout
