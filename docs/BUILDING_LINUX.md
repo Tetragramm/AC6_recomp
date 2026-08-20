@@ -143,38 +143,52 @@ Behaviour that differs from the Windows build today:
 |---|---|---|
 | Graphics backend | Direct3D 12 | Vulkan |
 | Windowing | Win32 | GTK 3 |
-| Keyboard and mouse (`ac6_kbm_enabled`) | Supported | **Not yet** — see below |
+| Keyboard, mouse buttons, wheel (`ac6_kbm_enabled`) | Supported | Supported |
+| Mouse **steering** | Supported | **Not yet** — see below |
 | Controllers | Supported | Supported |
 
 ### Keyboard and mouse
 
-`ac6_kbm_enabled` and `ac6_input.toml` are **Windows-only today**. The key
-polling, the scroll-wheel hook, and the cursor handling in
-`src/ac6_backend_fixes/ac6_kbm_input.cpp` are written against `GetAsyncKeyState`,
-`SetWindowsHookExW`, and window subclassing, and the non-Windows branches are
-stubs that report no input.
-
-For keyboard play on Linux, use the SDK's own keyboard/mouse pad emulation
-instead, in `ac6recomp.toml`:
+`ac6_kbm_enabled` and `ac6_input.toml` work the same on both platforms, so the
+bindings and every `ac6_kbm_*` setting are shared — nothing platform-specific to
+configure:
 
 ```toml
-mnk_mode = true
-mnk_sensitivity = 1.0
+ac6_kbm_enabled = true
 ```
 
 > [!IMPORTANT]
-> `ac6recomp.toml` is read as **top-level keys only**. Putting these under a
-> `[section]` header folds the section name into the cvar name and the setting
-> is silently ignored.
+> `ac6recomp.toml` is read as **top-level keys only**. Putting a setting under a
+> `[section]` header folds the section name into the cvar name and it is
+> silently ignored.
+
+Enabling `ac6_kbm_enabled` switches `mnk_mode` off automatically — the two are
+different keyboard implementations and only one can own the keyboard.
+
+The platforms get their key state differently, which is invisible in the config
+but matters if you are debugging input. Windows polls the OS with
+`GetAsyncKeyState` and hooks the scroll wheel with `SetWindowsHookExW`. There is
+no equivalent poll elsewhere, so every other platform accumulates key, mouse
+button, and wheel state from the SDK window's `WindowInputListener` events, and
+takes the input gate's focus check from window focus rather than from the
+foreground window.
+
+One consequence worth knowing: GTK reports only side-agnostic modifiers, so
+`LeftControl` and `RightControl` both arrive as plain `Control`. Bindings that
+name a side — the stock `Left Ctrl` for the machine gun, `Left Alt` for camera
+control — are folded onto the generic key, so either side of the keyboard
+triggers them.
+
+**Mouse steering is still Windows-only.** It works by pinning the cursor to the
+window centre on every poll and reading the delta, and `GTKWindow` implements
+neither cursor warping nor mouse capture — it overrides only fullscreen, title,
+and menu, so the cursor calls are no-ops. Supporting it needs those primitives
+in the GTK backend, and on Wayland warping the pointer is not permitted at all:
+that path needs the pointer-constraints and relative-pointer protocols, which is
+a different implementation from X11. Until then, set the mouse mode to something
+other than `steer` in `ac6_input.toml`, or fly with the keyboard or a pad.
 
 Controllers work on both platforms with no configuration.
-
-Unifying the two so both platforms share `ac6_kbm_enabled` and `ac6_input.toml`
-needs work in the GTK backend as well: `GTKWindow` currently implements only
-fullscreen, title, and menu, so mouse capture, cursor visibility, and cursor
-warping — which mouse *steering* depends on — are no-ops on Linux. Keyboard,
-mouse buttons, and the wheel could move to the SDK's cross-platform
-`WindowInputListener` without any of that.
 
 ---
 

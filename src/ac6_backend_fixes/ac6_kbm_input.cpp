@@ -56,6 +56,9 @@
 #include <rex/ui/imgui_drawer.h>
 #include <rex/ui/keybinds.h>
 #include <rex/ui/virtual_key.h>
+// ac6KbmAttachWindow takes a Window on every platform, so this is needed even
+// where the listener below is not compiled.
+#include <rex/ui/window.h>
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -65,6 +68,11 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <array>
+
+#include <rex/ui/ui_event.h>
+#include <rex/ui/window_listener.h>
 #endif
 
 REXCVAR_DEFINE_BOOL(ac6_kbm_enabled, false, "AC6/Enhancements",
@@ -280,6 +288,112 @@ void EnsureWheelThread() {
   }).detach();
 }
 #else
+// There is no GetAsyncKeyState equivalent to poll on this platform, so key
+// state is accumulated from the SDK window's input events instead. The same
+// listener supplies the wheel pulses the Win32 low-level hook produces above,
+// so EnsureWheelThread has nothing left to do here.
+//
+// Only keys, mouse buttons and the wheel are covered. Mouse STEERING is still
+// Windows-only: it pins the cursor to the window centre every poll, and
+// GTKWindow implements neither cursor warping nor mouse capture (see
+// MouseSteerPoll below).
+class KbmWindowInput final : public rex::ui::WindowInputListener,
+                             public rex::ui::WindowListener {
+ public:
+  // WindowInputListener
+  void OnKeyDown(rex::ui::KeyEvent& e) override { SetKey(e.virtual_key(), true); }
+  void OnKeyUp(rex::ui::KeyEvent& e) override { SetKey(e.virtual_key(), false); }
+  void OnMouseDown(rex::ui::MouseEvent& e) override { SetButton(e.button(), true); }
+  void OnMouseUp(rex::ui::MouseEvent& e) override { SetButton(e.button(), false); }
+
+  void OnMouseWheel(rex::ui::MouseEvent& e) override {
+    // Same shape as the Win32 hook: a short pulse the binding layer reads as
+    // a pseudo-key, so a detent survives until the next poll sees its edge.
+    const int32_t dy = e.scroll_y();
+    if (!dy) {
+      return;
+    }
+    const int64_t until = NowMs() + 90;
+    (dy > 0 ? g_wheel_up_until : g_wheel_down_until).store(until, std::memory_order_relaxed);
+  }
+
+  // WindowListener. Focus drives the input gate, exactly as the foreground
+  // window check does on Windows; a key still held when focus is lost would
+  // otherwise stay stuck down forever, since no key-up ever arrives.
+  void OnGotFocus(rex::ui::UISetupEvent&) override {
+    focused_.store(true, std::memory_order_relaxed);
+  }
+  void OnLostFocus(rex::ui::UISetupEvent&) override {
+    focused_.store(false, std::memory_order_relaxed);
+    for (auto& key : down_) {
+      key.store(false, std::memory_order_relaxed);
+    }
+  }
+
+  bool focused() const { return focused_.load(std::memory_order_relaxed); }
+
+  bool IsDown(VirtualKey vk) const {
+    const uint16_t code = Canonicalize(vk);
+    return code < down_.size() && down_[code].load(std::memory_order_relaxed);
+  }
+
+ private:
+  // GTK reports only the side-agnostic modifiers (Control_L and Control_R both
+  // arrive as kControl), but a binding may name a side - "Left Ctrl" is the
+  // stock fire-machine-gun key. Fold the side-specific codes onto the generic
+  // one so those bindings resolve rather than silently never matching.
+  static uint16_t Canonicalize(VirtualKey vk) {
+    switch (static_cast<uint16_t>(vk)) {
+      case 0xA0:  // VK_LSHIFT
+      case 0xA1:  // VK_RSHIFT
+        return static_cast<uint16_t>(VirtualKey::kShift);
+      case 0xA2:  // VK_LCONTROL
+      case 0xA3:  // VK_RCONTROL
+        return static_cast<uint16_t>(VirtualKey::kControl);
+      case 0xA4:  // VK_LMENU
+      case 0xA5:  // VK_RMENU
+        return static_cast<uint16_t>(VirtualKey::kMenu);
+      default:
+        return static_cast<uint16_t>(vk);
+    }
+  }
+
+  void SetKey(VirtualKey vk, bool down) {
+    const uint16_t code = Canonicalize(vk);
+    if (code < down_.size()) {
+      down_[code].store(down, std::memory_order_relaxed);
+    }
+  }
+
+  void SetButton(rex::ui::MouseEvent::Button button, bool down) {
+    switch (button) {
+      case rex::ui::MouseEvent::Button::kLeft:
+        SetKey(VirtualKey::kLButton, down);
+        break;
+      case rex::ui::MouseEvent::Button::kRight:
+        SetKey(VirtualKey::kRButton, down);
+        break;
+      case rex::ui::MouseEvent::Button::kMiddle:
+        SetKey(VirtualKey::kMButton, down);
+        break;
+      case rex::ui::MouseEvent::Button::kX1:
+        SetKey(VirtualKey::kXButton1, down);
+        break;
+      case rex::ui::MouseEvent::Button::kX2:
+        SetKey(VirtualKey::kXButton2, down);
+        break;
+      default:
+        break;
+    }
+  }
+
+  std::array<std::atomic<bool>, 256> down_ = {};
+  std::atomic<bool> focused_{false};
+};
+
+KbmWindowInput g_window_input;
+std::atomic<bool> g_window_attached{false};
+
 void EnsureWheelThread() {}
 #endif
 
@@ -654,7 +768,10 @@ GateState QueryGate() {
   }
   NoteFocusForKeyTrust(g.fg_ok);
 #else
-  g.fg_ok = true;
+  // Window focus, the equivalent of the foreground-window test above. Until
+  // the window is attached nothing can have been pressed anyway, so an
+  // unattached gate is closed rather than open.
+  g.fg_ok = g_window_attached.load(std::memory_order_relaxed) && g_window_input.focused();
 #endif
   g.capture_mouse = rex::ui::ImGuiDrawer::DialogsCaptureMouse();
   g.capture_keyboard = rex::ui::ImGuiDrawer::DialogsCaptureKeyboard();
@@ -712,8 +829,12 @@ bool KeyHeld(VirtualKey vk) {
   }
   return false;
 #else
-  (void)vk;
-  return false;
+  // Event-driven state (see KbmWindowInput). The Win32 trust dance above is
+  // not needed here: a key only enters the table through a real key-down
+  // delivered to our window, so a key held from before the window existed, or
+  // across a focus change, cannot be seen as pressed - which is what that
+  // logic exists to prevent.
+  return g_window_input.IsDown(vk);
 #endif
 }
 
@@ -1404,6 +1525,27 @@ PPC_FUNC_IMPL(rex_sub_82390CE0) {
 // test), so it stays only as a secondary signal.
 void ac6KbmNotifyFlightStep() {
   g_last_flight_ms.store(NowMs(), std::memory_order_relaxed);
+}
+
+// Hands the module the application window. Windows polls the OS for key state
+// and needs nothing here; every other platform has no such poll, so key, mouse
+// button and wheel state is accumulated from this window's input events.
+// Called once, after the window exists. Safe to call when kbm is disabled: the
+// listener only maintains state, and every consumer is behind
+// ac6_kbm_enabled.
+void ac6KbmAttachWindow([[maybe_unused]] rex::ui::Window* window) {
+#if !defined(_WIN32)
+  if (!window || g_window_attached.load(std::memory_order_relaxed)) {
+    return;
+  }
+  // z-order 0 matches the application's own listener: the overlays sit above
+  // and the gate in QueryGate is what actually yields input to them, so this
+  // must not sit above the overlays and swallow their keys.
+  window->AddInputListener(&g_window_input, 0);
+  window->AddListener(&g_window_input);
+  g_window_attached.store(true, std::memory_order_relaxed);
+  KbmLog("window input attached (keyboard, mouse buttons and wheel)");
+#endif
 }
 
 PPC_EXTERN_FUNC(__imp__sub_82390CD8);  // guest XamInputGetCapabilities wrapper

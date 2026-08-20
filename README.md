@@ -26,7 +26,7 @@ See [Important console variables](#important-console-variables).
 - **High quality terrain.** Terrain is drawn at the full resolution shipped on the disc, twice what the console rendered. Cracks and seams that appear over mountains are also removed.
 - **Resolution scaling.** Render internally at 2× (1440p) or 3× (2160p) and beyond for a much sharper image.
 - **Ultrawide support.** Optional hor+ widescreen in missions and cutscenes.
-- **AC7-like keyboard and mouse controls.** Mouse steering, remappable bindings, live-reloaded from a config file (Windows only for now). Controllers work out of the box on both platforms, including a virtual pad when none is connected.
+- **AC7-like keyboard and mouse controls.** Remappable bindings, live-reloaded from a config file, on Windows and Linux alike. Mouse steering is Windows-only for now. Controllers work out of the box on both platforms, including a virtual pad when none is connected.
 - **Japanese language support.**
 - **Texture replacement modding** — see [Modding docs](#modding-docs).
 
@@ -51,9 +51,9 @@ See [Important console variables](#important-console-variables).
 
 *Note that the system requirement does not guarantees that the recomp will perform well on your system!*
 
-The Linux build is newer than the Windows one and some features are still
-Windows-only — most visibly keyboard and mouse. See
-[Building on Linux](docs/BUILDING_LINUX.md) for the platform differences.
+The Linux build is newer than the Windows one; mouse steering is the main thing
+still missing. See [Building on Linux](docs/BUILDING_LINUX.md) for the build
+steps and the full list of platform differences.
 
 ### Steps
 
@@ -95,10 +95,9 @@ Settings live in **`ac6recomp.toml`** next to the executable. Most can also be c
 | `ac6_terrain_hd` | `true` | Draw terrain at the full shipped resolution (2× what the console drew), which also removes terrain cracks |
 | `ac6_fullres_effects` | `false` | Draw clouds, smokes, trails, and afterburner effect at native resolution (2× what the console drew), slightly affects performance |
 | `ac6_cursor_hide_seconds` | `3.0` | Hide the mouse cursor after this many idle seconds. `0` = never hide. Windows only |
-| `ac6_kbm_enabled` | `false` | **Enable keyboard and mouse controls.** Off by default — controllers work out of the box. Windows only; on Linux use `mnk_mode` instead |
-| `ac6_kbm_config` | `ac6_input.toml` | Path to the key bindings file. Edits are picked up live. Windows only |
-| `mnk_mode` | `false` | Keyboard/mouse as a virtual controller. The Linux keyboard option; works on Windows too |
-| `mnk_sensitivity` | `1.0` | Mouse sensitivity for `mnk_mode` |
+| `ac6_kbm_enabled` | `false` | **Enable keyboard and mouse controls.** Off by default — controllers work out of the box. Turning it on switches `mnk_mode` off |
+| `ac6_kbm_config` | `ac6_input.toml` | Path to the key bindings file. Edits are picked up live |
+| `mnk_mode` | `false` | Alternative keyboard/mouse-as-a-virtual-controller mode. Superseded by `ac6_kbm_enabled`, which forces it off |
 | `ac6_texture_swaps_enabled` | `false` | Enable texture replacement mods (see [Modding docs](#modding-docs)) |
 
 For 1440p, set both `draw_resolution_scale_x` and `draw_resolution_scale_y` to `2`. For 2160p or 4K, set them to `3`.
@@ -128,11 +127,9 @@ Controllers work with no configuration on both platforms. **Keyboard and mouse a
 
 Bindings live in `ac6_input.toml`, created next to the executable on first run after `ac6_kbm_enabled` is enabled. By default, the keybinds are similar to Ace Combat 7.
 
-> [!IMPORTANT]
-> `ac6_kbm_enabled` and `ac6_input.toml` are **Windows-only today** — the key
-> polling and cursor handling behind them are Win32. On Linux, use the SDK's
-> keyboard/mouse pad emulation instead (`mnk_mode = true` in `ac6recomp.toml`),
-> which gives a virtual controller rather than the bindings below. See
+> [!NOTE]
+> **Mouse steering is Windows-only for now.** Keys, mouse buttons, and the wheel
+> work on both platforms, and the bindings below are shared. See
 > [Building on Linux](docs/BUILDING_LINUX.md#keyboard-and-mouse).
 
 ### Flight
@@ -148,7 +145,7 @@ Bindings live in `ac6_input.toml`, created next to the executable on first run a
 | Autopilot | `Z`, `X` | | Landing gear | `G` |
 | Pause | `Escape` | | | |
 
-**Mouse** steers the aircraft. Hold `Left Alt` (camera control) to look around with the mouse instead of steering.
+**Mouse** steers the aircraft. Hold `Left Alt` (camera control) to look around with the mouse instead of steering. *(Steering is Windows-only for now; on Linux the buttons and wheel work but the stick stays with the keyboard or pad.)*
 
 **Camera:** `Numpad 8` / `2` / `4` / `6` — up / down / left / right.
 

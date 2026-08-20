@@ -25,6 +25,12 @@ REXCVAR_DECLARE(std::string, ac6_graphics_backend);
 void ApplyAc6ConfigPresets();
 void LogAc6ConfigPresetSummary();
 
+// Defined in ac6_backend_fixes/ac6_kbm_input.cpp: hands the keyboard/mouse
+// module the application window, which is where non-Windows builds get their
+// key, mouse button and wheel state from. A no-op on Windows, which polls the
+// OS instead.
+void ac6KbmAttachWindow(rex::ui::Window* window);
+
 class Ac6recompApp : public rex::ReXApp {
  public:
   using rex::ReXApp::ReXApp;
@@ -105,6 +111,12 @@ class Ac6recompApp : public rex::ReXApp {
         const ::ac6::FrameStats s = ::ac6::GetFrameStats();
         return rex::ui::FrameStats{s.frame_time_ms, s.fps, s.frame_count};
     });
+
+    // Keyboard and mouse: Windows polls the OS for key state, but there is no
+    // equivalent poll elsewhere, so the module takes its key, mouse button and
+    // wheel state from this window's input events. Here rather than
+    // OnPostSetup because the window does not exist yet at that point.
+    ac6KbmAttachWindow(window());
   }
 
  private:
