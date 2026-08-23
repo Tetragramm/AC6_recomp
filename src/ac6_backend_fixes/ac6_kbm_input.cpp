@@ -408,6 +408,10 @@ VirtualKey ParseKeyName(std::string name) {
   else if (name == "Mouse3") name = "MMB";
   else if (name == "MouseWheelUp") return kVkWheelUp;
   else if (name == "MouseWheelDown") return kVkWheelDown;
+  else if (name == "Mouse4" || name == "MouseBack")
+    return static_cast<VirtualKey>(0x05);  // VK_XBUTTON1 (side button, "back")
+  else if (name == "Mouse5" || name == "MouseForward")
+    return static_cast<VirtualKey>(0x06);  // VK_XBUTTON2 (side button, "forward")
   else if (name == "LeftControl" || name == "LeftCtrl")
     return static_cast<VirtualKey>(0xA2);  // VK_LCONTROL
   else if (name == "RightControl" || name == "RightCtrl")
