@@ -767,6 +767,11 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     uint32_t source_base_tiles;
     uint32_t source_pitch_tiles;
     uint32_t dispatch_first_tile;
+    // Height of the resolve region, in 8-pixel units - the dispatch covers
+    // whole EDRAM tiles, so the shader has to reject the samples past the
+    // bottom edge of the region itself (the copy shader needs no such check
+    // because its dispatch is sized in region pixels).
+    uint32_t height_div_8;
   };
 
   struct DirectResolvePipelineKey {
@@ -811,9 +816,25 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
   VkPipeline GetDumpPipeline(DumpPipelineKey key);
   VkPipeline GetDirectResolvePipeline(DirectResolvePipelineKey key);
+  // Builds the render target sampling shader shared by the two resolve paths.
+  // With direct_key, the packed sample is written to the resolve destination
+  // instead of the EDRAM buffer, fusing the dump and the copy.
+  VkPipeline BuildRenderTargetSamplingPipeline(DumpPipelineKey key,
+                                               const DirectResolvePipelineKey* direct_key);
+  // Checks whether the resolve can be done straight from the host render
+  // targets, and if so, gathers the dispatches for IssueDirectResolveCopy into
+  // dump_rectangles_ / direct_resolve_dispatches_. Doesn't record any commands,
+  // so the caller can still fall back to dumping to the EDRAM buffer.
   bool TryResolveCopyDirectly(const draw_util::ResolveInfo& resolve_info,
                               draw_util::ResolveCopyShaderIndex copy_shader,
                               bool draw_resolution_scaled);
+  // Records the dispatches prepared by TryResolveCopyDirectly, replacing both
+  // the render target dump and the resolve copy.
+  void IssueDirectResolveCopy(const draw_util::ResolveInfo& resolve_info,
+                              draw_util::ResolveCopyShaderIndex copy_shader,
+                              draw_util::ResolveCopyShaderConstants copy_shader_constants,
+                              VkDescriptorSet descriptor_set_dest, bool draw_resolution_scaled,
+                              uint32_t dest_binding_offset);
 
   // Writes contents of host render targets within rectangles from
   // ResolveInfo::GetCopyEdramTileSpan to edram_buffer_.

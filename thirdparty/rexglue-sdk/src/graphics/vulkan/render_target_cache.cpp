@@ -1376,6 +1376,22 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
           } else {
             ++direct_resolve_fallback_count_;
           }
+          // One greppable line the first time the fused path runs, then a
+          // periodic tally - the fallback share is what says whether a title
+          // actually benefits.
+          if (direct_resolved && direct_resolve_success_count_ == 1) {
+            // Error level so the line survives a performance-mode log level,
+            // like the other support lines - this is the one that says which
+            // resolve path a session actually ran.
+            REXGPU_ERROR("VulkanRenderTargetCache: resolving directly from host render targets");
+          }
+          if (!(direct_resolve_attempt_count_ & UINT64_C(2047))) {
+            REXGPU_INFO(
+                "VulkanRenderTargetCache: direct resolves: {} of {} attempts, {} fell back to "
+                "the EDRAM dump",
+                direct_resolve_success_count_, direct_resolve_attempt_count_,
+                direct_resolve_fallback_count_);
+          }
         }
         if (!direct_resolved) {
           // Dump the current contents of the render targets owning the affected
@@ -1463,31 +1479,40 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
                               std::pair<uint32_t, uint32_t>(uint32_t(copy_dest_use_start),
                                                             uint32_t(copy_dest_use_length)));
           }
-          UseEdramBuffer(EdramBufferUsage::kComputeRead);
-          command_processor_.BindExternalComputePipeline(
-              resolve_copy_pipelines_[size_t(copy_shader)]);
-          VkDescriptorSet descriptor_sets[kResolveCopyDescriptorSetCount] = {};
-          descriptor_sets[kResolveCopyDescriptorSetEdram] = edram_storage_buffer_descriptor_set_;
-          descriptor_sets[kResolveCopyDescriptorSetDest] = descriptor_set_dest;
-          command_buffer.CmdVkBindDescriptorSets(
-              VK_PIPELINE_BIND_POINT_COMPUTE, resolve_copy_pipeline_layout_, 0,
-              uint32_t(rex::countof(descriptor_sets)), descriptor_sets, 0, nullptr);
-          if (draw_resolution_scaled) {
-            command_buffer.CmdVkPushConstants(
-                resolve_copy_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                sizeof(copy_shader_constants.dest_relative), &copy_shader_constants.dest_relative);
+          if (direct_resolved) {
+            // The render targets go straight to the destination - no dump to
+            // the EDRAM buffer, and no copy pass reading it back.
+            IssueDirectResolveCopy(resolve_info, copy_shader, copy_shader_constants,
+                                   descriptor_set_dest, draw_resolution_scaled,
+                                   uint32_t(write_descriptor_set_dest_buffer_info.offset));
           } else {
-            // TODO(Triang3l): Proper dest_base in case of one 512 MB shared
-            // memory binding, or multiple shared memory bindings in case of
-            // splitting due to maxStorageBufferRange overflow.
-            copy_shader_constants.dest_base -=
-                uint32_t(write_descriptor_set_dest_buffer_info.offset);
-            command_buffer.CmdVkPushConstants(
-                resolve_copy_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                sizeof(copy_shader_constants), &copy_shader_constants);
+            UseEdramBuffer(EdramBufferUsage::kComputeRead);
+            command_processor_.BindExternalComputePipeline(
+                resolve_copy_pipelines_[size_t(copy_shader)]);
+            VkDescriptorSet descriptor_sets[kResolveCopyDescriptorSetCount] = {};
+            descriptor_sets[kResolveCopyDescriptorSetEdram] = edram_storage_buffer_descriptor_set_;
+            descriptor_sets[kResolveCopyDescriptorSetDest] = descriptor_set_dest;
+            command_buffer.CmdVkBindDescriptorSets(
+                VK_PIPELINE_BIND_POINT_COMPUTE, resolve_copy_pipeline_layout_, 0,
+                uint32_t(rex::countof(descriptor_sets)), descriptor_sets, 0, nullptr);
+            if (draw_resolution_scaled) {
+              command_buffer.CmdVkPushConstants(resolve_copy_pipeline_layout_,
+                                                VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                                sizeof(copy_shader_constants.dest_relative),
+                                                &copy_shader_constants.dest_relative);
+            } else {
+              // TODO(Triang3l): Proper dest_base in case of one 512 MB shared
+              // memory binding, or multiple shared memory bindings in case of
+              // splitting due to maxStorageBufferRange overflow.
+              copy_shader_constants.dest_base -=
+                  uint32_t(write_descriptor_set_dest_buffer_info.offset);
+              command_buffer.CmdVkPushConstants(
+                  resolve_copy_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                  sizeof(copy_shader_constants), &copy_shader_constants);
+            }
+            command_processor_.SubmitBarriers(true);
+            command_buffer.CmdVkDispatch(copy_group_count_x, copy_group_count_y, 1);
           }
-          command_processor_.SubmitBarriers(true);
-          command_buffer.CmdVkDispatch(copy_group_count_x, copy_group_count_y, 1);
 
           // Invalidate textures and mark the range as scaled if needed.
           texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
@@ -5627,6 +5652,41 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
   if (pipeline_it != dump_pipelines_.end()) {
     return pipeline_it->second;
   }
+  VkPipeline pipeline = BuildRenderTargetSamplingPipeline(key, nullptr);
+  dump_pipelines_.emplace(key, pipeline);
+  return pipeline;
+}
+
+namespace {
+
+// Members of VulkanRenderTargetCache::DirectResolvePushConstants, as seen by
+// the generated shader.
+enum DirectResolvePushConstant : uint32_t {
+  kDirectResolvePushConstantEdramInfo,
+  kDirectResolvePushConstantCoordinateInfo,
+  kDirectResolvePushConstantDestInfo,
+  kDirectResolvePushConstantDestCoordinateInfo,
+  kDirectResolvePushConstantDestBase,
+  kDirectResolvePushConstantSourceBaseTiles,
+  kDirectResolvePushConstantSourcePitchTiles,
+  kDirectResolvePushConstantDispatchFirstTile,
+  kDirectResolvePushConstantHeightDiv8,
+
+  kDirectResolvePushConstantCount,
+};
+
+}  // namespace
+
+VkPipeline VulkanRenderTargetCache::BuildRenderTargetSamplingPipeline(
+    DumpPipelineKey key, const DirectResolvePipelineKey* direct_key) {
+  // Without direct_key, this is the EDRAM dump shader: it samples the host
+  // render target and stores the packed guest sample to the EDRAM buffer, from
+  // where a separate resolve copy shader moves it to the destination. With
+  // direct_key, the same sampling and packing feeds the resolve destination
+  // directly, so the round trip through the EDRAM buffer - two passes over the
+  // resolved area, the dominant cost of a resolve at raised draw resolutions -
+  // is skipped entirely.
+  const bool direct = direct_key != nullptr;
 
   std::vector<spv::Id> id_vector_temp;
 
@@ -5645,16 +5705,19 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
   spv::Id type_float = builder.makeFloatType(32);
 
   // Bindings.
-  // EDRAM buffer.
+  // The output buffer: the EDRAM buffer, or the resolve destination when
+  // fusing. The destination is addressed in single dwords (the guest tiled
+  // address function is per-texel), so its element type is always uint.
   bool format_is_64bpp =
       !key.is_depth && xenos::IsColorRenderTargetFormat64bpp(key.GetColorFormat());
+  bool output_is_uint2 = format_is_64bpp && !direct;
   id_vector_temp.clear();
-  id_vector_temp.push_back(builder.makeRuntimeArray(format_is_64bpp ? type_uint2 : type_uint));
+  id_vector_temp.push_back(builder.makeRuntimeArray(output_is_uint2 ? type_uint2 : type_uint));
   // Storage buffers have std430 packing, no padding to 4-component vectors.
   builder.addDecoration(id_vector_temp.back(), spv::DecorationArrayStride,
-                        sizeof(uint32_t) << uint32_t(format_is_64bpp));
-  spv::Id type_edram = builder.makeStructType(id_vector_temp, "XeEdram");
-  builder.addMemberName(type_edram, 0, "edram");
+                        sizeof(uint32_t) << uint32_t(output_is_uint2));
+  spv::Id type_edram = builder.makeStructType(id_vector_temp, direct ? "XeResolveDest" : "XeEdram");
+  builder.addMemberName(type_edram, 0, direct ? "dest" : "edram");
   builder.addMemberDecoration(type_edram, 0, spv::DecorationNonReadable);
   builder.addMemberDecoration(type_edram, 0, spv::DecorationOffset, 0);
   // Block since SPIR-V 1.3, but since SPIR-V 1.0 is generated, it's
@@ -5662,8 +5725,8 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
   builder.addDecoration(type_edram, spv::DecorationBufferBlock);
   // StorageBuffer since SPIR-V 1.3, but since SPIR-V 1.0 is generated, it's
   // Uniform.
-  spv::Id edram_buffer =
-      builder.createVariable(spv::NoPrecision, spv::StorageClassUniform, type_edram, "xe_edram");
+  spv::Id edram_buffer = builder.createVariable(spv::NoPrecision, spv::StorageClassUniform,
+                                               type_edram, direct ? "xe_resolve_dest" : "xe_edram");
   builder.addDecoration(edram_buffer, spv::DecorationDescriptorSet, kDumpDescriptorSetEdram);
   builder.addDecoration(edram_buffer, spv::DecorationBinding, 0);
   // Color or depth source.
@@ -5695,22 +5758,37 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
     builder.addDecoration(source_stencil_texture, spv::DecorationBinding, 1);
   }
   // Push constants.
+  uint32_t push_constant_count = direct ? kDirectResolvePushConstantCount : kDumpPushConstantCount;
   id_vector_temp.clear();
-  id_vector_temp.reserve(kDumpPushConstantCount);
-  for (uint32_t i = 0; i < kDumpPushConstantCount; ++i) {
+  id_vector_temp.reserve(push_constant_count);
+  for (uint32_t i = 0; i < push_constant_count; ++i) {
     id_vector_temp.push_back(type_uint);
   }
-  spv::Id type_push_constants = builder.makeStructType(id_vector_temp, "XeEdramDumpPushConstants");
-  builder.addMemberName(type_push_constants, kDumpPushConstantPitches, "pitches");
-  builder.addMemberDecoration(type_push_constants, kDumpPushConstantPitches, spv::DecorationOffset,
-                              int(sizeof(uint32_t) * kDumpPushConstantPitches));
-  builder.addMemberName(type_push_constants, kDumpPushConstantOffsets, "offsets");
-  builder.addMemberDecoration(type_push_constants, kDumpPushConstantOffsets, spv::DecorationOffset,
-                              int(sizeof(uint32_t) * kDumpPushConstantOffsets));
+  spv::Id type_push_constants = builder.makeStructType(
+      id_vector_temp, direct ? "XeDirectResolvePushConstants" : "XeEdramDumpPushConstants");
+  static const char* const kDumpPushConstantNames[] = {"pitches", "offsets"};
+  static const char* const kDirectResolvePushConstantNames[] = {
+      "edram_info",  "coordinate_info",   "dest_info",          "dest_coordinate_info",
+      "dest_base",   "source_base_tiles", "source_pitch_tiles", "dispatch_first_tile",
+      "height_div_8"};
+  for (uint32_t i = 0; i < push_constant_count; ++i) {
+    builder.addMemberName(
+        type_push_constants, i,
+        direct ? kDirectResolvePushConstantNames[i] : kDumpPushConstantNames[i]);
+    builder.addMemberDecoration(type_push_constants, i, spv::DecorationOffset,
+                                int(sizeof(uint32_t) * i));
+  }
   builder.addDecoration(type_push_constants, spv::DecorationBlock);
-  spv::Id push_constants =
-      builder.createVariable(spv::NoPrecision, spv::StorageClassPushConstant, type_push_constants,
-                             "xe_edram_dump_push_constants");
+  spv::Id push_constants = builder.createVariable(
+      spv::NoPrecision, spv::StorageClassPushConstant, type_push_constants,
+      direct ? "xe_direct_resolve_push_constants" : "xe_edram_dump_push_constants");
+  auto load_push_constant = [&](uint32_t index) -> spv::Id {
+    id_vector_temp.clear();
+    id_vector_temp.push_back(builder.makeIntConstant(int(index)));
+    return builder.createLoad(
+        builder.createAccessChain(spv::StorageClassPushConstant, push_constants, id_vector_temp),
+        spv::NoPrecision);
+  };
 
   // gl_GlobalInvocationID input.
   spv::Id input_global_invocation_id = builder.createVariable(
@@ -5755,39 +5833,41 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
       builder.createBinOp(spv::OpUMod, type_uint, rectangle_sample_y, const_tile_height);
 
   // Get the tile index in the EDRAM relative to the dump rectangle base tile.
-  id_vector_temp.clear();
-  id_vector_temp.push_back(builder.makeIntConstant(kDumpPushConstantPitches));
-  spv::Id pitches_constant = builder.createLoad(
-      builder.createAccessChain(spv::StorageClassPushConstant, push_constants, id_vector_temp),
-      spv::NoPrecision);
+  // The rows of the dumped rectangle are spaced by the pitch of the resolve
+  // region, which the direct path takes from the EDRAM info it already has.
   spv::Id const_uint_0 = builder.makeUintConstant(0);
   spv::Id const_edram_pitch_tiles_bits = builder.makeUintConstant(xenos::kEdramPitchTilesBits);
+  spv::Id direct_edram_info =
+      direct ? load_push_constant(kDirectResolvePushConstantEdramInfo) : spv::NoResult;
+  spv::Id pitches_constant = direct ? spv::NoResult : load_push_constant(kDumpPushConstantPitches);
+  spv::Id dest_pitch_tiles =
+      builder.createTriOp(spv::OpBitFieldUExtract, type_uint,
+                          direct ? direct_edram_info : pitches_constant, const_uint_0,
+                          const_edram_pitch_tiles_bits);
   spv::Id rectangle_tile_index = builder.createBinOp(
       spv::OpIAdd, type_uint,
-      builder.createBinOp(spv::OpIMul, type_uint,
-                          builder.createTriOp(spv::OpBitFieldUExtract, type_uint, pitches_constant,
-                                              const_uint_0, const_edram_pitch_tiles_bits),
-                          rectangle_tile_index_y),
+      builder.createBinOp(spv::OpIMul, type_uint, dest_pitch_tiles, rectangle_tile_index_y),
       rectangle_tile_index_x);
   // Add the base tile in the dispatch to the dispatch-local tile index, not
   // wrapping yet so in case of a wraparound, the address relative to the base
   // in the image after subtraction of the base won't be negative.
-  id_vector_temp.clear();
-  id_vector_temp.push_back(builder.makeIntConstant(kDumpPushConstantOffsets));
-  spv::Id offsets_constant = builder.createLoad(
-      builder.createAccessChain(spv::StorageClassPushConstant, push_constants, id_vector_temp),
-      spv::NoPrecision);
+  spv::Id offsets_constant = direct ? spv::NoResult : load_push_constant(kDumpPushConstantOffsets);
   spv::Id const_edram_base_tiles_bits_plus_1 =
       builder.makeUintConstant(xenos::kEdramBaseTilesBits + 1);
+  spv::Id dispatch_first_tile =
+      direct ? load_push_constant(kDirectResolvePushConstantDispatchFirstTile)
+             : builder.createTriOp(spv::OpBitFieldUExtract, type_uint, offsets_constant,
+                                   const_uint_0, const_edram_base_tiles_bits_plus_1);
   spv::Id edram_tile_index_non_wrapped =
-      builder.createBinOp(spv::OpIAdd, type_uint,
-                          builder.createTriOp(spv::OpBitFieldUExtract, type_uint, offsets_constant,
-                                              const_uint_0, const_edram_base_tiles_bits_plus_1),
-                          rectangle_tile_index);
+      builder.createBinOp(spv::OpIAdd, type_uint, dispatch_first_tile, rectangle_tile_index);
 
   // Combine the tile sample index and the tile index, wrapping the tile
-  // addressing, into the EDRAM sample index.
-  spv::Id edram_sample_address = builder.createBinOp(
+  // addressing, into the EDRAM sample index. Not needed when resolving
+  // directly - neither the store nor the load goes through the EDRAM buffer,
+  // so its layout (including the depth column swap below) drops out.
+  spv::Id edram_sample_address = spv::NoResult;
+  if (!direct) {
+  edram_sample_address = builder.createBinOp(
       spv::OpIAdd, type_uint,
       builder.createBinOp(
           spv::OpIMul, type_uint, builder.makeUintConstant(tile_width * tile_height),
@@ -5813,17 +5893,131 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
                 builder.makeIntConstant(int32_t(tile_width_half)),
                 builder.makeIntConstant(-int32_t(tile_width_half)))));
   }
+  }
+
+  // Where this sample lands inside the resolve region, for the fused path. Done
+  // before the source coordinates, because the half-pixel offset fill reads a
+  // different sample than the one this invocation would otherwise sample.
+  spv::Id direct_region_x = spv::NoResult, direct_region_y = spv::NoResult,
+          direct_in_region = spv::NoResult, direct_coordinate_info = spv::NoResult;
+  if (direct) {
+    spv::Id type_bool_region = builder.makeBoolType();
+    auto uconst = [&](uint32_t value) { return builder.makeUintConstant(value); };
+    auto bin = [&](spv::Op op, spv::Id a, spv::Id b) {
+      return builder.createBinOp(op, type_uint, a, b);
+    };
+    auto bits = [&](spv::Id value, uint32_t offset, uint32_t count) {
+      return builder.createTriOp(spv::OpBitFieldUExtract, type_uint, value, uconst(offset),
+                                 uconst(count));
+    };
+    direct_coordinate_info = load_push_constant(kDirectResolvePushConstantCoordinateInfo);
+
+    // Only 1x MSAA is fused, so guest samples and guest pixels coincide.
+    uint32_t sample_size_log2_x = 3 + uint32_t(format_is_64bpp);
+    uint32_t tile_width_unscaled = xenos::kEdramTileWidthSamples >> uint32_t(format_is_64bpp);
+    spv::Id origin_x_samples =
+        bin(spv::OpShiftLeftLogical, bits(direct_coordinate_info, 0, 4), uconst(sample_size_log2_x));
+    spv::Id origin_y_samples =
+        bin(spv::OpShiftLeftLogical, bits(direct_coordinate_info, 4, 1), uconst(3));
+    spv::Id region_base_tile = bin(
+        spv::OpIAdd,
+        bin(spv::OpIAdd,
+            bits(direct_edram_info, xenos::kEdramPitchTilesBits + xenos::kMsaaSamplesBits + 1,
+                 xenos::kEdramBaseTilesBits),
+            bin(spv::OpIMul,
+                bin(spv::OpUDiv, origin_y_samples, uconst(xenos::kEdramTileHeightSamples)),
+                dest_pitch_tiles)),
+        bin(spv::OpUDiv, origin_x_samples, uconst(tile_width_unscaled)));
+    spv::Id origin_in_tile_x =
+        bin(spv::OpIMul, bin(spv::OpUMod, origin_x_samples, uconst(tile_width_unscaled)),
+            uconst(draw_resolution_scale_x()));
+    spv::Id origin_in_tile_y = bin(
+        spv::OpIMul, bin(spv::OpUMod, origin_y_samples, uconst(xenos::kEdramTileHeightSamples)),
+        uconst(draw_resolution_scale_y()));
+
+    spv::Id region_tile_index = bin(spv::OpISub, edram_tile_index_non_wrapped, region_base_tile);
+    spv::Id position_x =
+        bin(spv::OpIAdd,
+            bin(spv::OpIMul, bin(spv::OpUMod, region_tile_index, dest_pitch_tiles),
+                const_tile_width),
+            tile_sample_x);
+    spv::Id position_y =
+        bin(spv::OpIAdd,
+            bin(spv::OpIMul, bin(spv::OpUDiv, region_tile_index, dest_pitch_tiles),
+                const_tile_height),
+            tile_sample_y);
+    direct_region_x = bin(spv::OpISub, position_x, origin_in_tile_x);
+    direct_region_y = bin(spv::OpISub, position_y, origin_in_tile_y);
+    spv::Id region_width = bin(
+        spv::OpIMul,
+        bin(spv::OpShiftLeftLogical,
+            bits(direct_coordinate_info, 5,
+                 xenos::kResolveSizeBits - xenos::kResolveAlignmentPixelsLog2),
+            uconst(xenos::kResolveAlignmentPixelsLog2)),
+        uconst(draw_resolution_scale_x()));
+    spv::Id region_height =
+        bin(spv::OpIMul,
+            bin(spv::OpShiftLeftLogical, load_push_constant(kDirectResolvePushConstantHeightDiv8),
+                uconst(xenos::kResolveAlignmentPixelsLog2)),
+            uconst(draw_resolution_scale_y()));
+    direct_in_region = builder.createBinOp(
+        spv::OpLogicalAnd, type_bool_region,
+        builder.createBinOp(
+            spv::OpLogicalAnd, type_bool_region,
+            builder.createBinOp(spv::OpUGreaterThanEqual, type_bool_region, position_x,
+                                origin_in_tile_x),
+            builder.createBinOp(spv::OpULessThan, type_bool_region, direct_region_x, region_width)),
+        builder.createBinOp(
+            spv::OpLogicalAnd, type_bool_region,
+            builder.createBinOp(spv::OpUGreaterThanEqual, type_bool_region, position_y,
+                                origin_in_tile_y),
+            builder.createBinOp(spv::OpULessThan, type_bool_region, direct_region_y,
+                                region_height)));
+
+    // Half-pixel offset fill: with resolution scaling the guest's half-pixel
+    // offset becomes a full-pixel one, leaving the left and the top edges of the
+    // region uncovered. The copy shader fills them from the first surely covered
+    // column and row, so sample that column and row here instead - the
+    // destination address still uses the unbent position.
+    uint32_t fill_x = draw_resolution_scale_x() >> 1;
+    uint32_t fill_y = draw_resolution_scale_y() >> 1;
+    if (fill_x || fill_y) {
+      spv::Id fill_enabled = builder.createBinOp(
+          spv::OpINotEqual, type_bool_region,
+          bin(spv::OpBitwiseAnd, direct_edram_info,
+              uconst(UINT32_C(1) << (xenos::kEdramPitchTilesBits + xenos::kMsaaSamplesBits + 1 +
+                                     xenos::kEdramBaseTilesBits + xenos::kRenderTargetFormatBits +
+                                     1))),
+          const_uint_0);
+      auto bend = [&](spv::Id tile_sample, spv::Id region, uint32_t fill) {
+        if (!fill) {
+          return tile_sample;
+        }
+        spv::Id needs_fill = builder.createBinOp(
+            spv::OpLogicalAnd, type_bool_region, fill_enabled,
+            builder.createBinOp(spv::OpULessThan, type_bool_region, region, uconst(fill)));
+        return builder.createTriOp(
+            spv::OpSelect, type_uint, needs_fill,
+            bin(spv::OpIAdd, tile_sample, bin(spv::OpISub, uconst(fill), region)), tile_sample);
+      };
+      tile_sample_x = bend(tile_sample_x, direct_region_x, fill_x);
+      tile_sample_y = bend(tile_sample_y, direct_region_y, fill_y);
+    }
+  }
 
   // Get the linear tile index within the source texture.
-  spv::Id source_tile_index = builder.createBinOp(
-      spv::OpISub, type_uint, edram_tile_index_non_wrapped,
-      builder.createTriOp(spv::OpBitFieldUExtract, type_uint, offsets_constant,
-                          const_edram_base_tiles_bits_plus_1,
-                          builder.makeUintConstant(xenos::kEdramBaseTilesBits)));
+  spv::Id source_base_tiles =
+      direct ? load_push_constant(kDirectResolvePushConstantSourceBaseTiles)
+             : builder.createTriOp(spv::OpBitFieldUExtract, type_uint, offsets_constant,
+                                   const_edram_base_tiles_bits_plus_1,
+                                   builder.makeUintConstant(xenos::kEdramBaseTilesBits));
+  spv::Id source_tile_index = builder.createBinOp(spv::OpISub, type_uint,
+                                                  edram_tile_index_non_wrapped, source_base_tiles);
   // Split the linear tile index in the source texture into X and Y in tiles.
   spv::Id source_pitch_tiles =
-      builder.createTriOp(spv::OpBitFieldUExtract, type_uint, pitches_constant,
-                          const_edram_pitch_tiles_bits, const_edram_pitch_tiles_bits);
+      direct ? load_push_constant(kDirectResolvePushConstantSourcePitchTiles)
+             : builder.createTriOp(spv::OpBitFieldUExtract, type_uint, pitches_constant,
+                                   const_edram_pitch_tiles_bits, const_edram_pitch_tiles_bits);
   spv::Id source_tile_index_y =
       builder.createBinOp(spv::OpUDiv, type_uint, source_tile_index, source_pitch_tiles);
   spv::Id source_tile_index_x =
@@ -6120,22 +6314,223 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
     }
   }
 
-  // Write the packed value to the EDRAM buffer.
-  spv::Id store_value = packed[0];
-  if (format_is_64bpp) {
+  if (direct) {
+    // Fused path: place the packed sample straight into the resolve
+    // destination, doing what the resolve copy shader would have done with the
+    // value after reading it back out of the EDRAM buffer.
+    spv::Id type_bool = builder.makeBoolType();
+    auto uconst = [&](uint32_t value) { return builder.makeUintConstant(value); };
+    auto bin = [&](spv::Op op, spv::Id a, spv::Id b) {
+      return builder.createBinOp(op, type_uint, a, b);
+    };
+    auto add = [&](spv::Id a, spv::Id b) { return bin(spv::OpIAdd, a, b); };
+    auto sub = [&](spv::Id a, spv::Id b) { return bin(spv::OpISub, a, b); };
+    auto mul = [&](spv::Id a, spv::Id b) { return bin(spv::OpIMul, a, b); };
+    auto shl = [&](spv::Id a, uint32_t b) { return bin(spv::OpShiftLeftLogical, a, uconst(b)); };
+    auto shr = [&](spv::Id a, uint32_t b) { return bin(spv::OpShiftRightLogical, a, uconst(b)); };
+    auto band = [&](spv::Id a, uint32_t b) { return bin(spv::OpBitwiseAnd, a, uconst(b)); };
+    auto bor = [&](spv::Id a, spv::Id b) { return bin(spv::OpBitwiseOr, a, b); };
+    auto bits = [&](spv::Id value, uint32_t offset, uint32_t count) {
+      return builder.createTriOp(spv::OpBitFieldUExtract, type_uint, value, uconst(offset),
+                                 uconst(count));
+    };
+
+    spv::Id coordinate_info = direct_coordinate_info;
+    spv::Id dest_info = load_push_constant(kDirectResolvePushConstantDestInfo);
+    spv::Id dest_coordinate_info =
+        load_push_constant(kDirectResolvePushConstantDestCoordinateInfo);
+    spv::Id region_x = direct_region_x;
+    spv::Id region_y = direct_region_y;
+    spv::Id in_region = direct_in_region;
+    (void)coordinate_info;
+
+    // The destination position, in host texels.
+    spv::Id host_dest_x =
+        add(region_x, mul(shl(bits(dest_coordinate_info, 20, 4),
+                              xenos::kResolveAlignmentPixelsLog2),
+                          uconst(draw_resolution_scale_x())));
+    spv::Id host_dest_y =
+        add(region_y, mul(shl(bits(dest_coordinate_info, 24, 4),
+                              xenos::kResolveAlignmentPixelsLog2),
+                          uconst(draw_resolution_scale_y())));
+
+    // A scaled destination doesn't expand each guest texel on its own: the
+    // texels sharing a 16-byte block stay together, and it's the block that is
+    // repeated draw_resolution_scale_x * draw_resolution_scale_y times. So the
+    // guest position comes from the host position with the block index divided
+    // by the scale, not the texel index.
+    uint32_t texels_per_block_log2 = 2 - uint32_t(format_is_64bpp);
+    bool scaled = draw_resolution_scale_x() > 1 || draw_resolution_scale_y() > 1;
+    spv::Id guest_x, guest_y, sub_index = spv::NoResult, texel_in_block = spv::NoResult;
+    if (scaled) {
+      spv::Id host_block_x = shr(host_dest_x, texels_per_block_log2);
+      guest_x = shl(bin(spv::OpUDiv, host_block_x, uconst(draw_resolution_scale_x())),
+                    texels_per_block_log2);
+      guest_y = bin(spv::OpUDiv, host_dest_y, uconst(draw_resolution_scale_y()));
+      sub_index =
+          add(mul(bin(spv::OpUMod, host_block_x, uconst(draw_resolution_scale_x())),
+                  uconst(draw_resolution_scale_y())),
+              bin(spv::OpUMod, host_dest_y, uconst(draw_resolution_scale_y())));
+      texel_in_block = band(host_dest_x, (UINT32_C(1) << texels_per_block_log2) - 1);
+    } else {
+      guest_x = host_dest_x;
+      guest_y = host_dest_y;
+    }
+    spv::Id dest_x = guest_x;
+    spv::Id dest_y = guest_y;
+    spv::Id dest_pitch_div_32 =
+        bits(dest_coordinate_info, 0,
+             xenos::kTexture2DCubeMaxWidthHeightLog2 + 2 - xenos::kTextureTileWidthHeightLog2);
+    uint32_t bpb_log2 = 2 + uint32_t(format_is_64bpp);
+    // texture_util::GetTiledOffset2D, in the shader.
+    spv::Id tiled_2d;
+    {
+      spv::Id macro = shl(add(shr(dest_x, 5), mul(shr(dest_y, 5), dest_pitch_div_32)),
+                          bpb_log2 + 7);
+      spv::Id micro = shl(add(band(dest_x, 7), shl(band(dest_y, 0xE), 2)), bpb_log2);
+      spv::Id offset = add(add(add(macro, shl(band(micro, ~UINT32_C(0xF)), 1)), band(micro, 0xF)),
+                           shl(band(dest_y, 1), 4));
+      tiled_2d = add(
+          add(add(add(shl(band(offset, ~UINT32_C(0x1FF)), 3), shl(band(dest_y, 16), 7)),
+                  shl(band(offset, 0x1C0), 2)),
+              shl(band(add(shr(band(dest_y, 8), 2), shr(dest_x, 3)), 3), 6)),
+          band(offset, 0x3F));
+    }
+    // texture_util::GetTiledOffset3D, in the shader - the destination may be a
+    // slice of a 3D texture.
+    spv::Id dest_z = bits(dest_info, 4, 3);
+    spv::Id tiled_3d;
+    {
+      spv::Id dest_height_div_32 =
+          bits(dest_coordinate_info,
+               xenos::kTexture2DCubeMaxWidthHeightLog2 + 2 - xenos::kTextureTileWidthHeightLog2,
+               xenos::kTexture2DCubeMaxWidthHeightLog2 + 2 - xenos::kTextureTileWidthHeightLog2);
+      spv::Id macro_outer =
+          mul(add(shr(dest_y, 4), mul(shr(dest_z, 2), shl(dest_height_div_32, 1))),
+              dest_pitch_div_32);
+      spv::Id macro =
+          shl(band(shl(add(shr(dest_x, 5), macro_outer), bpb_log2 + 6), 0xFFFFFFF), 1);
+      spv::Id micro = shr(shl(add(band(dest_x, 7), shl(band(dest_y, 6), 2)), bpb_log2 + 6), 6);
+      spv::Id offset_outer = band(add(shr(dest_y, 3), shr(dest_z, 2)), 1);
+      spv::Id offset1 =
+          add(offset_outer, shl(band(add(shr(dest_x, 3), shl(offset_outer, 1)), 3), 1));
+      spv::Id offset2 = add(add(add(shl(add(macro, band(micro, ~UINT32_C(15))), 1), band(micro, 15)),
+                                shl(band(dest_z, 3), bpb_log2 + 6)),
+                            shl(band(dest_y, 1), 4));
+      spv::Id address = shl(band(offset1, 1), 3);
+      address = add(address, band(shr(offset2, 6), 7));
+      address = shl(address, 3);
+      address = add(address, band(offset1, ~UINT32_C(1)));
+      address = shl(address, 2);
+      address = add(address, band(offset2, ~UINT32_C(511)));
+      address = shl(address, 3);
+      tiled_3d = add(address, band(offset2, 63));
+    }
+    spv::Id dest_offset = builder.createTriOp(
+        spv::OpSelect, type_uint,
+        builder.createBinOp(spv::OpINotEqual, type_bool, band(dest_info, 8), const_uint_0),
+        tiled_3d, tiled_2d);
+    if (scaled) {
+      dest_offset =
+          add(add(mul(dest_offset, uconst(draw_resolution_scale_x() * draw_resolution_scale_y())),
+                  shl(sub_index, 4)),
+              shl(texel_in_block, bpb_log2));
+    } else {
+      dest_offset = add(dest_offset, load_push_constant(kDirectResolvePushConstantDestBase));
+    }
+
+    // Apply the destination swap and endianness, as the resolve copy shader
+    // does to the value it reads from the EDRAM buffer.
+    spv::Id source_format = bits(direct_edram_info,
+                                 xenos::kEdramPitchTilesBits + xenos::kMsaaSamplesBits + 1 +
+                                     xenos::kEdramBaseTilesBits,
+                                 xenos::kRenderTargetFormatBits);
+    spv::Id swap_enabled = builder.createBinOp(spv::OpINotEqual, type_bool,
+                                               band(dest_info, UINT32_C(1) << 24), const_uint_0);
+    spv::Id endian = band(dest_info, 7);
+    spv::Id endian_8_in_16 = builder.createBinOp(
+        spv::OpLogicalOr, type_bool,
+        builder.createBinOp(spv::OpIEqual, type_bool, endian,
+                            uconst(uint32_t(xenos::Endian128::k8in16))),
+        builder.createBinOp(spv::OpIEqual, type_bool, endian,
+                            uconst(uint32_t(xenos::Endian128::k8in32))));
+    spv::Id endian_16_in_32 = builder.createBinOp(
+        spv::OpLogicalOr, type_bool,
+        builder.createBinOp(spv::OpIEqual, type_bool, endian,
+                            uconst(uint32_t(xenos::Endian128::k8in32))),
+        builder.createBinOp(spv::OpIEqual, type_bool, endian,
+                            uconst(uint32_t(xenos::Endian128::k16in32))));
+    auto transform_value = [&](spv::Id value) {
+      // Red/blue swap, by the source render target format, as in the copy
+      // shaders.
+      spv::Id swapped_8888 = bor(bor(band(value, 0xFF00FF00), shl(band(value, 0xFF), 16)),
+                                 band(shr(value, 16), 0xFF));
+      spv::Id swapped_1010 = bor(bor(band(value, 0xC00FFC00), shl(band(value, 0x3FF), 20)),
+                                 band(shr(value, 20), 0x3FF));
+      spv::Id is_8888 = builder.createBinOp(
+          spv::OpULessThanEqual, type_bool, source_format,
+          uconst(uint32_t(xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA)));
+      spv::Id is_1010 = builder.createBinOp(
+          spv::OpLogicalOr, type_bool,
+          builder.createBinOp(
+              spv::OpULessThanEqual, type_bool,
+              sub(source_format, uconst(uint32_t(xenos::ColorRenderTargetFormat::k_2_10_10_10))),
+              uconst(1)),
+          builder.createBinOp(
+              spv::OpLogicalOr, type_bool,
+              builder.createBinOp(
+                  spv::OpIEqual, type_bool, source_format,
+                  uconst(uint32_t(
+                      xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10))),
+              builder.createBinOp(
+                  spv::OpIEqual, type_bool, source_format,
+                  uconst(uint32_t(xenos::ColorRenderTargetFormat::
+                                      k_2_10_10_10_FLOAT_AS_16_16_16_16)))));
+      spv::Id swapped = builder.createTriOp(
+          spv::OpSelect, type_uint, is_8888, swapped_8888,
+          builder.createTriOp(spv::OpSelect, type_uint, is_1010, swapped_1010, value));
+      spv::Id result = builder.createTriOp(spv::OpSelect, type_uint, swap_enabled, swapped, value);
+      result = builder.createTriOp(
+          spv::OpSelect, type_uint, endian_8_in_16,
+          bor(shl(band(result, 0x00FF00FF), 8), shr(band(result, 0xFF00FF00), 8)), result);
+      result = builder.createTriOp(spv::OpSelect, type_uint, endian_16_in_32,
+                                   bor(shl(result, 16), shr(result, 16)), result);
+      return result;
+    };
+
+    SpirvBuilder::IfBuilder if_in_region(in_region, spv::SelectionControlDontFlattenMask, builder);
+    {
+      spv::Id dest_dword_index = shr(dest_offset, 2);
+      for (uint32_t i = 0; i <= uint32_t(format_is_64bpp); ++i) {
+        id_vector_temp.clear();
+        // The only SSBO structure member.
+        id_vector_temp.push_back(builder.makeIntConstant(0));
+        id_vector_temp.push_back(builder.createUnaryOp(
+            spv::OpBitcast, type_int, i ? add(dest_dword_index, uconst(1)) : dest_dword_index));
+        builder.createStore(
+            transform_value(packed[i]),
+            builder.createAccessChain(spv::StorageClassUniform, edram_buffer, id_vector_temp));
+      }
+    }
+    if_in_region.makeEndIf();
+  } else {
+    // Write the packed value to the EDRAM buffer.
+    spv::Id store_value = packed[0];
+    if (format_is_64bpp) {
+      id_vector_temp.clear();
+      id_vector_temp.push_back(packed[0]);
+      id_vector_temp.push_back(packed[1]);
+      store_value = builder.createCompositeConstruct(type_uint2, id_vector_temp);
+    }
     id_vector_temp.clear();
-    id_vector_temp.push_back(packed[0]);
-    id_vector_temp.push_back(packed[1]);
-    store_value = builder.createCompositeConstruct(type_uint2, id_vector_temp);
+    // The only SSBO structure member.
+    id_vector_temp.push_back(builder.makeIntConstant(0));
+    id_vector_temp.push_back(builder.createUnaryOp(spv::OpBitcast, type_int, edram_sample_address));
+    // StorageBuffer since SPIR-V 1.3, but since SPIR-V 1.0 is generated, it's
+    // Uniform.
+    builder.createStore(store_value, builder.createAccessChain(spv::StorageClassUniform,
+                                                               edram_buffer, id_vector_temp));
   }
-  id_vector_temp.clear();
-  // The only SSBO structure member.
-  id_vector_temp.push_back(builder.makeIntConstant(0));
-  id_vector_temp.push_back(builder.createUnaryOp(spv::OpBitcast, type_int, edram_sample_address));
-  // StorageBuffer since SPIR-V 1.3, but since SPIR-V 1.0 is generated, it's
-  // Uniform.
-  builder.createStore(store_value, builder.createAccessChain(spv::StorageClassUniform, edram_buffer,
-                                                             id_vector_temp));
 
   // End the main function and make it the entry point.
   builder.leaveFunction();
@@ -6153,19 +6548,24 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
 
   // Create the pipeline, and store the handle even if creation fails not to try
   // to create it again later.
+  VkPipelineLayout pipeline_layout;
+  if (direct) {
+    pipeline_layout =
+        key.is_depth ? direct_resolve_pipeline_layout_depth_ : direct_resolve_pipeline_layout_color_;
+  } else {
+    pipeline_layout = key.is_depth ? dump_pipeline_layout_depth_ : dump_pipeline_layout_color_;
+  }
   VkPipeline pipeline = ui::vulkan::util::CreateComputePipeline(
-      command_processor_.GetVulkanDevice(),
-      key.is_depth ? dump_pipeline_layout_depth_ : dump_pipeline_layout_color_,
+      command_processor_.GetVulkanDevice(), pipeline_layout,
       reinterpret_cast<const uint32_t*>(shader_code.data()), sizeof(uint32_t) * shader_code.size());
   if (pipeline == VK_NULL_HANDLE) {
     REXGPU_ERROR(
-        "VulkanRenderTargetCache: Failed to create a render target dumping "
-        "pipeline for {}-sample render targets with format {}",
-        UINT32_C(1) << uint32_t(key.msaa_samples),
+        "VulkanRenderTargetCache: Failed to create a render target {} pipeline "
+        "for {}-sample render targets with format {}",
+        direct ? "direct resolve" : "dumping", UINT32_C(1) << uint32_t(key.msaa_samples),
         key.is_depth ? xenos::GetDepthRenderTargetFormatName(key.GetDepthFormat())
                      : xenos::GetColorRenderTargetFormatName(key.GetColorFormat()));
   }
-  dump_pipelines_.emplace(key, pipeline);
   return pipeline;
 }
 
@@ -6175,12 +6575,21 @@ VkPipeline VulkanRenderTargetCache::GetDirectResolvePipeline(DirectResolvePipeli
     return pipeline_it->second;
   }
   VkPipeline pipeline = VK_NULL_HANDLE;
-  // Until dedicated direct host RT -> shared memory shaders are added, reuse
-  // the resolve copy pipelines to keep all resolve shader modes wired for the
-  // direct preflight path.
-  size_t copy_shader_index = size_t(key.copy_shader);
-  if (copy_shader_index < size_t(draw_util::ResolveCopyShaderIndex::kCount)) {
-    pipeline = resolve_copy_pipelines_[copy_shader_index];
+  // Only the "fast" copy shaders are fused so far. They write the EDRAM sample
+  // to the destination unchanged apart from the red/blue swap and the
+  // endianness, which is exactly what the shared packing already produces - the
+  // format-converting "full" shaders would need their conversion replicated
+  // here as well. Multisampled sources are not fused either: the copy shader
+  // picks one sample by offsetting within the EDRAM, and with resolution
+  // scaling the relation between a sample offset and a scaled texel needs to be
+  // settled before it can be reproduced from the dump-side dispatch.
+  // 64bpp is left out for now on top of that: its EDRAM tile is half as wide,
+  // but the resolve region's offset within the tile is still expressed in
+  // 32bpp-equivalent samples, and that conversion is untested here.
+  bool copy_shader_fusable =
+      key.copy_shader == draw_util::ResolveCopyShaderIndex::kFast32bpp1x2xMSAA;
+  if (copy_shader_fusable && key.dump_pipeline_key.msaa_samples == xenos::MsaaSamples::k1X) {
+    pipeline = BuildRenderTargetSamplingPipeline(key.dump_pipeline_key, &key);
   }
   direct_resolve_pipelines_.emplace(key, pipeline);
   return pipeline;
@@ -6190,8 +6599,6 @@ bool VulkanRenderTargetCache::TryResolveCopyDirectly(const draw_util::ResolveInf
                                                      draw_util::ResolveCopyShaderIndex copy_shader,
                                                      bool draw_resolution_scaled) {
   ++direct_resolve_attempt_count_;
-  (void)copy_shader;
-  (void)draw_resolution_scaled;
   if (direct_resolve_pipeline_layout_color_ == VK_NULL_HANDLE ||
       direct_resolve_pipeline_layout_depth_ == VK_NULL_HANDLE) {
     return false;
@@ -6208,18 +6615,30 @@ bool VulkanRenderTargetCache::TryResolveCopyDirectly(const draw_util::ResolveInf
     return false;
   }
 
+  // Every tile of the resolve region must be owned by a render target. Where
+  // no render target owns one, the dump path still copies whatever the EDRAM
+  // buffer holds for it - possibly written by an earlier dump - while the
+  // fused path would leave the destination untouched, so fall back rather than
+  // resolve a partial region.
+  uint64_t covered_tiles = 0;
+  for (const ResolveCopyDispatch& resolve_copy_dispatch : direct_resolve_dispatches_) {
+    covered_tiles += uint64_t(resolve_copy_dispatch.dispatch.width_tiles) *
+                     resolve_copy_dispatch.dispatch.height_tiles;
+  }
+  if (covered_tiles != uint64_t(dump_row_length_used) * dump_rows) {
+    return false;
+  }
+
   for (const ResolveCopyDumpRectangle& rectangle : dump_rectangles_) {
     const auto* render_target = static_cast<const VulkanRenderTarget*>(rectangle.render_target);
     if (render_target == nullptr) {
       return false;
     }
+    RenderTargetKey rt_key = render_target->key();
     DumpPipelineKey dump_pipeline_key;
-    dump_pipeline_key.msaa_samples = render_target->key().msaa_samples;
-    dump_pipeline_key.resource_format = render_target->key().resource_format;
-    dump_pipeline_key.is_depth = render_target->key().is_depth;
-    if (GetDumpPipeline(dump_pipeline_key) == VK_NULL_HANDLE) {
-      return false;
-    }
+    dump_pipeline_key.msaa_samples = rt_key.msaa_samples;
+    dump_pipeline_key.resource_format = rt_key.resource_format;
+    dump_pipeline_key.is_depth = rt_key.is_depth;
     DirectResolvePipelineKey direct_pipeline_key;
     direct_pipeline_key.dump_pipeline_key = dump_pipeline_key;
     direct_pipeline_key.copy_shader = copy_shader;
@@ -6229,9 +6648,96 @@ bool VulkanRenderTargetCache::TryResolveCopyDirectly(const draw_util::ResolveInf
     }
   }
 
-  // Dedicated direct resolve dispatches are staged behind the same preflight;
-  // keep using the existing dump path until source-image direct shaders land.
-  return DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch);
+  return true;
+}
+
+void VulkanRenderTargetCache::IssueDirectResolveCopy(
+    const draw_util::ResolveInfo& resolve_info, draw_util::ResolveCopyShaderIndex copy_shader,
+    draw_util::ResolveCopyShaderConstants copy_shader_constants,
+    VkDescriptorSet descriptor_set_dest, bool draw_resolution_scaled,
+    uint32_t dest_binding_offset) {
+  assert_true(GetPath() == Path::kHostRenderTargets);
+  assert_false(direct_resolve_dispatches_.empty());
+
+  uint32_t dump_base;
+  uint32_t dump_row_length_used;
+  uint32_t dump_rows;
+  uint32_t dump_pitch;
+  resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used, dump_rows, dump_pitch);
+
+  // The scaled destination is bound at its own base, so the shader adds
+  // nothing; the unscaled one is bound at an offset into the shared memory.
+  DirectResolvePushConstants push_constants;
+  push_constants.resolve = copy_shader_constants;
+  push_constants.resolve.dest_base =
+      draw_resolution_scaled ? 0 : (copy_shader_constants.dest_base - dest_binding_offset);
+  push_constants.height_div_8 = resolve_info.height_div_8;
+
+  DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
+
+  VkPipelineLayout last_pipeline_layout = VK_NULL_HANDLE;
+  VkDescriptorSet last_source_descriptor_set = VK_NULL_HANDLE;
+  const RenderTarget* last_render_target = nullptr;
+  for (const ResolveCopyDispatch& resolve_copy_dispatch : direct_resolve_dispatches_) {
+    const ResolveCopyDumpRectangle& rectangle =
+        dump_rectangles_[resolve_copy_dispatch.rectangle_index];
+    auto& vulkan_rt = *static_cast<VulkanRenderTarget*>(rectangle.render_target);
+    RenderTargetKey rt_key = vulkan_rt.key();
+
+    DumpPipelineKey dump_pipeline_key;
+    dump_pipeline_key.msaa_samples = rt_key.msaa_samples;
+    dump_pipeline_key.resource_format = rt_key.resource_format;
+    dump_pipeline_key.is_depth = rt_key.is_depth;
+    DirectResolvePipelineKey direct_pipeline_key;
+    direct_pipeline_key.dump_pipeline_key = dump_pipeline_key;
+    direct_pipeline_key.copy_shader = copy_shader;
+    direct_pipeline_key.draw_resolution_scaled = draw_resolution_scaled;
+    VkPipeline pipeline = GetDirectResolvePipeline(direct_pipeline_key);
+    // TryResolveCopyDirectly has checked every rectangle already.
+    assert_true(pipeline != VK_NULL_HANDLE);
+    command_processor_.BindExternalComputePipeline(pipeline);
+
+    VkPipelineLayout pipeline_layout =
+        rt_key.is_depth ? direct_resolve_pipeline_layout_depth_ : direct_resolve_pipeline_layout_color_;
+    if (last_pipeline_layout != pipeline_layout) {
+      last_pipeline_layout = pipeline_layout;
+      last_source_descriptor_set = VK_NULL_HANDLE;
+      command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout,
+                                             kDumpDescriptorSetEdram, 1, &descriptor_set_dest, 0,
+                                             nullptr);
+    }
+
+    if (last_render_target != rectangle.render_target) {
+      last_render_target = rectangle.render_target;
+      vulkan_rt.SetUsage(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
+                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
+    VkDescriptorSet source_descriptor_set = vulkan_rt.GetDescriptorSetTransferSource();
+    if (last_source_descriptor_set != source_descriptor_set) {
+      last_source_descriptor_set = source_descriptor_set;
+      command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout,
+                                             kDumpDescriptorSetSource, 1, &source_descriptor_set, 0,
+                                             nullptr);
+    }
+
+    push_constants.source_base_tiles = rt_key.base_tiles;
+    push_constants.source_pitch_tiles = rt_key.GetPitchTiles();
+    push_constants.dispatch_first_tile = dump_base + resolve_copy_dispatch.dispatch.offset;
+    command_buffer.CmdVkPushConstants(pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                      sizeof(push_constants), &push_constants);
+
+    command_processor_.SubmitBarriers(true);
+    command_buffer.CmdVkDispatch(
+        (draw_resolution_scale_x() * (xenos::kEdramTileWidthSamples >> uint32_t(rt_key.Is64bpp())) *
+             resolve_copy_dispatch.dispatch.width_tiles +
+         (kDumpSamplesPerGroupX - 1)) /
+            kDumpSamplesPerGroupX,
+        (draw_resolution_scale_y() * xenos::kEdramTileHeightSamples *
+             resolve_copy_dispatch.dispatch.height_tiles +
+         (kDumpSamplesPerGroupY - 1)) /
+            kDumpSamplesPerGroupY,
+        1);
+  }
 }
 
 bool VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used,
