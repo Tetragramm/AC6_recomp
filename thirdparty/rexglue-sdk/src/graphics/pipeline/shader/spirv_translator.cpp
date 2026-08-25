@@ -21,10 +21,15 @@
 #include <fmt/format.h>
 
 #include <rex/assert.h>
+#include <rex/cvar.h>
 #include <rex/graphics/pipeline/shader/spirv.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/math.h>
 #include <rex/string/buffer.h>
+
+// Defined in graphics/flags.cpp; read by param_gen below.
+REXCVAR_DECLARE(bool, param_gen_integer_guest_position);
+REXCVAR_DECLARE(bool, param_gen_host_subpixel_restore);
 
 namespace rex::graphics {
 
@@ -3136,6 +3141,19 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
   // Pixel parameters.
   if (param_gen_interpolator != UINT32_MAX) {
     Modification modification = GetSpirvShaderModification();
+    // Snap the reverted position to the integer guest-pixel index. Reverting
+    // the resolution scale leaves a sub-guest-pixel fraction (e.g. .5 at 2x)
+    // which is correct only for shaders that feed PsParamGen straight to
+    // tfetch. Games that instead do integer pixel-address math on the position
+    // (AC6's deferred EDRAM restore/de-swizzle passes) break, because their
+    // frac()-based bit extraction sees a multiplied period at >1x and scrambles
+    // the sample coordinate into a mosaic. Flooring here makes that math
+    // operate on integer guest pixels again, at the cost of those passes
+    // sampling at guest resolution - param_gen_host_subpixel_restore re-adds
+    // the sub-pixel later, at the texture fetch, so the restore passes regain
+    // full host resolution.
+    bool param_gen_floor_guest_position = REXCVAR_GET(param_gen_integer_guest_position) ||
+                                          REXCVAR_GET(param_gen_host_subpixel_restore);
     // Rounding the position down, and taking the absolute value, so in case the
     // host GPU for some reason has quads used for derivative calculation at odd
     // locations, the left and top edges will have correct derivative magnitude
@@ -3166,6 +3184,10 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
       param_gen_x = builder_->createNoContractionBinOp(
           spv::OpFMul, type_float_, param_gen_x,
           builder_->makeFloatConstant(1.0f / float(draw_resolution_scale_x_)));
+      if (param_gen_floor_guest_position) {
+        param_gen_x = builder_->createUnaryBuiltinCall(type_float_, ext_inst_glsl_std_450_,
+                                                       GLSLstd450Floor, param_gen_x);
+      }
     }
     param_gen_x = builder_->createUnaryBuiltinCall(type_float_, ext_inst_glsl_std_450_,
                                                    GLSLstd450FAbs, param_gen_x);
@@ -3202,6 +3224,10 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
       param_gen_y = builder_->createNoContractionBinOp(
           spv::OpFMul, type_float_, param_gen_y,
           builder_->makeFloatConstant(1.0f / float(draw_resolution_scale_y_)));
+      if (param_gen_floor_guest_position) {
+        param_gen_y = builder_->createUnaryBuiltinCall(type_float_, ext_inst_glsl_std_450_,
+                                                       GLSLstd450Floor, param_gen_y);
+      }
     }
     param_gen_y = builder_->createUnaryBuiltinCall(type_float_, ext_inst_glsl_std_450_,
                                                    GLSLstd450FAbs, param_gen_y);

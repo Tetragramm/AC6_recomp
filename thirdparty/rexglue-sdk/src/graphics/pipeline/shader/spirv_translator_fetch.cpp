@@ -24,6 +24,8 @@
 #include <rex/math.h>
 
 REXCVAR_DECLARE(bool, vfetch_index_rounding_bias);
+// Defined in graphics/flags.cpp; read by the host sub-pixel restore below.
+REXCVAR_DECLARE(bool, param_gen_host_subpixel_restore);
 
 namespace rex::graphics {
 
@@ -751,6 +753,21 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
       }
     }
 
+    // For a resolution-scaled, position-derived 2D sample in a pixel shader
+    // that uses PsParamGen (AC6's deferred restore passes), the guest
+    // de-swizzle runs on integer guest pixels (see the param_gen floor in
+    // StartFragmentShaderInMain) and so samples the guest-texel center, losing
+    // the host sub-pixel. Re-add it after the coordinate has been normalized,
+    // so the sample lands on the exact host texel - true resolution-scaled
+    // detail. Needs the guest texture size loaded below.
+    bool apply_host_subpixel_correction =
+        instr.opcode == ucode::FetchOpcode::kTextureFetch &&
+        !instr.attributes.unnormalized_coordinates &&
+        instr.dimension == xenos::FetchOpDimension::k2D && is_pixel_shader() &&
+        !is_depth_only_fragment_shader_ && GetPsParamGenInterpolator() != UINT32_MAX &&
+        (draw_resolution_scale_x_ > 1 || draw_resolution_scale_y_ > 1) &&
+        REXCVAR_GET(param_gen_host_subpixel_restore);
+
     // Fetch constant word usage:
     // - 2: Size (needed only once).
     // - 3: Exponent adjustment (needed only once).
@@ -823,6 +840,11 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           size_needed_components &= 0b0011;
           break;
       }
+    }
+    if (apply_host_subpixel_correction) {
+      // The guest width and height are needed to convert the host sub-pixel
+      // offset into normalized texture space.
+      size_needed_components |= 0b011;
     }
     if (instr.dimension == xenos::FetchOpDimension::k3DOrStacked && size_needed_components) {
       // Stacked and 3D textures have different size packing - need to get
@@ -1098,6 +1120,46 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
             coordinate_ref = builder_->createNoContractionBinOp(
                 spv::OpFAdd, type_float_, coordinate_ref, component_offset_normalized);
           }
+        }
+      }
+      if (apply_host_subpixel_correction) {
+        // The coordinate now samples the guest-texel center (host texel
+        // scale * swizzle(g) + scale / 2). Shift it to the current host
+        // sub-pixel so it samples host texel scale * swizzle(g) + s (the
+        // host-resolution swizzle), landing on an exact texel center.
+        assert_true(input_fragment_coordinates_ != spv::NoResult);
+        assert_true(texture_resolution_scaled != spv::NoResult);
+        for (uint32_t i = 0; i < 2; ++i) {
+          uint32_t axis_scale = i ? draw_resolution_scale_y_ : draw_resolution_scale_x_;
+          if (axis_scale <= 1) {
+            continue;
+          }
+          // host_subpixel = uint(gl_FragCoord[i]) % scale.
+          id_vector_temp_.clear();
+          id_vector_temp_.push_back(builder_->makeIntConstant(int(i)));
+          spv::Id position_component = builder_->createLoad(
+              builder_->createAccessChain(spv::StorageClassInput, input_fragment_coordinates_,
+                                          id_vector_temp_),
+              spv::NoPrecision);
+          spv::Id host_subpixel = builder_->createUnaryOp(
+              spv::OpConvertUToF, type_float_,
+              builder_->createBinOp(
+                  spv::OpUMod, type_uint_,
+                  builder_->createUnaryOp(spv::OpConvertFToU, type_uint_, position_component),
+                  builder_->makeUintConstant(axis_scale)));
+          // delta = (host_subpixel - (scale - 1) / 2) / (guest_size * scale).
+          spv::Id delta = builder_->createNoContractionBinOp(
+              spv::OpFAdd, type_float_, host_subpixel,
+              builder_->makeFloatConstant(-(float(axis_scale) - 1.0f) * 0.5f));
+          assert_true(size[i] != spv::NoResult);
+          delta = builder_->createNoContractionBinOp(spv::OpFDiv, type_float_, delta, size[i]);
+          delta = builder_->createNoContractionBinOp(spv::OpFMul, type_float_, delta,
+                                                     const_texture_resolution_scale_reciprocal[i]);
+          // Only resolution-scaled textures are stored at host resolution.
+          coordinates[i] = builder_->createTriOp(
+              spv::OpSelect, type_float_, texture_resolution_scaled,
+              builder_->createNoContractionBinOp(spv::OpFAdd, type_float_, coordinates[i], delta),
+              coordinates[i]);
         }
       }
       if (instr.dimension == xenos::FetchOpDimension::k3DOrStacked) {
