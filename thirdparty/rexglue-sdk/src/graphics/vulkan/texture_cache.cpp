@@ -875,8 +875,18 @@ VkSampler VulkanTextureCache::UseSampler(SamplerParameters parameters, bool& has
   }
   sampler_create_info.minLod = float(parameters.mip_min_level);
   if (parameters.mip_base_map) {
-    assert_false(parameters.mip_linear);
-    sampler_create_info.maxLod = sampler_create_info.minLod + 0.25f;
+    // Only the base map must be sampled. Without anisotropic filtering, this is
+    // emulated the way the Vulkan specification describes GL_NEAREST /
+    // GL_LINEAR minification - point mip sampling with maxLod 0.25 above
+    // minLod, preserving magnification vs. minification. Anisotropic filtering
+    // forces linear filtering for both min and mag (and thus mip_linear), which
+    // is exactly what kBaseMap must not do, so clamp to a single level instead
+    // - the same fallback as in the Direct3D 12 implementation.
+    sampler_create_info.maxLod = sampler_create_info.minLod;
+    if (parameters.aniso_filter == xenos::AnisoFilter::kDisabled) {
+      assert_false(parameters.mip_linear);
+      sampler_create_info.maxLod += 0.25f;
+    }
   } else {
     sampler_create_info.maxLod = VK_LOD_CLAMP_NONE;
   }
