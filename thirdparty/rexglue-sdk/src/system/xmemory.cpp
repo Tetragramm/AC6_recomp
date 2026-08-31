@@ -29,7 +29,17 @@
 // TODO(benvanik): move xbox.h out
 #include <rex/system/xtypes.h>
 
-REXCVAR_DECLARE(bool, ac6_fix_trails);  // defined in graphics/flags.cpp
+// Read here and by the D3D12 command processor. Defined in rexsystem rather
+// than rexgraphics because rexgraphics links before rexsystem: a system ->
+// graphics symbol reference is unresolvable in tools that pull in little of
+// rexgraphics (rexglue).
+// Consumed once at graphics SetupContext (a one-shot write-watch callback
+// registration), so a change needs a restart to take effect.
+REXCVAR_DEFINE_BOOL(ac6_fix_trails, true, "AC6/Fixes",
+                    "Fix invisible missile and jet trails by refreshing the GPU copy "
+                    "of the trail history when the CPU rewrites it.")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 REXCVAR_DEFINE_BOOL(protect_zero, true, "Memory", "Protect the zero page from reads and writes")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 

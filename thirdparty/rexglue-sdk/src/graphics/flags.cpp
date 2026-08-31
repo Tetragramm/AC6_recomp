@@ -112,12 +112,8 @@ REXCVAR_DEFINE_BOOL(gpu_debug_markers, false, "GPU",
                     "Insert debug markers into GPU command streams for tools "
                     "like PIX and RenderDoc. Automatically enabled when "
                     "RenderDoc is detected.");
-// Consumed once at graphics SetupContext (a one-shot write-watch callback
-// registration), so a change needs a restart to take effect.
-REXCVAR_DEFINE_BOOL(ac6_fix_trails, true, "AC6/Fixes",
-                    "Fix invisible missile and jet trails by refreshing the GPU copy "
-                    "of the trail history when the CPU rewrites it.")
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+// ac6_fix_trails is defined in system/xmemory.cpp: rexsystem is the lower
+// layer, so both it and rexgraphics can reach the definition at link time.
 
 bool IsGpuDebugMarkersEnabled() {
   static bool cached = false;
