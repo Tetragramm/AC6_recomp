@@ -41,6 +41,12 @@ bool IsCinematicActive();
 // signal for the dynamic FPS pacing.
 void NotifyWorldCompositorDraw();
 
+// ac6_timing_trace plumbing: the delta hook reports what it handed the sim, and
+// the physics fix reports the step ratio it last used, so one log line can show
+// whether the unlock's remapping is actually correct.
+void NoteSimDelta(double exact, double delta, bool snapped);
+double LastPhysicsStepRatio();
+
 // True while a world-compositor draw happened within the last decay window
 // (i.e. the 3D world is being rendered - gameplay or in-engine cutscene, not
 // the 2D front-end). Same signal the dynamic FPS pacing uses.

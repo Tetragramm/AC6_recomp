@@ -175,6 +175,12 @@ uint32_t PlayerFlightModel(uint8_t* base) {
 
 }  // namespace
 
+namespace ac6 {
+// Reported by the ac6_timing_trace line in render_hooks.cpp. StepRatio caches
+// per guest frame, so calling it here costs nothing extra.
+double LastPhysicsStepRatio() { return StepRatio(); }
+}  // namespace ac6
+
 PPC_EXTERN_FUNC(__imp__rex_sub_823046A0);  // flight-model force step
 PPC_EXTERN_FUNC(__imp__rex_sub_82329B40);  // flight-model input shaping
 PPC_EXTERN_FUNC(__imp__rex_sub_82305278);  // flight-model alternate (ground) force step

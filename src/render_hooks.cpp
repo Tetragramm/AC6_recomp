@@ -41,6 +41,20 @@ REXCVAR_DEFINE_DOUBLE(ac6_max_sim_fps, 60.0, "AC6/Enhancements",
 REXCVAR_DEFINE_BOOL(ac6_dt_snap, true, "AC6/Enhancements",
                     "Snap the simulation step to the pacing target when within ~1ms "
                     "of it, removing residual micro-stutter and shake.");
+REXCVAR_DEFINE_BOOL(ac6_timing_trace, false, "AC6/Enhancements",
+                    "Log the FPS unlock's timing state once a second: measured frame "
+                    "time, the frame delta handed to the sim, and the physics step "
+                    "ratio. For diagnosing unlock misbehaviour.");
+REXCVAR_DEFINE_BOOL(ac6_present_pacing, true, "AC6/Enhancements",
+                    "Gate the guest's swap on real GPU delivery of the previous frame "
+                    "plus a target-rate limiter. false = the FPS unlock's other parts "
+                    "still apply but the guest swap is never blocked.");
+REXCVAR_DEFINE_DOUBLE(ac6_freerun_vblank_hz, 0.0, "AC6/Enhancements",
+                      "Guest VBlank rate while gameplay free-runs under the FPS unlock. "
+                      "0 = leave the guest VBlank at its native rate (the only value "
+                      "known to be correct - see the note in ac6PresentTimingHook). "
+                      "Raising it above the frame rate CORRUPTS the game's own frame "
+                      "delta and makes the simulation crawl.");
 REXCVAR_DEFINE_DOUBLE(ac6_min_sim_fps, 20.0, "AC6/Enhancements",
                       "Lowest framerate the game runs at true speed before slow "
                       "motion kicks in. Stock behaviour is 30.");
@@ -152,7 +166,22 @@ bool AreTimingHooksActive() {
 
 }  // namespace
 
+namespace {
+// Last values the sim actually received, for ac6_timing_trace.
+std::atomic<double> g_trace_exact{0.0};
+std::atomic<double> g_trace_delta{0.0};
+std::atomic<bool> g_trace_snapped{false};
+std::atomic<bool> g_trace_delta_seen{false};
+}  // namespace
+
 namespace ac6 {
+
+void NoteSimDelta(double exact, double delta, bool snapped) {
+  g_trace_exact.store(exact, std::memory_order_relaxed);
+  g_trace_delta.store(delta, std::memory_order_relaxed);
+  g_trace_snapped.store(snapped, std::memory_order_relaxed);
+  g_trace_delta_seen.store(true, std::memory_order_relaxed);
+}
 
 // True while the FPS-unlock timing hooks are remapping the game's cadence
 // (unlock cvars on and no cutscene clamp). The physics force-step rescale keys
@@ -264,6 +293,7 @@ void ac6DeltaPrecisionHook(PPCRegister& r8, PPCRegister& r10, PPCRegister& r29, 
       }
       s_remainder = 0.0;  // locked to target; no fractional carry
       r8.u64 = uint64_t(snapped);
+      ac6::NoteSimDelta(exact, snapped, true);
       return;
     }
   }
@@ -280,6 +310,7 @@ void ac6DeltaPrecisionHook(PPCRegister& r8, PPCRegister& r10, PPCRegister& r29, 
   }
   s_remainder = precision ? (base - delta) : 0.0;
   r8.u64 = uint64_t(delta);
+  ac6::NoteSimDelta(exact, delta, false);
 }
 
 void ac6PresentTimingHook(PPCRegister& /*r31*/) {
@@ -309,12 +340,27 @@ void ac6PresentTimingHook(PPCRegister& /*r31*/) {
   if (dynamic_pacing && !free_running) {
     override_hz = 60.0;
   } else if (free_running) {
-    // Force the guest vblank to free-run (non-gating) during gameplay so
-    // PaceGuestPresent is the SOLE gate, regardless of the vsync /
-    // guest_vblank_sync_to_refresh cvars (whose defaults would otherwise re-add
-    // a 60Hz gate). This makes the smooth unlock work with zero configuration.
-    override_hz = 1000.0;
-    pacing_target_hz = ResolvePacingTargetFps();
+    // DO NOT raise the guest VBlank rate here. The original code forced 1000Hz
+    // to make the VBlank non-gating so PaceGuestPresent would be the sole gate.
+    // That is incompatible with this game: AC6 measures its frame delta BETWEEN
+    // VBLANK INTERRUPTS, not between frames, so a VBlank faster than the frame
+    // rate makes every measured delta a fraction of the real one.
+    //
+    // Measured 2026-08-31 with ac6_timing_trace at a steady 60fps (correct
+    // delta = 50, where 100 = 30fps): at the 240Hz override the delta the sim
+    // received peaked at 12.55 = 50 * 60/240 and jittered down to 1.85 as the
+    // frame/VBlank phase drifted. The sim therefore advanced at roughly a sixth
+    // of real time - the aircraft barely responds and the ramped input command
+    // reads as "stuck on". At the original 1000Hz the cap is 3 instead of 12.5,
+    // i.e. the same bug, worse.
+    //
+    // So the VBlank stays at its native rate and caps the game at the refresh
+    // rate. The rest of the unlock (flip interval, delta precision, dt-snap,
+    // physics rescale) still applies. ac6_freerun_vblank_hz exists to
+    // re-introduce an override for experiments; anything above the frame rate
+    // will corrupt the delta.
+    pacing_target_hz = REXCVAR_GET(ac6_present_pacing) ? ResolvePacingTargetFps() : 0.0;
+    override_hz = REXCVAR_GET(ac6_freerun_vblank_hz);
   }
   rex::graphics::GraphicsSystem::SetGuestVblankHzOverride(override_hz);
   rex::graphics::GraphicsSystem::SetGuestPresentPacing(pacing_target_hz);
@@ -329,6 +375,26 @@ void ac6PresentTimingHook(PPCRegister& /*r31*/) {
         g_frame_count.fetch_add(1, std::memory_order_relaxed);
     }
     g_frame_start = now;
+
+  if (REXCVAR_GET(ac6_timing_trace)) {
+    static int64_t s_last_trace_ms = 0;
+    const int64_t now_ms = NowMs();
+    if (now_ms - s_last_trace_ms >= 1000) {
+      s_last_trace_ms = now_ms;
+      const double ft = g_frame_time_ms.load(std::memory_order_relaxed);
+      REXLOG_INFO(
+          "[AC6-TIMING] frame {:.2f}ms ({:.1f}fps) hooks={} world={} cine={} "
+          "vblank={:.0f}Hz pacing={:.0f} | sim delta: exact={:.2f} used={:.0f} "
+          "snapped={} seen={} | physics step ratio={:.4f}",
+          ft, ft > 0.0001 ? 1000.0 / ft : 0.0, AreTimingHooksActive() ? 1 : 0,
+          IsWorldRenderActive() ? 1 : 0, ac6::IsCinematicActive() ? 1 : 0, override_hz,
+          pacing_target_hz, g_trace_exact.load(std::memory_order_relaxed),
+          g_trace_delta.load(std::memory_order_relaxed),
+          g_trace_snapped.load(std::memory_order_relaxed) ? 1 : 0,
+          g_trace_delta_seen.exchange(false, std::memory_order_relaxed) ? 1 : 0,
+          ac6::LastPhysicsStepRatio());
+    }
+  }
 
   // Log the first handful of pacing transitions (smooth pacing keyed negative
   // so mode switches log distinctly from plain overrides).

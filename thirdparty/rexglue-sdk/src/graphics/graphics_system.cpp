@@ -487,6 +487,17 @@ void GraphicsSystem::PaceGuestPresent() {
             g_guest_present_count.load(std::memory_order_relaxed);
         g_guest_swaps_issued.store(g_present_delivery_at_last_timeout,
                                    std::memory_order_relaxed);
+        // Each of these is a 100ms stall of the guest's swap thread. A steady
+        // stream of them means guest frames are not reaching the presenter and
+        // the pacing gate is what is hitching the game.
+        static std::atomic<uint32_t> s_timeouts{0};
+        uint32_t timeout_count = s_timeouts.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (timeout_count <= 8 || (timeout_count % 64) == 0) {
+          REXGPU_WARN(
+              "[AC6-PACING] guest swap stalled 100ms waiting for delivery "
+              "(#{}; issued={} delivered={})",
+              timeout_count, issued, g_present_delivery_at_last_timeout);
+        }
       }
     } else if (!delivery_stalled) {
       g_present_delivery_at_last_timeout = UINT64_MAX;
