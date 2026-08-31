@@ -266,6 +266,15 @@ set(SDL_DISKAUDIO OFF CACHE BOOL "" FORCE)
 set(SDL_DUMMYAUDIO OFF CACHE BOOL "" FORCE)
 set(SDL_DUMMYVIDEO OFF CACHE BOOL "" FORCE)
 
+# Audio backends. When PipeWire is compiled in, SDL3 puts PIPEWIRE_PREFERRED
+# first in its bootstrap list and picks its native PipeWire backend over
+# PulseAudio; that backend crackles and stutters badly under this emulator's
+# callback pattern, while PulseAudio (which PipeWire proxies anyway on a
+# PipeWire desktop) is clean. Default it off. Deliberately NOT forced, so
+# -DSDL_PIPEWIRE=ON on the configure line still wins for anyone who wants to
+# test it - a command-line -D populates the cache before this runs.
+set(SDL_PIPEWIRE OFF CACHE BOOL "Build SDL3's native PipeWire audio backend")
+
 add_subdirectory(sdl3)
 
 #=============================================================================
