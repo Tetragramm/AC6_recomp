@@ -12,7 +12,9 @@
 
 #include <array>
 #include <memory>
+#include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -21,6 +23,7 @@
 #include <rex/graphics/vulkan/shared_memory.h>
 #include <rex/hash.h>
 #include <rex/ui/vulkan/mem_alloc.h>
+#include "../../../../../../src/ac6_texture_overrides.h"
 
 namespace rex::graphics::vulkan {
 
@@ -191,6 +194,8 @@ class VulkanTextureCache final : public TextureCache {
     enum class Usage {
       kUndefined,
       kTransferDestination,
+      // Reading the image back on the host - AC6 texture dumps.
+      kTransferSource,
       kGuestShaderSampled,
       kSwapSampled,
     };
@@ -370,6 +375,71 @@ class VulkanTextureCache final : public TextureCache {
     kUnsupportedSnormBit = kUnsupportedUnormBit << 1,
   };
   uint8_t unsupported_format_features_used_[64] = {};
+
+  // AC6 texture swaps (ac6_texture_swaps_*): DDS dump and replacement, the
+  // Vulkan half of what d3d12/texture_cache.cpp does. Stable keys are built
+  // from guest-side key fields only, so dumps and mod packs are interchangeable
+  // between the two backends; the DXGI format is what the DDS carries, mapped
+  // from the host VkFormat by GetDxgiFormatForVkFormat.
+  struct DumpSubresource {
+    uint64_t offset = 0;     // into the readback buffer, tightly packed
+    uint32_t row_pitch = 0;  // bytes
+    uint32_t row_count = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t mip_level = 0;
+    uint32_t array_layer = 0;
+    uint32_t depth = 1;
+  };
+  struct PendingTextureDump {
+    uint64_t submission_index = 0;
+    uint64_t total_size = 0;
+    uint64_t texture_key_hash = 0;
+    uint64_t frame_index = 0;
+    uint64_t signature_stable_id = 0;
+    uint64_t active_vertex_shader_hash = 0;
+    uint64_t active_pixel_shader_hash = 0;
+    uint32_t base_page = 0;
+    uint32_t mip_page = 0;
+    uint32_t guest_dimension = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t depth_or_array_size = 1;
+    uint32_t mip_count = 1;
+    uint32_t guest_format = 0;
+    uint32_t endianness = 0;
+    DXGI_FORMAT dxgi_format = DXGI_FORMAT_UNKNOWN;
+    D3D12_RESOURCE_DIMENSION resource_dimension = D3D12_RESOURCE_DIMENSION_UNKNOWN;
+    bool tiled = false;
+    bool packed_mips = false;
+    bool signed_separate = false;
+    bool scaled_resolve = false;
+    std::string stable_key;
+    std::string signature_tags;
+    VkBuffer readback_buffer = VK_NULL_HANDLE;
+    VkDeviceMemory readback_memory = VK_NULL_HANDLE;
+    void* readback_mapping = nullptr;
+    std::vector<DumpSubresource> subresources;
+  };
+
+  static DXGI_FORMAT GetDxgiFormatForVkFormat(VkFormat format);
+  void ProcessCompletedTextureTransfers();
+  void DestroyPendingTextureDump(PendingTextureDump& pending_dump);
+  bool ScheduleTextureDump(VulkanTexture& texture, VkFormat host_format);
+  bool ApplyTextureReplacement(VulkanTexture& texture, VkFormat host_format);
+
+  std::unordered_set<std::string> dumped_texture_keys_;
+  std::unordered_set<std::string> replacement_warning_keys_;
+  std::vector<PendingTextureDump> pending_texture_dumps_;
+  // Replacement upload buffers, kept alive until the submission that reads
+  // them has completed.
+  struct PendingUploadBuffer {
+    uint64_t submission_index = 0;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    void* mapping = nullptr;
+  };
+  std::vector<PendingUploadBuffer> pending_upload_buffers_;
 
   uint32_t sampler_max_count_;
 
