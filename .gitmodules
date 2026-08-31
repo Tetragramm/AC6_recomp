@@ -1,4 +1,0 @@
-﻿[submodule "thirdparty/rexglue-sdk"]
-	path = thirdparty/rexglue-sdk
-	url = https://github.com/rapidsamphire/rexglue-sdk.git
-	branch = ac6recomp-fixes
