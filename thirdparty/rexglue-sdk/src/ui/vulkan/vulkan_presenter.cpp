@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -26,6 +27,7 @@
 #include <rex/platform.h>
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/util.h>
+#include <rex/ui/present_stats.h>
 
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
 #include <ffx_api/ffx_api.h>
@@ -1535,9 +1537,17 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
 
   VkSemaphore acquire_semaphore = paint_submission.acquire_semaphore();
   uint32_t swapchain_image_index;
+  // How long the paint blocked waiting for a swapchain image - the Vulkan
+  // counterpart of the D3D12 frame-latency-object wait, and what the frame
+  // timing overlay's "wait" figure reports (high = GPU/display bound, ~0 =
+  // pacing bound). Without this the overlay reads a hardcoded 0 on Vulkan.
+  auto acquire_wait_begin = std::chrono::steady_clock::now();
   VkResult acquire_result =
       dfn.vkAcquireNextImageKHR(device, paint_context_.swapchain, UINT64_MAX, acquire_semaphore,
                                 VK_NULL_HANDLE, &swapchain_image_index);
+  ui::SetLastPresentWaitMs(std::chrono::duration<double, std::milli>(
+                               std::chrono::steady_clock::now() - acquire_wait_begin)
+                               .count());
   switch (acquire_result) {
     case VK_SUCCESS:
     case VK_SUBOPTIMAL_KHR:
