@@ -23,6 +23,7 @@
 #include <rex/assert.h>
 #include <rex/cvar.h>
 #include <rex/graphics/pipeline/shader/spirv.h>
+#include <rex/graphics/pipeline/shader/ac6_shader_hash_list.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/math.h>
 #include <rex/string/buffer.h>
@@ -30,6 +31,9 @@
 // Defined in graphics/flags.cpp; read by param_gen below.
 REXCVAR_DECLARE(bool, param_gen_integer_guest_position);
 REXCVAR_DECLARE(bool, param_gen_host_subpixel_restore);
+REXCVAR_DECLARE(std::string, ac6_fix_hoisted_fetch_gradients_hashes);
+REXCVAR_DECLARE(bool, ac6_flare_drop_quad2);
+REXCVAR_DECLARE(int32_t, ac6_flare_drop_index_min);
 
 namespace rex::graphics {
 
@@ -127,6 +131,11 @@ void SpirvShaderTranslator::Reset() {
   input_sample_id_ = spv::NoResult;
   input_sample_mask_ = spv::NoResult;
   std::fill(input_output_interpolators_.begin(), input_output_interpolators_.end(), spv::NoResult);
+  // AC6 water line: reset unconditionally - the variable-creation block below
+  // is skipped entirely for a depth-only fragment shader.
+  var_main_hoisted_grad_h_ = spv::NoResult;
+  var_main_hoisted_grad_v_ = spv::NoResult;
+  hoisted_gradient_interpolator_ = UINT32_MAX;
   output_point_coordinates_ = spv::NoResult;
   output_point_size_ = spv::NoResult;
   output_per_vertex_member_count_ = 0;
@@ -510,6 +519,30 @@ void SpirvShaderTranslator::StartTranslation() {
     var_main_tfetch_gradients_v_ =
         builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_float3_,
                                  "xe_var_tfetch_gradients_v", const_float3_0_);
+    // AC6 water line: pick the allowlisted interpolator (if any) and reserve the
+    // variables its prologue-taken derivatives live in. Fragment shaders only -
+    // there are no derivatives anywhere else.
+    if (is_pixel_shader()) {
+      const std::string& hoisted_grad_hashes =
+          REXCVAR_GET(ac6_fix_hoisted_fetch_gradients_hashes);
+      if (!hoisted_grad_hashes.empty()) {
+        uint64_t ucode_hash = current_shader().ucode_data_hash();
+        uint32_t interpolator_mask = GetModificationInterpolatorMask();
+        for (uint32_t i = 0; i < xenos::kMaxInterpolators; ++i) {
+          if ((interpolator_mask & (UINT32_C(1) << i)) &&
+              UcodeHashSlotInList(ucode_hash, i, hoisted_grad_hashes)) {
+            hoisted_gradient_interpolator_ = i;
+            var_main_hoisted_grad_h_ =
+                builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_float4_,
+                                         "xe_var_hoisted_grad_h", const_float4_0_);
+            var_main_hoisted_grad_v_ =
+                builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_float4_,
+                                         "xe_var_hoisted_grad_v", const_float4_0_);
+            break;
+          }
+        }
+      }
+    }
     if (register_count()) {
       spv::Id type_register_array =
           builder_->makeArrayType(type_float4_, builder_->makeUintConstant(register_count()), 1);
@@ -2569,6 +2602,34 @@ void SpirvShaderTranslator::CompleteVertexOrTessEvalShaderInMain() {
         position_w);
   }
 
+  // AC6 sun-flare "square" fix - drop the flare's second billboard. This VS
+  // (ADF9AFC4C10921B9) emits two billboards per flare draw: V0-V3 = the visible
+  // glow quad, V4-V7 = a huge malformed quad (corners far off-screen, garbage
+  // UVs) that is invisible on real hardware but mis-renders in the emulator as
+  // a faint bright-edged rectangle. Cull it the same way as the OR-mode kill
+  // above - NaN the output position W of vertices with index >= the threshold,
+  // so the rasterizer discards the primitive. V0-V3 are untouched.
+  if (REXCVAR_GET(ac6_flare_drop_quad2) &&
+      current_shader().ucode_data_hash() == UINT64_C(0xADF9AFC4C10921B9) &&
+      shader_modification.vertex.host_vertex_shader_type ==
+          Shader::HostVertexShaderType::kVertex &&
+      input_vertex_index_ != spv::NoResult) {
+    int32_t ac6_drop_index_min = REXCVAR_GET(ac6_flare_drop_index_min);
+    if (ac6_drop_index_min < 0) {
+      ac6_drop_index_min = 0;
+    }
+    spv::Id ac6_drop = builder_->createBinOp(
+        spv::OpUGreaterThanEqual, type_bool_,
+        builder_->createUnaryOp(spv::OpBitcast, type_uint_,
+                                builder_->createLoad(input_vertex_index_, spv::NoPrecision)),
+        builder_->makeUintConstant(uint32_t(ac6_drop_index_min)));
+    position_w = builder_->createTriOp(
+        spv::OpSelect, type_float_, ac6_drop,
+        builder_->createUnaryOp(spv::OpBitcast, type_float_,
+                                builder_->makeUintConstant(UINT32_C(0x7FC00000))),
+        position_w);
+  }
+
   // Write the point size.
   if (output_point_size_ != spv::NoResult) {
     spv::Id point_size;
@@ -3130,12 +3191,27 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
     }
     id_vector_temp_.clear();
     id_vector_temp_.push_back(builder_->makeIntConstant(int(i)));
-    builder_->createStore(
+    spv::Id interpolator_value =
         (i < xenos::kMaxInterpolators && (interpolator_mask & (UINT32_C(1) << i)))
             ? builder_->createLoad(input_output_interpolators_[i], spv::NoPrecision)
-            : const_float4_0_,
-        builder_->createAccessChain(spv::StorageClassFunction, var_main_registers_,
-                                    id_vector_temp_));
+            : const_float4_0_;
+    builder_->createStore(interpolator_value,
+                          builder_->createAccessChain(spv::StorageClassFunction, var_main_registers_,
+                                                      id_vector_temp_));
+    // AC6 water line (ac6_fix_hoisted_fetch_gradients_hashes): take this
+    // interpolator's derivatives HERE, in the prologue, where every pixel of
+    // the quad is running, so a fetch inside translated guest control flow can
+    // use a well-defined value instead of an undefined one computed at the
+    // fetch site.
+    if (i == hoisted_gradient_interpolator_ && var_main_hoisted_grad_h_ != spv::NoResult) {
+      builder_->addCapability(spv::CapabilityDerivativeControl);
+      builder_->createStore(
+          builder_->createUnaryOp(spv::OpDPdxCoarse, type_float4_, interpolator_value),
+          var_main_hoisted_grad_h_);
+      builder_->createStore(
+          builder_->createUnaryOp(spv::OpDPdyCoarse, type_float4_, interpolator_value),
+          var_main_hoisted_grad_v_);
+    }
   }
 
   // Pixel parameters.

@@ -977,6 +977,15 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // float3.
   spv::Id var_main_tfetch_gradients_h_;
   spv::Id var_main_tfetch_gradients_v_;
+  // AC6 water line (ac6_fix_hoisted_fetch_gradients_hashes): the derivatives of
+  // one interpolator, taken in the fragment prologue where every pixel of the
+  // quad is live, so a fetch buried in translated guest control flow can use a
+  // well-defined value instead of the undefined one it would compute there.
+  // Only created for an allowlisted shader; kMaxInterpolators = none.
+  // float4.
+  spv::Id var_main_hoisted_grad_h_;
+  spv::Id var_main_hoisted_grad_v_;
+  uint32_t hoisted_gradient_interpolator_;
   // float4[register_count()].
   spv::Id var_main_registers_;
   // Memory export variables are created only when needed.

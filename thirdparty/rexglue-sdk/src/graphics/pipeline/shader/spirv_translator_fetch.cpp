@@ -20,12 +20,17 @@
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
+#include <rex/graphics/pipeline/shader/ac6_shader_hash_list.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/math.h>
 
 REXCVAR_DECLARE(bool, vfetch_index_rounding_bias);
 // Defined in graphics/flags.cpp; read by the host sub-pixel restore below.
 REXCVAR_DECLARE(bool, param_gen_host_subpixel_restore);
+REXCVAR_DECLARE(std::string, ac6_neutralize_deswizzle_hashes);
+REXCVAR_DECLARE(std::string, ac6_snap_guest_texel_hashes);
+REXCVAR_DECLARE(std::string, ac6_densify_x_fetch_hashes);
+REXCVAR_DECLARE(std::string, ac6_densify_y_fetch_hashes);
 
 namespace rex::graphics {
 
@@ -768,6 +773,93 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
         (draw_resolution_scale_x_ > 1 || draw_resolution_scale_y_ > 1) &&
         REXCVAR_GET(param_gen_host_subpixel_restore);
 
+    // Surgical de-swizzle neutralize: some AC6 full-screen "restore/resample"
+    // passes manually de-swizzle the Xenos sub-tile layout of their source.
+    // That is correct only where the emulator keeps the source already
+    // swizzled; the texture cache detiles EVERYTHING to linear, so the same
+    // de-swizzle scrambles it - the streak that feeds the cloud/effects
+    // pipeline. For an allowlisted shader (guest ucode hash; runtime string
+    // cvar) replace the scrambled coordinate with the identity host-texel UV =
+    // gl_FragCoord.xy / (guest_size * scale), a 1:1 copy. The layout mismatch
+    // is scale-independent - the source is linear at 1x too - so this applies
+    // at ALL draw resolutions.
+    bool apply_deswizzle_identity = false;
+    if (instr.opcode == ucode::FetchOpcode::kTextureFetch &&
+        !instr.attributes.unnormalized_coordinates &&
+        instr.dimension == xenos::FetchOpDimension::k2D && is_pixel_shader() &&
+        !is_depth_only_fragment_shader_ && GetPsParamGenInterpolator() != UINT32_MAX) {
+      const std::string& neutralize_hashes = REXCVAR_GET(ac6_neutralize_deswizzle_hashes);
+      apply_deswizzle_identity =
+          !neutralize_hashes.empty() &&
+          UcodeHashSlotInList(current_shader().ucode_data_hash(), fetch_constant_index,
+                              neutralize_hashes);
+    }
+
+    // Guest-texel snap for scale-broken filter kernels: some game passes (AC6's
+    // cutscene depth-of-field gather pair) build their kernel out of fractional
+    // guest-texel tap offsets whose bilinear blend ratios are tuned for the
+    // guest-resolution texel grid. Against a resolution-scaled texture the same
+    // UVs land on the finer host grid: every ratio is reinterpreted and the
+    // kernel phase alternates per output pixel, aliasing into striping. For an
+    // allowlisted shader snap the final coordinate to the guest texel center,
+    // where host bilinear of a scaled texture returns exactly the guest texel's
+    // box average. These shaders sample via interpolators, so no param_gen
+    // requirement.
+    // AC6 water line (ac6_fix_hoisted_fetch_gradients_hashes): use the
+    // prologue-computed gradients for this fetch if its coordinates are read
+    // straight from the guest register the hoisted interpolator was loaded
+    // into. Requiring a plain, absolutely-addressed register read is what keeps
+    // the substitution honest - anything else and the gradients would not
+    // correspond to the coordinates.
+    bool use_hoisted_gradients =
+        is_pixel_shader() && var_main_hoisted_grad_h_ != spv::NoResult &&
+        hoisted_gradient_interpolator_ != UINT32_MAX &&
+        instr.operands[0].storage_source == InstructionStorageSource::kRegister &&
+        instr.operands[0].storage_addressing_mode == InstructionStorageAddressingMode::kAbsolute &&
+        instr.operands[0].storage_index == hoisted_gradient_interpolator_;
+
+    bool apply_guest_texel_snap = false;
+    if (instr.opcode == ucode::FetchOpcode::kTextureFetch &&
+        !instr.attributes.unnormalized_coordinates &&
+        instr.dimension == xenos::FetchOpDimension::k2D && is_pixel_shader() &&
+        !is_depth_only_fragment_shader_ &&
+        (draw_resolution_scale_x_ > 1 || draw_resolution_scale_y_ > 1)) {
+      const std::string& snap_hashes = REXCVAR_GET(ac6_snap_guest_texel_hashes);
+      apply_guest_texel_snap =
+          !snap_hashes.empty() &&
+          UcodeHashSlotInList(current_shader().ucode_data_hash(), fetch_constant_index,
+                              snap_hashes);
+    }
+
+    // Axis densification for separable sparse-kernel passes (AC6 DoF gathers):
+    // each allowlisted fetch becomes the average of 2*scale_axis samples spread
+    // along the pass axis across one guest-texel half-gap on each side of the
+    // tap. The union of adjacent taps' cells covers the kernel span
+    // continuously, so ghost copies of features thinner than the tap spacing
+    // merge at any resolution scale; the effective kernel is the authored one
+    // convolved with a 2-guest-texel box (~2% wider - shape-faithful).
+    // Per-axis resolution scale aware; no-op when the relevant axis scale is 1.
+    uint32_t densify_axis_samples[2] = {0, 0};
+    if (instr.opcode == ucode::FetchOpcode::kTextureFetch &&
+        !instr.attributes.unnormalized_coordinates &&
+        instr.dimension == xenos::FetchOpDimension::k2D && is_pixel_shader() &&
+        !is_depth_only_fragment_shader_) {
+      const std::string& densify_x_hashes = REXCVAR_GET(ac6_densify_x_fetch_hashes);
+      if (draw_resolution_scale_x_ > 1 && !densify_x_hashes.empty() &&
+          UcodeHashSlotInList(current_shader().ucode_data_hash(), fetch_constant_index,
+                              densify_x_hashes)) {
+        densify_axis_samples[0] = 2 * uint32_t(draw_resolution_scale_x_);
+      }
+      const std::string& densify_y_hashes = REXCVAR_GET(ac6_densify_y_fetch_hashes);
+      if (draw_resolution_scale_y_ > 1 && !densify_y_hashes.empty() &&
+          UcodeHashSlotInList(current_shader().ucode_data_hash(), fetch_constant_index,
+                              densify_y_hashes)) {
+        densify_axis_samples[1] = 2 * uint32_t(draw_resolution_scale_y_);
+      }
+    }
+    const bool apply_cluster_filter =
+        densify_axis_samples[0] != 0 || densify_axis_samples[1] != 0;
+
     // Fetch constant word usage:
     // - 2: Size (needed only once).
     // - 3: Exponent adjustment (needed only once).
@@ -841,9 +933,11 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           break;
       }
     }
-    if (apply_host_subpixel_correction) {
+    if (apply_host_subpixel_correction || apply_deswizzle_identity ||
+        apply_guest_texel_snap || apply_cluster_filter) {
       // The guest width and height are needed to convert the host sub-pixel
-      // offset into normalized texture space.
+      // offset into normalized texture space (and, for the AC6 payloads below,
+      // to build the identity UV and the guest texel grid).
       size_needed_components |= 0b011;
     }
     if (instr.dimension == xenos::FetchOpDimension::k3DOrStacked && size_needed_components) {
@@ -1160,6 +1254,59 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
               spv::OpSelect, type_float_, texture_resolution_scaled,
               builder_->createNoContractionBinOp(spv::OpFAdd, type_float_, coordinates[i], delta),
               coordinates[i]);
+        }
+      }
+      if (apply_deswizzle_identity) {
+        // coordinates.xy is the guest de-swizzled coordinate. The guest wrote
+        // these restore/resample passes for raw EDRAM-ordered resolve data, but
+        // the texture cache detiles everything to linear, so the de-swizzle is
+        // always a wrong texel permutation here. Replace it with the identity
+        // host-texel UV = gl_FragCoord.xy / (guest_size * scale) so the pass
+        // copies its source 1:1. Unconditional within allowlisted shaders:
+        // there is no swizzled-content texture this could break, and unlike the
+        // payloads around it this is NOT gated on the texture being
+        // resolution-scaled (the mismatch exists at 1x too).
+        assert_true(input_fragment_coordinates_ != spv::NoResult);
+        for (uint32_t i = 0; i < 2; ++i) {
+          assert_true(size[i] != spv::NoResult);
+          uint32_t axis_scale = i ? draw_resolution_scale_y_ : draw_resolution_scale_x_;
+          // host_size = guest_size * draw_resolution_scale.
+          spv::Id host_size = size[i];
+          if (axis_scale != 1) {
+            host_size = builder_->createNoContractionBinOp(
+                spv::OpFMul, type_float_, host_size,
+                builder_->makeFloatConstant(float(axis_scale)));
+          }
+          id_vector_temp_.clear();
+          id_vector_temp_.push_back(builder_->makeIntConstant(int(i)));
+          spv::Id position_component = builder_->createLoad(
+              builder_->createAccessChain(spv::StorageClassInput, input_fragment_coordinates_,
+                                          id_vector_temp_),
+              spv::NoPrecision);
+          coordinates[i] = builder_->createNoContractionBinOp(spv::OpFDiv, type_float_,
+                                                              position_component, host_size);
+        }
+      }
+      if (apply_guest_texel_snap) {
+        // coordinates.xy is the final normalized coordinate. Snap it to the
+        // guest texel center so the allowlisted kernel samples the guest grid
+        // regardless of the host storage resolution (see the gate above).
+        assert_true(texture_resolution_scaled != spv::NoResult);
+        for (uint32_t i = 0; i < 2; ++i) {
+          assert_true(size[i] != spv::NoResult);
+          // snapped = (floor(uv * guest_size) + 0.5) / guest_size.
+          spv::Id snapped = builder_->createNoContractionBinOp(spv::OpFMul, type_float_,
+                                                               coordinates[i], size[i]);
+          snapped = builder_->createUnaryBuiltinCall(type_float_, ext_inst_glsl_std_450_,
+                                                     GLSLstd450Floor, snapped);
+          snapped = builder_->createNoContractionBinOp(spv::OpFAdd, type_float_, snapped,
+                                                       builder_->makeFloatConstant(0.5f));
+          snapped = builder_->createNoContractionBinOp(spv::OpFDiv, type_float_, snapped, size[i]);
+          // Only textures stored at host resolution present a finer grid than
+          // the kernel was tuned for; guest-resolution sources stay stock.
+          coordinates[i] = builder_->createTriOp(spv::OpSelect, type_float_,
+                                                 texture_resolution_scaled, snapped,
+                                                 coordinates[i]);
         }
       }
       if (instr.dimension == xenos::FetchOpDimension::k3DOrStacked) {
@@ -1597,6 +1744,37 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
                   (i ? gradients_v : gradients_h) =
                       builder_->createCompositeConstruct(type_float2_, id_vector_temp_);
                 }
+              } else if (use_hoisted_gradients) {
+                // The fetch sits inside translated guest control flow, where
+                // derivatives are undefined - a quad pixel that did not enter
+                // the block holds a stale coordinate, so the finite difference
+                // collapses, the LOD runs off to negative infinity, and the
+                // fetch clamps to the finest mip. On Xenos the guest's
+                // predication and jumps still let every pixel of the quad
+                // execute, so its derivatives are well defined; this restores
+                // that by using the gradients taken in the prologue, where the
+                // quad is uniform. Swizzled the way the coordinate operand is,
+                // so the components line up with `coordinates`.
+                spv::Id hoisted_h = builder_->createLoad(var_main_hoisted_grad_h_,
+                                                         spv::NoPrecision);
+                spv::Id hoisted_v = builder_->createLoad(var_main_hoisted_grad_v_,
+                                                         spv::NoPrecision);
+                id_vector_temp_.clear();
+                uint32_t component_x = uint32_t(instr.operands[0].GetComponent(0)) -
+                                       uint32_t(SwizzleSource::kX);
+                uint32_t component_y = uint32_t(instr.operands[0].GetComponent(1)) -
+                                       uint32_t(SwizzleSource::kX);
+                id_vector_temp_.push_back(builder_->createCompositeExtract(
+                    hoisted_h, type_float_, component_x));
+                id_vector_temp_.push_back(builder_->createCompositeExtract(
+                    hoisted_h, type_float_, component_y));
+                gradients_h = builder_->createCompositeConstruct(type_float2_, id_vector_temp_);
+                id_vector_temp_.clear();
+                id_vector_temp_.push_back(builder_->createCompositeExtract(
+                    hoisted_v, type_float_, component_x));
+                id_vector_temp_.push_back(builder_->createCompositeExtract(
+                    hoisted_v, type_float_, component_y));
+                gradients_v = builder_->createCompositeConstruct(type_float2_, id_vector_temp_);
               } else {
                 id_vector_temp_.clear();
                 for (uint32_t i = 0; i < 2; ++i) {
@@ -1909,15 +2087,93 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
             texture_parameters.gradX = gradients_h;
             texture_parameters.gradY = gradients_v;
           }
-          id_vector_temp_.clear();
-          for (uint32_t i = 0; i < 3; ++i) {
-            id_vector_temp_.push_back(coordinates[i]);
+          // AC6 DoF densification: build the cluster of tap offsets (in guest
+          // texels) this fetch averages over. A single (0,0) entry is the
+          // stock single sample.
+          float cluster_dx[64] = {0.0f};
+          float cluster_dy[64] = {0.0f};
+          uint32_t cluster_count = 1;
+          if (apply_cluster_filter) {
+            float xs[8] = {0.0f};
+            float ys[8] = {0.0f};
+            uint32_t nx = 1, ny = 1;
+            if (densify_axis_samples[0]) {
+              nx = std::min(densify_axis_samples[0], UINT32_C(8));
+              for (uint32_t j = 0; j < nx; ++j) {
+                xs[j] = (float(j) + 0.5f) * 2.0f / float(nx) - 1.0f;
+              }
+            }
+            if (densify_axis_samples[1]) {
+              ny = std::min(densify_axis_samples[1], UINT32_C(8));
+              for (uint32_t j = 0; j < ny; ++j) {
+                ys[j] = (float(j) + 0.5f) * 2.0f / float(ny) - 1.0f;
+              }
+            }
+            cluster_count = 0;
+            for (uint32_t jy = 0; jy < ny; ++jy) {
+              for (uint32_t jx = 0; jx < nx; ++jx) {
+                cluster_dx[cluster_count] = xs[jx];
+                cluster_dy[cluster_count] = ys[jy];
+                ++cluster_count;
+              }
+            }
           }
-          texture_parameters.coords =
-              builder_->createCompositeConstruct(type_float3_, id_vector_temp_);
-          SampleTexture(texture_parameters, image_operands_mask, image_2d_array_or_cube_unsigned,
-                        image_2d_array_or_cube_signed, sampler, is_any_unsigned, is_any_signed,
-                        sample_result_unsigned, sample_result_signed);
+          spv::Id cluster_accum_unsigned = spv::NoResult;
+          spv::Id cluster_accum_signed = spv::NoResult;
+          for (uint32_t cluster_pass = 0; cluster_pass < cluster_count; ++cluster_pass) {
+            id_vector_temp_.clear();
+            for (uint32_t i = 0; i < 3; ++i) {
+              spv::Id coordinate = coordinates[i];
+              if (apply_cluster_filter && i < 2) {
+                // coord += cluster offset (guest texels) / guest_size.
+                float offset_texels = i ? cluster_dy[cluster_pass] : cluster_dx[cluster_pass];
+                if (offset_texels != 0.0f) {
+                  assert_true(size[i] != spv::NoResult);
+                  coordinate = builder_->createNoContractionBinOp(
+                      spv::OpFAdd, type_float_, coordinate,
+                      builder_->createNoContractionBinOp(
+                          spv::OpFDiv, type_float_,
+                          builder_->makeFloatConstant(offset_texels), size[i]));
+                }
+              }
+              id_vector_temp_.push_back(coordinate);
+            }
+            texture_parameters.coords =
+                builder_->createCompositeConstruct(type_float3_, id_vector_temp_);
+            spv::Id pass_result_unsigned, pass_result_signed;
+            SampleTexture(texture_parameters, image_operands_mask, image_2d_array_or_cube_unsigned,
+                          image_2d_array_or_cube_signed, sampler, is_any_unsigned, is_any_signed,
+                          pass_result_unsigned, pass_result_signed);
+            if (cluster_pass == 0) {
+              cluster_accum_unsigned = pass_result_unsigned;
+              cluster_accum_signed = pass_result_signed;
+            } else {
+              if (cluster_accum_unsigned != spv::NoResult &&
+                  pass_result_unsigned != spv::NoResult) {
+                cluster_accum_unsigned = builder_->createNoContractionBinOp(
+                    spv::OpFAdd, type_float4_, cluster_accum_unsigned, pass_result_unsigned);
+              }
+              if (cluster_accum_signed != spv::NoResult && pass_result_signed != spv::NoResult) {
+                cluster_accum_signed = builder_->createNoContractionBinOp(
+                    spv::OpFAdd, type_float4_, cluster_accum_signed, pass_result_signed);
+              }
+            }
+          }
+          if (cluster_count > 1) {
+            spv::Id cluster_reciprocal = builder_->makeFloatConstant(1.0f / float(cluster_count));
+            if (cluster_accum_unsigned != spv::NoResult) {
+              cluster_accum_unsigned = builder_->createNoContractionBinOp(
+                  spv::OpVectorTimesScalar, type_float4_, cluster_accum_unsigned,
+                  cluster_reciprocal);
+            }
+            if (cluster_accum_signed != spv::NoResult) {
+              cluster_accum_signed = builder_->createNoContractionBinOp(
+                  spv::OpVectorTimesScalar, type_float4_, cluster_accum_signed,
+                  cluster_reciprocal);
+            }
+          }
+          sample_result_unsigned = cluster_accum_unsigned;
+          sample_result_signed = cluster_accum_signed;
         }
 
         // Swizzle the result components manually if needed, to `result`.

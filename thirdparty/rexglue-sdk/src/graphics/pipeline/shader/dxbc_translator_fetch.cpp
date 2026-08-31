@@ -21,6 +21,7 @@
 #include <rex/cvar.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/render_target/cache.h>
+#include <rex/graphics/pipeline/shader/ac6_shader_hash_list.h>
 #include <rex/graphics/pipeline/shader/dxbc_translator.h>
 #include <rex/math.h>
 #include <rex/string.h>
@@ -29,54 +30,14 @@ namespace rex::graphics {
 using namespace ucode;
 
 namespace {
-// Returns true if `hash` + `tfetch_index` is allowlisted by `list`, a string of
-// tokens separated by commas/spaces/semicolons. Each token is
-// "<hex-hash>[:<slot>[+<slot>...]]" (optional "0x" prefix on the hash):
-// a bare hash matches ALL of that shader's fetch slots; with ":4" or ":1+2"
-// only the listed Xenos tfetch slots match. Used to allowlist specific guest
-// pixel shaders (and optionally specific fetches within them, e.g. only the
-// de-swizzled fetch of a compositor whose other fetches use plain UVs) at
-// runtime, so re-targeting needs no rebuild.
-bool UcodeHashSlotInList(uint64_t hash, uint32_t tfetch_index, const std::string& list) {
-  auto is_sep = [](char c) {
-    return c == ',' || c == ';' || c == ' ' || c == '\t' || c == '\n' || c == '\r';
-  };
-  size_t i = 0, n = list.size();
-  while (i < n) {
-    while (i < n && is_sep(list[i])) {
-      ++i;
-    }
-    size_t start = i;
-    while (i < n && !is_sep(list[i])) {
-      ++i;
-    }
-    if (i > start) {
-      std::string token = list.substr(start, i - start);
-      size_t colon = token.find(':');
-      std::string hash_part = colon == std::string::npos ? token : token.substr(0, colon);
-      if (std::strtoull(hash_part.c_str(), nullptr, 16) == hash) {
-        if (colon == std::string::npos) {
-          return true;  // No slot list - all slots.
-        }
-        size_t p = colon + 1;
-        while (p < token.size()) {
-          size_t q = token.find('+', p);
-          if (q == std::string::npos) {
-            q = token.size();
-          }
-          if (q > p &&
-              std::strtoul(token.substr(p, q - p).c_str(), nullptr, 10) == tfetch_index) {
-            return true;
-          }
-          p = q + 1;
-        }
-        // Hash matched but this slot isn't listed - keep scanning (the same
-        // hash may appear again with other slots).
-      }
-    }
-  }
-  return false;
-}
+// The allowlist syntax is "<hex-hash>[:<slot>[+<slot>...]]" tokens separated by
+// commas/spaces/semicolons: a bare hash matches ALL of that shader's fetch
+// slots; with ":4" or ":1+2" only the listed Xenos tfetch slots match. Used to
+// allowlist specific guest pixel shaders (and optionally specific fetches
+// within them, e.g. only the de-swizzled fetch of a compositor whose other
+// fetches use plain UVs) at runtime, so re-targeting needs no rebuild. Shared
+// with the SPIR-V translator - see ac6_shader_hash_list.h.
+using rex::graphics::UcodeHashSlotInList;
 }  // namespace
 
 void DxbcShaderTranslator::ProcessVertexFetchInstruction(
