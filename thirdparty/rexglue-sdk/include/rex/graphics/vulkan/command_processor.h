@@ -762,6 +762,23 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Bit is set when the vertex buffer at that index has been requested in the
   // current frame. Cleared between frames and on fetch constant writes.
   uint64_t vertex_buffers_in_sync_[2] = {};
+  // NOTE on ac6_fix_trails: it is deliberately NOT hooked up here. The D3D12
+  // backend needs it because it keeps a PERSISTENT vertex_buffer_states_
+  // address cache that skips RequestRange entirely for a buffer whose fetch
+  // constant never changes, so a CPU write to AC6's fixed-address trail ring
+  // is never re-uploaded; its fix drops that cache on invalidation. This
+  // backend has no such cache - vertex_buffers_in_sync_ is cleared wholesale
+  // at the top of every IssueSwap and there is no address-match shortcut, so
+  // every vertex buffer is re-requested at least once per frame and the bug
+  // cannot occur. Registering the invalidation callback here only forces
+  // redundant RequestRange calls mid-frame and measurably costs framerate.
+
+  // AC6 HD terrain: vertex fetch constant 95 of gated terrain draws is
+  // redirected to the synthetic full-density ring table (one game-global
+  // system-heap guest allocation); guest registers and memory stay untouched.
+  bool AC6TerrainHdEnsureRing();
+  bool ac6_hd_active_ = false;
+  uint32_t ac6_hd_ring_phys_ = 0;  // UINT32_MAX = allocation failed
   std::unordered_map<uint64_t, ReadbackBuffer> readback_buffers_;
   std::unordered_map<uint64_t, ReadbackBuffer> memexport_readback_buffers_;
 

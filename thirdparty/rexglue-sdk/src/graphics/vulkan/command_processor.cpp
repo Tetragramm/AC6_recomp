@@ -47,6 +47,8 @@
 #include <rex/ui/vulkan/util.h>
 
 #include "../../../../../src/ac6_backend_fixes/ac6_backend_hooks.h"
+#include "../../../../../src/ac6_backend_fixes/ac6_fullres_effects.h"
+#include "../../../../../src/render_hooks.h"
 
 // Legacy backend compatibility aliases for shared readback controls.
 REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
@@ -622,6 +624,50 @@ void VulkanCommandProcessor::InvalidateVertexBufferResidency(uint32_t vfetch_ind
     return;
   }
   vertex_buffers_in_sync_[vfetch_index >> 6] &= ~(uint64_t(1) << (vfetch_index & 63));
+}
+
+bool VulkanCommandProcessor::AC6TerrainHdEnsureRing() {
+  if (ac6_hd_ring_phys_ == UINT32_MAX) {
+    return false;
+  }
+  if (ac6_hd_ring_phys_) {
+    return true;
+  }
+  // Build the synthetic ring: for each of the group's 4 fans (patch bases
+  // (0,0), (2,0), (0,2), (2,2) in (row, col) cells), slots (10f+1+k) mod 40
+  // hold sample k of the fan's full 3x3 grid (row-major; the +1 is the
+  // shader's ring phase). Slots 0/10/20/30 are never referenced. The ring is
+  // game-global - the authored one is byte-identical across maps.
+  static const uint16_t kPatchBase[4][2] = {{0, 0}, {2, 0}, {0, 2}, {2, 2}};
+  uint16_t entries[80] = {};
+  for (uint32_t f = 0; f < 4; ++f) {
+    for (uint32_t k = 0; k < 9; ++k) {
+      uint32_t slot = (10 * f + 1 + k) % 40;
+      entries[slot * 2 + 0] = uint16_t(kPatchBase[f][0] + k / 3);  // row
+      entries[slot * 2 + 1] = uint16_t(kPatchBase[f][1] + k % 3);  // col
+    }
+  }
+  memory::Memory* memory = kernel_state_->memory();
+  uint32_t ring_virt = memory->SystemHeapAlloc(sizeof(entries), 256, memory::kSystemHeapPhysical);
+  if (!ring_virt) {
+    REXGPU_ERROR("AC6 HD terrain: failed to allocate the synthetic ring table");
+    ac6_hd_ring_phys_ = UINT32_MAX;
+    return false;
+  }
+  uint32_t* ring_host = memory->TranslateVirtual<uint32_t*>(ring_virt);
+  const uint32_t* words = reinterpret_cast<const uint32_t*>(entries);
+  for (uint32_t i = 0; i < sizeof(entries) / sizeof(uint32_t); ++i) {
+    // Guest vertex fetch tables are 8-in-32 big-endian.
+    ring_host[i] = rex::byte_swap(words[i]);
+  }
+  ac6_hd_ring_phys_ = memory->GetPhysicalAddress(ring_virt);
+  if (ac6_hd_ring_phys_ == UINT32_MAX) {
+    REXGPU_ERROR("AC6 HD terrain: synthetic ring allocation has no physical address");
+    return false;
+  }
+  REXGPU_INFO("AC6 HD terrain: synthetic ring at guest 0x{:08X} (virtual 0x{:08X})",
+              ac6_hd_ring_phys_, ring_virt);
+  return true;
 }
 
 void VulkanCommandProcessor::InvalidateVertexBufferResidencyRange(uint32_t first_vfetch,
@@ -2450,7 +2496,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   uint32_t display_width = std::max(uint32_t(1), uint32_t(video_mode.display_width));
   uint32_t display_height = std::max(uint32_t(1), uint32_t(video_mode.display_height));
 
-  presenter->RefreshGuestOutput(
+  bool refreshed = presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
       [this, guest_output_width, guest_output_height, frontbuffer_format, swap_texture_view,
        swap_post_effect,
@@ -2965,6 +3011,12 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         EndSubmission(true);
         return true;
       });
+
+  if (refreshed) {
+    // A guest frame was actually delivered to the presenter - feed the
+    // delivery-paced present pacing (see GraphicsSystem::NotifyGuestPresent).
+    GraphicsSystem::NotifyGuestPresent();
+  }
 
   // End the frame even if did not present for any reason (the image refresher
   // was not called), to prevent leaking per-frame resources.
@@ -3711,6 +3763,37 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       return true;
     }
   }
+  // AC6: the world/effects compositor draws once per frame whenever the 3D
+  // world renders (never in the 2D front-end) - stamp it as the "gameplay
+  // world active" signal for the dynamic FPS pacing.
+  if (pixel_shader && pixel_shader->ucode_data_hash() == UINT64_C(0x17e5e4ac3e713245)) {
+    ac6::NotifyWorldCompositorDraw();
+  }
+
+  // AC6 full-res effects (the silhouette fix): the compositor mask is
+  // sampled by whichever cloud draw binds it, not necessarily the world
+  // compositor - so crop the mask fetch to the filled 640x360 quarter on every
+  // draw that reads it. Must run before RequestTextures/UpdateBindings read
+  // the fetch constants. No-op unless ac6_fullres_effects.
+  ac6::backend::FxCropCompositorMask(
+      vertex_shader ? vertex_shader->ucode_data_hash() : 0,
+      pixel_shader ? pixel_shader->ucode_data_hash() : 0,
+      &register_file_->values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0]);
+
+  // AC6 full-res effects (THE silhouette fix): the 2:1 silhouette downscaler
+  // (PS 8EE463763E880F35) samples 2*coord from its full-res input; doubling the
+  // fx buffers made its output 1280 wide, so it reads 0..2560 from a 1280-wide
+  // input -> the right half wraps -> 2x2 ghost planes. Restore JUST this draw's
+  // target to 640 wide (hash-gated - no scene-wide effect). Must run before
+  // render_target_cache_->Update and GetHostViewportInfo read these registers.
+  ac6::backend::FxFixDownscalerDraw(
+      pixel_shader ? pixel_shader->ucode_data_hash() : 0,
+      &register_file_->values[XE_GPU_REG_RB_SURFACE_INFO],
+      &register_file_->values[XE_GPU_REG_PA_CL_VPORT_XSCALE],
+      &register_file_->values[XE_GPU_REG_PA_CL_VPORT_YSCALE],
+      &register_file_->values[XE_GPU_REG_PA_CL_VPORT_XOFFSET],
+      &register_file_->values[XE_GPU_REG_PA_CL_VPORT_YOFFSET]);
+
   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
   if (memexport_used_pixel) {
     if (!device_properties.fragmentStoresAndAtomics) {
@@ -3737,6 +3820,29 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   VulkanShader::VulkanTranslation* vertex_shader_translation;
   VulkanShader::VulkanTranslation* pixel_shader_translation;
   bool memexport_writes_possible = memexport_used_vertex || memexport_used_pixel;
+
+  // AC6 HD terrain: the terrain vertex shader is fully data-driven, so a
+  // synthetic ring table (vertex fetch 95 redirect) plus a full-density fan
+  // emission make the unmodified shader draw every shipped height sample -
+  // no more T-junction cracks ("rifts"), and river beds render true.
+  {
+    bool ac6_hd = false;
+    if (REXCVAR_GET(ac6_terrain_hd) && prim_type == xenos::PrimitiveType::kTriangleFan) {
+      uint64_t vs_ucode_hash = vertex_shader->ucode_data_hash();
+      ac6_hd = (vs_ucode_hash == UINT64_C(0x042F34FADAD3F370) ||
+                vs_ucode_hash == UINT64_C(0xD113DCDC8F6AC408)) &&
+               AC6TerrainHdEnsureRing();
+    }
+    if (ac6_hd != ac6_hd_active_) {
+      // The effective vertex fetch constant 95 changes without a guest
+      // register write - drop the residency shortcut and the uploaded copy.
+      ac6_hd_active_ = ac6_hd;
+      InvalidateVertexBufferResidency(95);
+      current_constant_buffers_up_to_date_ &=
+          ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFetch);
+    }
+    primitive_processor_->SetAc6TerrainFanHd(ac6_hd);
+  }
 
   // Two iterations because a submission (even the current one - in which case
   // it needs to be ended, and a new one must be started) may need to be awaited
@@ -4032,6 +4138,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         continue;
       }
       xenos::xe_gpu_vertex_fetch_t vfetch_constant = regs.GetVertexFetch(vfetch_index);
+      if (ac6_hd_active_ && vfetch_index == 95) {
+        // AC6 HD terrain: request residency for the synthetic ring, not for
+        // the authored ring the guest fetch constant points to.
+        vfetch_constant.address = ac6_hd_ring_phys_ >> 2;
+        vfetch_constant.size = 40;
+      }
       switch (vfetch_constant.type) {
         case xenos::FetchConstantType::kVertex:
           break;
@@ -6590,6 +6702,13 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       }
       buffer_info.range = VkDeviceSize(kFetchConstantsSize);
       std::memcpy(mapping, &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], kFetchConstantsSize);
+      if (ac6_hd_active_) {
+        // AC6 HD terrain: point vertex fetch constant 95 at the synthetic
+        // ring. Address bits only - type, endian and size stay authentic.
+        uint32_t* fetch_dwords = reinterpret_cast<uint32_t*>(mapping);
+        fetch_dwords[95 * 2] =
+            (ac6_hd_ring_phys_ & ~uint32_t(3)) | (fetch_dwords[95 * 2] & uint32_t(3));
+      }
       current_constant_buffers_up_to_date_ |= UINT32_C(1)
                                               << SpirvShaderTranslator::kConstantBufferFetch;
     }
