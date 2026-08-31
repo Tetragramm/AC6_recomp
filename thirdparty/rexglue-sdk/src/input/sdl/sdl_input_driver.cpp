@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <chrono>
 #include <array>
 #include <atomic>
 #include <filesystem>
@@ -697,14 +698,53 @@ void SDLInputDriver::UpdateXCapabilities(ControllerState& state) {
 }
 
 void SDLInputDriver::QueueControllerUpdate() {
+  auto now_ms = []() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+  };
+
   // Pump SDL events to ensure controller state is up to date.
   bool is_queued = false;
   sdl_pumpevents_queued_.compare_exchange_strong(is_queued, true);
   if (!is_queued) {
-    attached_window_->app_context().CallInUIThread([this]() {
-      SDL_PumpEvents();
+    attached_window_->app_context().CallInUIThread([this, now_ms]() {
+      {
+        std::lock_guard<std::mutex> pump_lock(sdl_pump_mutex_);
+        SDL_PumpEvents();
+      }
+      sdl_pumpevents_last_ms_.store(now_ms(), std::memory_order_relaxed);
       sdl_pumpevents_queued_ = false;
     });
+  }
+
+  // The queued pump above only runs when the UI thread drains its callback
+  // queue. Controller state is event-driven, so while that thread is busy the
+  // pad stops updating entirely and the guest keeps reading the last delivered
+  // values - the stick appears frozen at whatever was held, then "bursts" back
+  // when the UI thread finally runs. SDL is built here with SDL_VIDEO=OFF, so
+  // there is no windowing thread affinity to respect and the queue can be
+  // pumped from the calling thread; do that whenever the last pump is stale so
+  // input freshness never depends on UI thread latency.
+  constexpr int64_t kPumpStaleMs = 4;  // ~1 frame at 240Hz - well under a frame
+  const int64_t now = now_ms();
+  const int64_t last = sdl_pumpevents_last_ms_.load(std::memory_order_relaxed);
+  if (now - last >= kPumpStaleMs) {
+    {
+      std::lock_guard<std::mutex> pump_lock(sdl_pump_mutex_);
+      SDL_PumpEvents();
+    }
+    sdl_pumpevents_last_ms_.store(now, std::memory_order_relaxed);
+    if (last && now - last >= 100) {
+      static std::atomic<uint32_t> s_stale_logs{0};
+      uint32_t n = s_stale_logs.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (n <= 8 || (n % 64) == 0) {
+        REXLOG_WARN(
+            "[SDL-INPUT] controller state was stale for {}ms (UI thread did not "
+            "pump; #{}) - pumped inline",
+            now - last, n);
+      }
+    }
   }
 }
 

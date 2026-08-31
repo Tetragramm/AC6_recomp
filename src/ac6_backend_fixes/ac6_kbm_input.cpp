@@ -1673,6 +1673,28 @@ PPC_FUNC_IMPL(rex_sub_82211E28) {
     }
   }
 
+  // Flight-context transitions. While FlightActive() is false the flight
+  // injection below is skipped entirely, so the guest keeps whatever stick
+  // values were last written - the controls appear frozen at the last input.
+  // This traces exactly when that happens and for how long, which separates
+  // "the gate closed" from "the flight sim stopped stepping".
+  if (REXCVAR_GET(ac6_kbm_log)) {
+    static bool s_last_flight = false;
+    static int64_t s_flight_since = 0;
+    static int s_flight_lines = 0;
+    const bool flight_now = FlightActive();
+    if (flight_now != s_last_flight && s_flight_lines < 400) {
+      const int64_t now = NowMs();
+      ++s_flight_lines;
+      KbmLog(fmt::format(
+          "flight context -> {} after {}ms as {}; flight stick injection {}",
+          flight_now ? "IN-FLIGHT" : "NOT-IN-FLIGHT", s_flight_since ? now - s_flight_since : 0,
+          s_last_flight ? "IN-FLIGHT" : "NOT-IN-FLIGHT", flight_now ? "RESUMES" : "STOPS"));
+      s_last_flight = flight_now;
+      s_flight_since = now;
+    }
+  }
+
   // Heartbeat: proves the hook runs, shows the gate, and shows raw key
   // detection INDEPENDENT of the gate (so a closed gate is visible too).
   if (REXCVAR_GET(ac6_kbm_log) && (call == 5 || (call % 3000) == 0)) {

@@ -92,6 +92,14 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   bool SDL_Gamepad_initialized_;
   std::atomic<int> sdl_events_unflushed_;
   std::atomic<bool> sdl_pumpevents_queued_;
+  // Controller state is event-driven (SDL_AddEventWatch -> HandleEvent), so it
+  // only advances when SDL_PumpEvents() runs. The queued pump above runs on the
+  // UI thread; when that thread is busy the pad silently freezes at its last
+  // delivered values. These track pump freshness so GetState can pump inline
+  // instead. Guarded by sdl_pump_mutex_ because SDL_PumpEvents is not
+  // documented as safe to call concurrently from two threads.
+  std::atomic<int64_t> sdl_pumpevents_last_ms_{0};
+  std::mutex sdl_pump_mutex_;
   std::array<ControllerState, HID_SDL_USER_COUNT> controllers_;
   std::mutex controllers_mutex_;
   std::mutex event_queue_mutex_;
