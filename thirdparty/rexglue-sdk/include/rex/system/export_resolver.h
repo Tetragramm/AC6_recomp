@@ -38,7 +38,7 @@ struct ExportTag {
   // packed like so:
   // ll...... cccccccc ........ ..bihssi
 
-  static const int CategoryShift = 16;
+  static constexpr int CategoryShift = 16;
 
   // Export is implemented in some form and can be used.
   static const type kImplemented = 1u << 0;

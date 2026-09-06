@@ -84,9 +84,9 @@ class XmpApp : public system::xam::App {
                                 uint32_t buffer_length) override;
 
  private:
-  static const uint32_t kMsgStateChanged = 0x0A000001;
-  static const uint32_t kMsgPlaybackBehaviorChanged = 0x0A000002;
-  static const uint32_t kMsgPlaybackControllerChanged = 0x0A000003;
+  static constexpr uint32_t kMsgStateChanged = 0x0A000001;
+  static constexpr uint32_t kMsgPlaybackBehaviorChanged = 0x0A000002;
+  static constexpr uint32_t kMsgPlaybackControllerChanged = 0x0A000003;
 
   void OnStateChanged();
 
