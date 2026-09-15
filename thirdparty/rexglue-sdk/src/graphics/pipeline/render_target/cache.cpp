@@ -683,11 +683,20 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
   // draw with whatever contents currently are in the render target in this
   // case).
 
+  // A draw that overwrites its whole range (a full-target clear) takes
+  // ownership without copying the previous occupant in - the copy would be
+  // overwritten before anything could read it. This is where the bulk of the
+  // EDRAM emulation cost goes for games that pack many passes into the same
+  // EDRAM range and clear between them.
+  const uint32_t full_overwrite_mask = next_draw_full_overwrite_mask_;
+  next_draw_full_overwrite_mask_ = 0;
   for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
     const std::pair<uint32_t, uint32_t>& rt_base_index = edram_bases_sorted[i];
     uint32_t rt_bit_index = rt_base_index.second;
+    const bool elide = (full_overwrite_mask >> rt_bit_index) & 1;
     ChangeOwnership(rt_keys[rt_bit_index], 0, rt_lengths_tiles[i],
-                    interlock_barrier_only ? nullptr : &last_update_transfers_[rt_bit_index]);
+                    (interlock_barrier_only || elide) ? nullptr
+                                                      : &last_update_transfers_[rt_bit_index]);
   }
 
   if (interlock_barrier_only) {

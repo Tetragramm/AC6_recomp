@@ -544,6 +544,49 @@ class VulkanCommandProcessor : public CommandProcessor {
   // vkQueueBindSparse, to wait correctly on the next attempt.
   std::vector<VkSemaphore> current_submission_wait_semaphores_;
   std::vector<VkPipelineStageFlags> current_submission_wait_stage_masks_;
+  // GPU timestamps (cvar gpu_timestamps). Each submission gets a block of
+  // queries; marks are written at pass changes, EDRAM transfers, resolves and
+  // the swap, and the interval from one mark to the next is attributed to the
+  // first mark's label. Read back when the submission's fence retires and fed
+  // to the profiler as per-frame "gpu-ms/<label>" counters. This is the only
+  // way to know what the host GPU is actually spending a frame on.
+  static constexpr uint32_t kGpuTimerQueriesPerBlock = 512;
+  static constexpr uint32_t kGpuTimerBlocks = 16;
+  struct GpuTimerStamp {
+    uint32_t query;
+    uint32_t label;
+  };
+  struct GpuTimerSubmission {
+    uint64_t submission = 0;
+    uint32_t first_query = 0;
+    std::vector<GpuTimerStamp> marks;
+  };
+  VkQueryPool gpu_timer_pool_ = VK_NULL_HANDLE;
+  double gpu_timer_period_ns_ = 0.0;
+  uint32_t gpu_timer_next_block_ = 0;
+  bool gpu_timer_block_open_ = false;
+  GpuTimerSubmission gpu_timer_current_;
+  std::deque<GpuTimerSubmission> gpu_timer_pending_;
+  std::vector<std::string> gpu_timer_labels_;
+  std::unordered_map<std::string, uint32_t> gpu_timer_label_ids_;
+  std::vector<uint32_t> gpu_timer_counter_ids_;
+  uint64_t gpu_timer_last_pass_key_ = ~uint64_t(0);
+  void GpuTimerInit();
+  void GpuTimerShutdown();
+  void GpuTimerOnSubmissionOpen();
+  void GpuTimerOnSubmissionEnd(uint64_t submission);
+  void GpuTimerRetire();
+  uint32_t GpuTimerLabelId(const std::string& label);
+  void GpuTimerMarkLabel(uint32_t label_id);
+ public:
+  // Writes a timestamp attributing what follows (until the next mark) to
+  // `label`. No-op unless gpu_timestamps is on and a submission is open.
+  void GpuTimerMark(const char* label);
+  // Marks a pass change in IssueDraw: only writes when the key differs from
+  // the previous draw's, so a run of draws to one target is one interval.
+  void GpuTimerMarkPass(uint64_t key, const std::string& label);
+ private:
+
   std::vector<VkFence> submissions_in_flight_fences_;
   std::deque<std::pair<uint64_t, VkSemaphore>> submissions_in_flight_semaphores_;
 

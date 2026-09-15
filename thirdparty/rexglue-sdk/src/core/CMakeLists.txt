@@ -14,6 +14,7 @@ add_library(rexcore STATIC
     logging.cpp
     memory.cpp
     mutex.cpp
+    profiling.cpp
     ring_buffer.cpp
     sha256.cpp
     string.cpp

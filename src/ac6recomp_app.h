@@ -13,6 +13,7 @@
 #include <rex/graphics/vulkan/graphics_system.h>
 #endif
 
+#include "ac6_backend_fixes/ac6_swap_pacing_fix.h"
 #include "ac6_native_graphics.h"
 #include "ac6_native_graphics_overlay.h"
 #include "render_hooks.h"
@@ -92,6 +93,9 @@ class Ac6recompApp : public rex::ReXApp {
             ::ac6::graphics::OnFrameBoundary(memory);
         });
         REXLOG_INFO("Ac6recompApp: Native frame boundary callback registered");
+        if (auto* concrete = dynamic_cast<rex::graphics::GraphicsSystem*>(graphics_sys)) {
+            ac6::backend::InstallSwapPacingFix(concrete);
+        }
     }
   }
 

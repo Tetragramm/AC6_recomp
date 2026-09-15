@@ -444,6 +444,7 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
 }
 
 void TextureCache::RequestTextures(uint32_t used_texture_mask) {
+  SCOPE_profile_cpu_f("gpu");
   const auto& regs = register_file();
 
   if (texture_became_outdated_.exchange(false, std::memory_order_acquire)) {

@@ -10,6 +10,11 @@
  */
 
 #include <algorithm>
+#include <cstdio>
+#include <string>
+#include <unordered_map>
+#include <chrono>
+#include <mutex>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -23,6 +28,7 @@
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
+#include <rex/dbg.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/shader/spirv_builder.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
@@ -61,6 +67,8 @@ REXCVAR_DEFINE_STRING(render_target_path_vulkan, "", "GPU/Vulkan",
 //     "  Choose what is considered the most optimal for the system (currently "
 //     "always FB because the FSI path is much slower now).",
 //     "GPU");
+
+REXCVAR_DECLARE(bool, gpu_timestamps);
 
 namespace rex::graphics::vulkan {
 
@@ -1332,6 +1340,7 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
                                       VulkanSharedMemory& shared_memory,
                                       VulkanTextureCache& texture_cache,
                                       uint32_t& written_address_out, uint32_t& written_length_out) {
+  SCOPE_profile_cpu_f("gpu");
   written_address_out = 0;
   written_length_out = 0;
 
@@ -1609,6 +1618,7 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
 bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
                                      reg::RB_DEPTHCONTROL normalized_depth_control,
                                      uint32_t normalized_color_mask, const Shader& vertex_shader) {
+  SCOPE_profile_cpu_f("gpu");
   if (!RenderTargetCache::Update(is_rasterization_done, normalized_depth_control,
                                  normalized_color_mask, vertex_shader)) {
     return false;
@@ -4791,7 +4801,20 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
     const std::vector<Transfer>* render_target_transfers,
     const uint64_t* render_target_resolve_clear_values,
     const Transfer::Rectangle* resolve_clear_rectangle) {
+  SCOPE_profile_cpu_f("gpu");
   assert_true(GetPath() == Path::kHostRenderTargets);
+  {
+    // Only worth a mark when there is actually something to do.
+    bool any = resolve_clear_rectangle != nullptr;
+    for (uint32_t i = 0; !any && i < render_target_count; ++i) {
+      any = render_target_transfers && !render_target_transfers[i].empty();
+    }
+    if (any) {
+      command_processor_.GpuTimerMark("edram ownership transfers");
+      // The next draw's pass mark closes this interval; force it to re-mark.
+      command_processor_.GpuTimerMarkPass(~uint64_t(0) - 1, "edram ownership transfers");
+    }
+  }
 
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
   uint64_t current_submission = command_processor_.GetCurrentSubmission();
@@ -4889,6 +4912,7 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
             uint32_t(offsetof(HostDepthStoreConstants, rectangle)),
             sizeof(host_depth_store_rectangle_constant), &host_depth_store_rectangle_constant);
         command_processor_.SubmitBarriers(true);
+        COUNT_profile_add("gpu/edram_depth_store_dispatches", 1);
         command_buffer.CmdVkDispatch(group_count_x, group_count_y, 1);
         MarkEdramBufferModified();
       }
@@ -5084,6 +5108,18 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
       // switches. Also gather stencil rectangles to clear if needed.
       bool need_stencil_bit_draws =
           dest_rt_key.is_depth && !vulkan_device->extensions().ext_EXT_shader_stencil_export;
+      {
+        static bool logged = false;
+        if (!logged && dest_rt_key.is_depth) {
+          logged = true;
+          REXGPU_ERROR("EDRAM transfers: device '{}' shader_stencil_export={} -> depth transfers "
+                       "use {}",
+                       vulkan_device->properties().deviceName,
+                       vulkan_device->extensions().ext_EXT_shader_stencil_export,
+                       need_stencil_bit_draws ? "8 masked stencil-bit draws per sample"
+                                              : "single-pass stencil export");
+        }
+      }
       current_transfer_invocations_.clear();
       current_transfer_invocations_.reserve(current_transfers.size()
                                             << uint32_t(need_stencil_bit_draws));
@@ -5301,6 +5337,48 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
                                                             << uint32_t(dest_rt_key.msaa_samples);
         bool transfer_is_stencil_bit = (transfer_pipeline_layout_info.used_push_constant_dwords &
                                         kTransferUsedPushConstantDwordStencilMaskBit) != 0;
+        {
+          // GPU-time attribution by transfer kind, so a heavy "ownership
+          // transfers" total can be split into the stencil-bit passes (which
+          // AC6 relies on - the tile-seam fix lives there), depth copies and
+          // colour copies (which may well copy contents the game never reads).
+          const char* transfer_label = transfer_is_stencil_bit ? "edram transfer stencil-bits"
+                                       : dest_rt_key.is_depth  ? "edram transfer depth"
+                                                               : "edram transfer color";
+          command_processor_.GpuTimerMark(transfer_label);
+          COUNT_profile_add("gpu/edram_transfer_batches", 1);
+          // Which EDRAM reuse patterns cause the transfers: (source -> dest)
+          // key histogram, printed once a second. Reads "base/pitch/msaa/fmt".
+          if (REXCVAR_GET(gpu_timestamps)) {
+            const auto& src_rt = *static_cast<const VulkanRenderTarget*>(it->transfer.source);
+            const RenderTargetKey sk = src_rt.key();
+            char buf[96];
+            std::snprintf(buf, sizeof(buf), "%s: %s %u/%u/%ux -> %s %u/%u/%ux x%u rects",
+                          transfer_is_stencil_bit ? "S" : dest_rt_key.is_depth ? "D" : "C",
+                          sk.is_depth ? "depth" : "color", uint32_t(sk.base_tiles),
+                          uint32_t(sk.GetPitchTiles()), 1u << uint32_t(sk.msaa_samples),
+                          dest_rt_key.is_depth ? "depth" : "color", uint32_t(dest_rt_key.base_tiles),
+                          uint32_t(dest_pitch_tiles), 1u << uint32_t(dest_rt_key.msaa_samples),
+                          transfer_rectangle_count);
+            static std::mutex hist_mutex;
+            static std::unordered_map<std::string, uint32_t> hist;
+            static auto last = std::chrono::steady_clock::now();
+            std::lock_guard<std::mutex> lock(hist_mutex);
+            ++hist[buf];
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last >= std::chrono::seconds(3)) {
+              last = now;
+              std::vector<std::pair<uint32_t, std::string>> rows;
+              for (auto& kv : hist) rows.emplace_back(kv.second, kv.first);
+              std::sort(rows.rbegin(), rows.rend());
+              REXGPU_ERROR("[EDRAM-XFER] transfer batches in the last 3s, by pattern:");
+              for (size_t i = 0; i < rows.size() && i < 12; ++i) {
+                REXGPU_ERROR("[EDRAM-XFER]   {:6}  {}", rows[i].first, rows[i].second);
+              }
+              hist.clear();
+            }
+          }
+        }
 
         uint32_t transfer_vertex_count = 6 * transfer_rectangle_count;
         VkBuffer transfer_vertex_buffer;
@@ -5509,6 +5587,7 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
               command_buffer.CmdVkSetStencilWriteMask(VK_STENCIL_FACE_FRONT_AND_BACK,
                                                       transfer_stencil_bit);
             }
+            COUNT_profile_add("gpu/edram_transfer_draws", 1);
             command_buffer.CmdVkDraw(transfer_vertex_count, 1, 0, 0);
           }
         }

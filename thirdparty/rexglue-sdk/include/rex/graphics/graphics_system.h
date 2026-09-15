@@ -81,6 +81,24 @@ class GraphicsSystem : public system::IGraphicsSystem {
                              uint64_t* out_sequence = nullptr) const;
   void DispatchInterruptCallback(uint32_t source, uint32_t cpu);
 
+  // Runs a guest function on the calling (command-processor) thread, the way
+  // the interrupt callback is run. For game-specific hooks that need to poke
+  // the guest's own GPU bookkeeping from the CP side.
+  uint64_t DispatchGuestCall(uint32_t address, uint32_t arg0, uint32_t arg1 = 0);
+  uint32_t interrupt_callback_data() const { return interrupt_callback_data_; }
+
+  // Called by the command processor when a WAIT_REG_MEM on guest memory is
+  // not satisfied and is about to sleep. Lets a game-specific fix advance
+  // whatever guest-side state the wait depends on (AC6's swap flag is cleared
+  // by the vblank ISR, which vsync-throttles the ring).
+  using WaitMemoryHook = std::function<void(uint32_t guest_physical_address)>;
+  void SetWaitMemoryHook(WaitMemoryHook hook) { wait_memory_hook_ = std::move(hook); }
+  void OnWaitMemory(uint32_t guest_physical_address) {
+    if (wait_memory_hook_) {
+      wait_memory_hook_(guest_physical_address);
+    }
+  }
+
   virtual void ClearCaches();
   virtual void InvalidateGpuMemory();
 
@@ -119,6 +137,8 @@ class GraphicsSystem : public system::IGraphicsSystem {
   // hold the target. Combine with a free-running guest vblank so the vblank
   // wait never gates. target_hz 0 = off. Process-wide, not per-instance.
   static void SetGuestPresentPacing(double target_hz);
+  // Current present-pacing target, 0 when the pacer is not gating the swap.
+  static double GetGuestPresentPacing();
   // Called by VdSwap on the swapping guest thread before it submits the next
   // swap; blocks per SetGuestPresentPacing. No-op while pacing is off.
   static void PaceGuestPresent();
@@ -166,6 +186,7 @@ class GraphicsSystem : public system::IGraphicsSystem {
   uint64_t last_swap_submission_sequence_ = 0;
 
   std::function<void(rex::memory::Memory*)> frame_boundary_callback_;
+  WaitMemoryHook wait_memory_hook_;
 
   RegisterFile register_file_;
   std::unique_ptr<CommandProcessor> command_processor_;
