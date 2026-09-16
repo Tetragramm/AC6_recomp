@@ -74,6 +74,14 @@ REXCVAR_DEFINE_BOOL(ac6_edram_no_transfers, false, "AC6/Enhancements",
                     "ownership change. Logs every transfer it skips ([EDRAM-SKIP]) so the "
                     "aliases the game actually relies on can be identified.");
 
+REXCVAR_DEFINE_BOOL(ac6_edram_skip_stencil_transfers, false, "AC6/Enhancements",
+                    "Don't carry stencil across EDRAM ownership transfers. Worth about 1 ms of a "
+                    "4K / scale 3 frame, and two missions looked identical with it on - but the "
+                    "game does test stencil (about 114 draws a frame read it with a real compare "
+                    "function), so a scene that depends on stencil surviving a reinterpretation "
+                    "would break. Turn it off if masked effects misbehave")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(vulkan_edram_stencil_transfer_compute, true, "GPU",
                     "Without VK_EXT_shader_stencil_export, transfer stencil into single-sampled "
                     "depth render targets with one compute dispatch and a buffer-to-image copy "
@@ -5577,14 +5585,18 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
 
       // Gather shader keys and sort to reduce pipeline state and binding
       // switches. Also gather stencil rectangles to clear if needed.
-      bool need_stencil_bit_draws =
-          dest_rt_key.is_depth && !vulkan_device->extensions().ext_EXT_shader_stencil_export;
+      bool stencil_export = vulkan_device->extensions().ext_EXT_shader_stencil_export;
+      bool need_stencil_bit_draws = dest_rt_key.is_depth && !stencil_export;
+      // Diagnostic: leave the destination stencil alone entirely, to see
+      // whether the game reads any of what these passes carry.
+      bool skip_stencil = need_stencil_bit_draws &&
+                          REXCVAR_GET(ac6_edram_skip_stencil_transfers);
       // Single-sampled destinations take the compute + buffer copy route
       // instead of the eight masked draws, recorded before the render pass.
-      bool stencil_via_compute = need_stencil_bit_draws &&
+      bool stencil_via_compute = need_stencil_bit_draws && !skip_stencil &&
                                  dest_rt_key.msaa_samples == xenos::MsaaSamples::k1X &&
                                  REXCVAR_GET(vulkan_edram_stencil_transfer_compute);
-      if (stencil_via_compute) {
+      if (stencil_via_compute || skip_stencil) {
         need_stencil_bit_draws = false;
       }
       {
@@ -5592,11 +5604,14 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
         if (!logged && dest_rt_key.is_depth) {
           logged = true;
           REXGPU_ERROR("EDRAM transfers: device '{}' shader_stencil_export={} -> depth transfers "
-                       "use {}",
-                       vulkan_device->properties().deviceName,
-                       vulkan_device->extensions().ext_EXT_shader_stencil_export,
-                       need_stencil_bit_draws ? "8 masked stencil-bit draws per sample"
-                                              : "single-pass stencil export");
+                       "write stencil with {}",
+                       vulkan_device->properties().deviceName, stencil_export,
+                       stencil_export      ? "single-pass stencil export"
+                       : skip_stencil      ? "NOTHING (ac6_edram_skip_stencil_transfers)"
+                       : stencil_via_compute
+                           ? "a compute pass and a buffer copy where the destination is 1x, "
+                             "8 masked draws otherwise"
+                           : "8 masked draws per sample");
         }
       }
       current_transfer_invocations_.clear();
@@ -5717,7 +5732,7 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
         }
       }
 
-      if (stencil_via_compute) {
+      if (stencil_via_compute && !skip_stencil) {
         if (!RecordStencilBufferTransfers(dest_vulkan_rt, current_transfers,
                                           resolve_clear_rectangle)) {
           REXGPU_ERROR("VulkanRenderTargetCache: stencil transfer via compute failed; stencil "
@@ -5730,6 +5745,9 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
       command_processor_.SubmitBarriersAndEnterRenderTargetCacheRenderPass(
           transfer_render_pass, transfer_framebuffer, transfer_dest_view, dest_rt_key.is_depth);
 
+      if (skip_stencil) {
+        stencil_clear_rectangle_count = 0;
+      }
       if (stencil_clear_rectangle_count) {
         VkClearAttachment* stencil_clear_attachment;
         VkClearRect* stencil_clear_rect_write_ptr;

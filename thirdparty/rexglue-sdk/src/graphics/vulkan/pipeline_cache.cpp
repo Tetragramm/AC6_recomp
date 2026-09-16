@@ -1531,6 +1531,14 @@ bool VulkanPipelineCache::GetCurrentStateDescription(
         description_out.depth_compare_op = xenos::CompareFunction::kAlways;
       }
       if (normalized_depth_control.stencil_enable) {
+        // Whether the game ever tests stencil at all decides whether carrying
+        // stencil across EDRAM ownership transfers is needed - the transfers
+        // are among the most expensive things in the frame without
+        // VK_EXT_shader_stencil_export.
+        COUNT_profile_add("gpu/draws_with_stencil_test", 1);
+        if (normalized_depth_control.stencilfunc != xenos::CompareFunction::kAlways) {
+          COUNT_profile_add("gpu/draws_reading_stencil", 1);
+        }
         description_out.stencil_test_enable = 1;
         description_out.stencil_front_fail_op = normalized_depth_control.stencilfail;
         description_out.stencil_front_pass_op = normalized_depth_control.stencilzpass;
