@@ -247,6 +247,14 @@ class DeferredCommandBuffer {
     args.filter = filter;
     return reinterpret_cast<VkImageBlit*>(args_ptr + header_size);
   }
+  void CmdVkFillBuffer(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size, uint32_t data) {
+    auto& args = *reinterpret_cast<ArgsVkFillBuffer*>(
+        WriteCommand(Command::kVkFillBuffer, sizeof(ArgsVkFillBuffer)));
+    args.buffer = buffer;
+    args.offset = offset;
+    args.size = size;
+    args.data = data;
+  }
   VkImageResolve* CmdResolveImageEmplace(VkImage src_image, VkImageLayout src_image_layout,
                                          VkImage dst_image, VkImageLayout dst_image_layout,
                                          uint32_t region_count) {
@@ -450,6 +458,7 @@ class DeferredCommandBuffer {
     kVkResolveImage,
     kVkCopyQueryPoolResults,
     kVkDispatch,
+    kVkFillBuffer,
     kVkDraw,
     kVkDrawIndexed,
     kVkEndQuery,
@@ -588,6 +597,13 @@ class DeferredCommandBuffer {
     uint32_t region_count;
     VkFilter filter;
     // Followed by aligned VkImageBlit[region_count].
+  };
+
+  struct ArgsVkFillBuffer {
+    VkBuffer buffer;
+    VkDeviceSize offset;
+    VkDeviceSize size;
+    uint32_t data;
   };
 
   struct ArgsVkCopyImageToBuffer {

@@ -74,6 +74,17 @@ REXCVAR_DEFINE_BOOL(ac6_edram_no_transfers, false, "AC6/Enhancements",
                     "ownership change. Logs every transfer it skips ([EDRAM-SKIP]) so the "
                     "aliases the game actually relies on can be identified.");
 
+REXCVAR_DEFINE_BOOL(vulkan_edram_stencil_transfer_compute, true, "GPU",
+                    "Without VK_EXT_shader_stencil_export, transfer stencil into single-sampled "
+                    "depth render targets with one compute dispatch and a buffer-to-image copy "
+                    "per rectangle instead of eight masked draws")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(vulkan_edram_stencil_copy_general, false, "GPU",
+                    "A/B: copy the stencil bytes with the destination in the GENERAL layout "
+                    "instead of TRANSFER_DST_OPTIMAL")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(vulkan_resolve_to_texture_msaa, true, "GPU",
                     "Also resolve multisampled render targets into texture images with "
                     "vkCmdResolveImage when the resolve averages all samples")
@@ -846,6 +857,43 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
       Shutdown();
       return false;
     }
+
+    // Stencil transfer compute pipeline layouts: same sets as dumping (output
+    // buffer, then the source), wider push constants.
+    VkPushConstantRange stencil_compute_push_constant_range;
+    stencil_compute_push_constant_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    stencil_compute_push_constant_range.offset = 0;
+    stencil_compute_push_constant_range.size = sizeof(StencilComputePushConstants);
+    // The output set is the command processor's transient storage buffer
+    // descriptor, so its layout must be the one those are allocated with.
+    VkDescriptorSetLayout stencil_compute_descriptor_set_layouts[kDumpDescriptorSetCount];
+    stencil_compute_descriptor_set_layouts[kDumpDescriptorSetEdram] =
+        command_processor_.GetSingleTransientDescriptorLayout(
+            VulkanCommandProcessor::SingleTransientDescriptorLayout::kStorageBufferCompute);
+    stencil_compute_descriptor_set_layouts[kDumpDescriptorSetSource] =
+        descriptor_set_layout_sampled_image_x2_;
+    VkPipelineLayoutCreateInfo stencil_compute_pipeline_layout_create_info =
+        dump_pipeline_layout_create_info;
+    stencil_compute_pipeline_layout_create_info.pSetLayouts =
+        stencil_compute_descriptor_set_layouts;
+    stencil_compute_pipeline_layout_create_info.pPushConstantRanges =
+        &stencil_compute_push_constant_range;
+    if (dfn.vkCreatePipelineLayout(device, &stencil_compute_pipeline_layout_create_info, nullptr,
+                                   &stencil_compute_pipeline_layout_depth_) != VK_SUCCESS) {
+      REXGPU_ERROR("VulkanRenderTargetCache: Failed to create the depth stencil transfer pipeline "
+                   "layout");
+      Shutdown();
+      return false;
+    }
+    stencil_compute_descriptor_set_layouts[kDumpDescriptorSetSource] =
+        descriptor_set_layout_sampled_image_;
+    if (dfn.vkCreatePipelineLayout(device, &stencil_compute_pipeline_layout_create_info, nullptr,
+                                   &stencil_compute_pipeline_layout_color_) != VK_SUCCESS) {
+      REXGPU_ERROR("VulkanRenderTargetCache: Failed to create the color stencil transfer pipeline "
+                   "layout");
+      Shutdown();
+      return false;
+    }
   } else if (path_ == Path::kPixelShaderInterlock) {
     // Pixel (fragment) shader interlock.
 
@@ -1046,6 +1094,16 @@ void VulkanRenderTargetCache::Shutdown(bool from_destructor) {
                                          dump_pipeline_layout_depth_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
                                          dump_pipeline_layout_color_);
+  for (const auto& stencil_compute_pipeline_pair : stencil_compute_pipelines_) {
+    if (stencil_compute_pipeline_pair.second != VK_NULL_HANDLE) {
+      dfn.vkDestroyPipeline(device, stencil_compute_pipeline_pair.second, nullptr);
+    }
+  }
+  stencil_compute_pipelines_.clear();
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
+                                         stencil_compute_pipeline_layout_depth_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
+                                         stencil_compute_pipeline_layout_color_);
 
   for (const auto& transfer_pipeline_array_pair : transfer_pipelines_) {
     for (VkPipeline transfer_pipeline : transfer_pipeline_array_pair.second) {
@@ -2210,7 +2268,9 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
   if (key.is_depth) {
     image_create_info.format = GetDepthVulkanFormat(key.GetDepthFormat());
     transfer_format = image_create_info.format;
-    image_create_info.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    // Transfer destination for the stencil transfer's buffer-to-image copy.
+    image_create_info.usage |=
+        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
   } else {
     xenos::ColorRenderTargetFormat color_format = key.GetColorFormat();
     image_create_info.format = GetColorVulkanFormat(color_format);
@@ -2651,6 +2711,12 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
   const TransferModeInfo& mode = kTransferModes[size_t(key.mode)];
   const TransferPipelineLayoutInfo& pipeline_layout_info =
       kTransferPipelineLayoutInfos[size_t(mode.pipeline_layout)];
+  // Compute variant of the stencil bit transfer: set 0 is the output buffer
+  // and the source sets follow; the destination pixel comes from the
+  // invocation id; the stencil byte goes to the buffer instead of a kill.
+  const bool stencil_compute = key.stencil_compute != 0;
+  assert_true(!stencil_compute || mode.output == TransferOutput::kStencilBit);
+  const uint32_t source_descriptor_set_base = stencil_compute ? 1 : 0;
 
   // If not dest_is_color, it's depth, or stencil bit - 40-sample columns are
   // swapped as opposed to color source.
@@ -2767,8 +2833,9 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
                               source_is_multisampled, 1, spv::ImageFormatUnknown),
         "xe_transfer_color");
     builder.addDecoration(source_color_texture, spv::DecorationDescriptorSet,
-                          rex::bit_count(pipeline_layout_info.used_descriptor_sets &
-                                         (kTransferUsedDescriptorSetColorTextureBit - 1)));
+                          source_descriptor_set_base +
+                              rex::bit_count(pipeline_layout_info.used_descriptor_sets &
+                                             (kTransferUsedDescriptorSetColorTextureBit - 1)));
     builder.addDecoration(source_color_texture, spv::DecorationBinding, 0);
   }
   // Depth / stencil source.
@@ -2777,6 +2844,7 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
   if (pipeline_layout_info.used_descriptor_sets &
       kTransferUsedDescriptorSetDepthStencilTexturesBit) {
     uint32_t source_depth_stencil_descriptor_set =
+        source_descriptor_set_base +
         rex::bit_count(pipeline_layout_info.used_descriptor_sets &
                        (kTransferUsedDescriptorSetDepthStencilTexturesBit - 1));
     // Using `depth == false` in makeImageType because comparisons are not
@@ -2848,24 +2916,67 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
   // Push constants.
   id_vector_temp.clear();
   uint32_t push_constants_member_host_depth_address = UINT32_MAX;
-  if (pipeline_layout_info.used_push_constant_dwords &
+  // Stencil compute output buffer and push constants (StencilComputePushConstants).
+  spv::Id stencil_compute_output_buffer = spv::NoResult;
+  spv::Id stencil_compute_push_constants = spv::NoResult;
+  if (stencil_compute) {
+    id_vector_temp.clear();
+    id_vector_temp.push_back(builder.makeRuntimeArray(type_uint));
+    builder.addDecoration(id_vector_temp.back(), spv::DecorationArrayStride, sizeof(uint32_t));
+    spv::Id type_stencil_output_buffer =
+        builder.makeStructType(id_vector_temp, "XeTransferStencilOutputBuffer");
+    builder.addMemberName(type_stencil_output_buffer, 0, "stencil");
+    builder.addMemberDecoration(type_stencil_output_buffer, 0, spv::DecorationOffset, 0);
+    builder.addDecoration(type_stencil_output_buffer, spv::DecorationBufferBlock);
+    stencil_compute_output_buffer =
+        builder.createVariable(spv::NoPrecision, spv::StorageClassUniform,
+                               type_stencil_output_buffer, "xe_transfer_stencil_output");
+    builder.addDecoration(stencil_compute_output_buffer, spv::DecorationDescriptorSet, 0);
+    builder.addDecoration(stencil_compute_output_buffer, spv::DecorationBinding, 0);
+
+    id_vector_temp.clear();
+    for (uint32_t i = 0; i < 7; ++i) {
+      id_vector_temp.push_back(type_uint);
+    }
+    spv::Id type_stencil_push_constants =
+        builder.makeStructType(id_vector_temp, "XeTransferStencilComputePushConstants");
+    static const char* const kMemberNames[] = {"address",     "rect_x",    "rect_y",
+                                               "rect_width",  "rect_height", "row_pitch",
+                                               "buffer_offset"};
+    for (uint32_t i = 0; i < 7; ++i) {
+      builder.addMemberName(type_stencil_push_constants, i, kMemberNames[i]);
+      builder.addMemberDecoration(type_stencil_push_constants, i, spv::DecorationOffset,
+                                  sizeof(uint32_t) * i);
+    }
+    builder.addDecoration(type_stencil_push_constants, spv::DecorationBlock);
+    stencil_compute_push_constants =
+        builder.createVariable(spv::NoPrecision, spv::StorageClassPushConstant,
+                               type_stencil_push_constants, "xe_transfer_push_constants");
+    id_vector_temp.clear();
+  }
+  if (!stencil_compute && pipeline_layout_info.used_push_constant_dwords &
       kTransferUsedPushConstantDwordHostDepthAddressBit) {
     push_constants_member_host_depth_address = uint32_t(id_vector_temp.size());
     id_vector_temp.push_back(type_uint);
   }
   uint32_t push_constants_member_address = UINT32_MAX;
-  if (pipeline_layout_info.used_push_constant_dwords & kTransferUsedPushConstantDwordAddressBit) {
+  if (!stencil_compute &&
+      pipeline_layout_info.used_push_constant_dwords & kTransferUsedPushConstantDwordAddressBit) {
     push_constants_member_address = uint32_t(id_vector_temp.size());
     id_vector_temp.push_back(type_uint);
   }
   uint32_t push_constants_member_stencil_mask = UINT32_MAX;
-  if (pipeline_layout_info.used_push_constant_dwords &
+  if (!stencil_compute && pipeline_layout_info.used_push_constant_dwords &
       kTransferUsedPushConstantDwordStencilMaskBit) {
     push_constants_member_stencil_mask = uint32_t(id_vector_temp.size());
     id_vector_temp.push_back(type_uint);
   }
   spv::Id push_constants = spv::NoResult;
-  if (!id_vector_temp.empty()) {
+  if (stencil_compute) {
+    // The address constant is member 0 of the compute push constants.
+    push_constants = stencil_compute_push_constants;
+    push_constants_member_address = 0;
+  } else if (!id_vector_temp.empty()) {
     spv::Id type_push_constants = builder.makeStructType(id_vector_temp, "XeTransferPushConstants");
     if (pipeline_layout_info.used_push_constant_dwords &
         kTransferUsedPushConstantDwordHostDepthAddressBit) {
@@ -2902,12 +3013,38 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
   }
 
   // Coordinate inputs.
-  spv::Id input_fragment_coord =
-      builder.createVariable(spv::NoPrecision, spv::StorageClassInput, type_float4, "gl_FragCoord");
-  builder.addDecoration(input_fragment_coord, spv::DecorationBuiltIn, spv::BuiltInFragCoord);
-  main_interface.push_back(input_fragment_coord);
+  spv::Id input_fragment_coord = spv::NoResult;
+  spv::Id input_global_invocation_id = spv::NoResult;
+  spv::Id input_local_invocation_index = spv::NoResult;
+  spv::Id stencil_compute_tile = spv::NoResult;
+  if (stencil_compute) {
+    input_global_invocation_id =
+        builder.createVariable(spv::NoPrecision, spv::StorageClassInput,
+                               builder.makeVectorType(type_uint, 3), "gl_GlobalInvocationID");
+    builder.addDecoration(input_global_invocation_id, spv::DecorationBuiltIn,
+                          spv::BuiltInGlobalInvocationId);
+    main_interface.push_back(input_global_invocation_id);
+    input_local_invocation_index = builder.createVariable(
+        spv::NoPrecision, spv::StorageClassInput, type_uint, "gl_LocalInvocationIndex");
+    builder.addDecoration(input_local_invocation_index, spv::DecorationBuiltIn,
+                          spv::BuiltInLocalInvocationIndex);
+    main_interface.push_back(input_local_invocation_index);
+    // The workgroup's 8x8 stencil bytes as 16 dwords, assembled with
+    // workgroup-local atomics and stored as whole dwords - no global atomics
+    // and no need to zero the output buffer.
+    static_assert(kStencilComputeGroupSizeX == 8 && kStencilComputeGroupSizeY == 8);
+    stencil_compute_tile = builder.createVariable(
+        spv::NoPrecision, spv::StorageClassWorkgroup,
+        builder.makeArrayType(type_uint, builder.makeUintConstant(16), 0), "xe_stencil_tile");
+  } else {
+    input_fragment_coord = builder.createVariable(spv::NoPrecision, spv::StorageClassInput,
+                                                  type_float4, "gl_FragCoord");
+    builder.addDecoration(input_fragment_coord, spv::DecorationBuiltIn, spv::BuiltInFragCoord);
+    main_interface.push_back(input_fragment_coord);
+  }
   spv::Id input_sample_id = spv::NoResult;
   spv::Id spec_const_sample_id = spv::NoResult;
+  assert_true(!stencil_compute || key.dest_msaa_samples == xenos::MsaaSamples::k1X);
   if (key.dest_msaa_samples != xenos::MsaaSamples::k1X) {
     if (device_properties.sampleRateShading) {
       // One draw for all samples.
@@ -2949,11 +3086,68 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
   uint_vector_temp.clear();
   uint_vector_temp.push_back(0);
   uint_vector_temp.push_back(1);
-  spv::Id dest_pixel_coord = builder.createUnaryOp(
-      spv::OpConvertFToU, type_uint2,
-      builder.createRvalueSwizzle(spv::NoPrecision, type_float2,
-                                  builder.createLoad(input_fragment_coord, spv::NoPrecision),
-                                  uint_vector_temp));
+  spv::Id dest_pixel_coord;
+  // Compute: the invocation within the rectangle, and its byte index in the
+  // output buffer (row-major at the row pitch).
+  spv::Id stencil_compute_rect_coord = spv::NoResult;
+  std::unique_ptr<SpirvBuilder::IfBuilder> stencil_compute_in_rect_if;
+  auto load_stencil_compute_push_constant = [&](uint32_t member) {
+    id_vector_temp.clear();
+    id_vector_temp.push_back(builder.makeIntConstant(int32_t(member)));
+    return builder.createLoad(builder.createAccessChain(spv::StorageClassPushConstant,
+                                                        stencil_compute_push_constants,
+                                                        id_vector_temp),
+                              spv::NoPrecision);
+  };
+  if (stencil_compute) {
+    stencil_compute_rect_coord = builder.createRvalueSwizzle(
+        spv::NoPrecision, type_uint2,
+        builder.createLoad(input_global_invocation_id, spv::NoPrecision), uint_vector_temp);
+    spv::Id rect_x = builder.createCompositeExtract(stencil_compute_rect_coord, type_uint, 0);
+    spv::Id rect_y = builder.createCompositeExtract(stencil_compute_rect_coord, type_uint, 1);
+    // Zero the tile (lanes 0-15), then the whole workgroup waits.
+    {
+      spv::Id local_index = builder.createLoad(input_local_invocation_index, spv::NoPrecision);
+      SpirvBuilder::IfBuilder tile_zero_if(
+          builder.createBinOp(spv::OpULessThan, type_bool, local_index,
+                              builder.makeUintConstant(16)),
+          spv::SelectionControlMaskNone, builder);
+      id_vector_temp.clear();
+      id_vector_temp.push_back(local_index);
+      builder.createStore(builder.makeUintConstant(0),
+                          builder.createAccessChain(spv::StorageClassWorkgroup,
+                                                    stencil_compute_tile, id_vector_temp));
+      tile_zero_if.makeEndIf();
+      builder.createControlBarrier(spv::ScopeWorkgroup, spv::ScopeWorkgroup,
+                                   spv::MemorySemanticsWorkgroupMemoryMask |
+                                       spv::MemorySemanticsAcquireReleaseMask);
+    }
+    // Out of the rectangle (the dispatch is rounded up to the group size):
+    // skip the fetch, but stay for the barrier and the store.
+    stencil_compute_in_rect_if = std::make_unique<SpirvBuilder::IfBuilder>(
+        builder.createBinOp(
+            spv::OpLogicalAnd, type_bool,
+            builder.createBinOp(spv::OpULessThan, type_bool, rect_x,
+                                load_stencil_compute_push_constant(3)),
+            builder.createBinOp(spv::OpULessThan, type_bool, rect_y,
+                                load_stencil_compute_push_constant(4))),
+        spv::SelectionControlMaskNone, builder);
+    // (The loads reuse id_vector_temp, so take them before building the list.)
+    spv::Id rect_origin_x = load_stencil_compute_push_constant(1);
+    spv::Id rect_origin_y = load_stencil_compute_push_constant(2);
+    id_vector_temp.clear();
+    id_vector_temp.push_back(rect_origin_x);
+    id_vector_temp.push_back(rect_origin_y);
+    dest_pixel_coord =
+        builder.createBinOp(spv::OpIAdd, type_uint2, stencil_compute_rect_coord,
+                            builder.createCompositeConstruct(type_uint2, id_vector_temp));
+  } else {
+    dest_pixel_coord = builder.createUnaryOp(
+        spv::OpConvertFToU, type_uint2,
+        builder.createRvalueSwizzle(spv::NoPrecision, type_float2,
+                                    builder.createLoad(input_fragment_coord, spv::NoPrecision),
+                                    uint_vector_temp));
+  }
   spv::Id dest_pixel_x = builder.createCompositeExtract(dest_pixel_coord, type_uint, 0);
   spv::Id const_dest_tile_width_pixels = builder.makeUintConstant(
       tile_width_samples >>
@@ -4543,7 +4737,30 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
         }
       } break;
       case TransferOutput::kStencilBit: {
-        if (packed) {
+        if (stencil_compute) {
+          // The whole stencil byte, OR-ed into the workgroup tile (four pixels
+          // per dword).
+          spv::Id stencil_value =
+              packed ? builder.createBinOp(spv::OpBitwiseAnd, type_uint, packed,
+                                           builder.makeUintConstant(0xFF))
+                     : builder.makeUintConstant(0xFF);
+          spv::Id local_index = builder.createLoad(input_local_invocation_index, spv::NoPrecision);
+          spv::Id shifted_value = builder.createBinOp(
+              spv::OpShiftLeftLogical, type_uint, stencil_value,
+              builder.createBinOp(spv::OpShiftLeftLogical, type_uint,
+                                  builder.createBinOp(spv::OpBitwiseAnd, type_uint, local_index,
+                                                      builder.makeUintConstant(3)),
+                                  builder.makeUintConstant(3)));
+          id_vector_temp.clear();
+          id_vector_temp.push_back(builder.createBinOp(spv::OpShiftRightLogical, type_uint,
+                                                       local_index, builder.makeUintConstant(2)));
+          spv::Id dword_pointer = builder.createAccessChain(
+              spv::StorageClassWorkgroup, stencil_compute_tile, id_vector_temp);
+          builder.createQuadOp(spv::OpAtomicOr, type_uint, dword_pointer,
+                               builder.makeUintConstant(uint32_t(spv::ScopeWorkgroup)),
+                               builder.makeUintConstant(uint32_t(spv::MemorySemanticsMaskNone)),
+                               shifted_value);
+        } else if (packed) {
           // Kill the sample if the needed stencil bit is not set.
           assert_true(push_constants_member_stencil_mask != UINT32_MAX);
           id_vector_temp.clear();
@@ -4567,17 +4784,83 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
     }
   }
 
+  if (stencil_compute) {
+    stencil_compute_in_rect_if->makeEndIf();
+    stencil_compute_in_rect_if.reset();
+    builder.createControlBarrier(spv::ScopeWorkgroup, spv::ScopeWorkgroup,
+                                 spv::MemorySemanticsWorkgroupMemoryMask |
+                                     spv::MemorySemanticsAcquireReleaseMask);
+    // Lanes 0-15 store the tile's dwords: dword j is row j >> 1, columns
+    // 4 * (j & 1) .. + 3 of the tile, if inside the rectangle's padded rows.
+    spv::Id local_index = builder.createLoad(input_local_invocation_index, spv::NoPrecision);
+    SpirvBuilder::IfBuilder store_lane_if(
+        builder.createBinOp(spv::OpULessThan, type_bool, local_index,
+                            builder.makeUintConstant(16)),
+        spv::SelectionControlMaskNone, builder);
+    spv::Id rect_x = builder.createCompositeExtract(stencil_compute_rect_coord, type_uint, 0);
+    spv::Id rect_y = builder.createCompositeExtract(stencil_compute_rect_coord, type_uint, 1);
+    spv::Id tile_x0 = builder.createBinOp(spv::OpBitwiseAnd, type_uint, rect_x,
+                                          builder.makeUintConstant(~UINT32_C(7)));
+    spv::Id tile_y0 = builder.createBinOp(spv::OpBitwiseAnd, type_uint, rect_y,
+                                          builder.makeUintConstant(~UINT32_C(7)));
+    spv::Id dword_x = builder.createBinOp(
+        spv::OpIAdd, type_uint, tile_x0,
+        builder.createBinOp(spv::OpShiftLeftLogical, type_uint,
+                            builder.createBinOp(spv::OpBitwiseAnd, type_uint, local_index,
+                                                builder.makeUintConstant(1)),
+                            builder.makeUintConstant(2)));
+    spv::Id dword_y = builder.createBinOp(
+        spv::OpIAdd, type_uint, tile_y0,
+        builder.createBinOp(spv::OpShiftRightLogical, type_uint, local_index,
+                            builder.makeUintConstant(1)));
+    spv::Id row_pitch = load_stencil_compute_push_constant(5);
+    SpirvBuilder::IfBuilder store_in_rect_if(
+        builder.createBinOp(
+            spv::OpLogicalAnd, type_bool,
+            builder.createBinOp(spv::OpULessThan, type_bool, dword_x, row_pitch),
+            builder.createBinOp(spv::OpULessThan, type_bool, dword_y,
+                                load_stencil_compute_push_constant(4))),
+        spv::SelectionControlMaskNone, builder);
+    spv::Id byte_index = builder.createBinOp(
+        spv::OpIAdd, type_uint,
+        builder.createBinOp(spv::OpIAdd, type_uint,
+                            builder.createBinOp(spv::OpIMul, type_uint, dword_y, row_pitch),
+                            dword_x),
+        load_stencil_compute_push_constant(6));
+    id_vector_temp.clear();
+    id_vector_temp.push_back(local_index);
+    spv::Id tile_dword = builder.createLoad(
+        builder.createAccessChain(spv::StorageClassWorkgroup, stencil_compute_tile,
+                                  id_vector_temp),
+        spv::NoPrecision);
+    id_vector_temp.clear();
+    id_vector_temp.push_back(builder.makeIntConstant(0));
+    id_vector_temp.push_back(builder.createBinOp(spv::OpShiftRightLogical, type_uint, byte_index,
+                                                 builder.makeUintConstant(2)));
+    builder.createStore(tile_dword,
+                        builder.createAccessChain(spv::StorageClassUniform,
+                                                  stencil_compute_output_buffer, id_vector_temp));
+    store_in_rect_if.makeEndIf();
+    store_lane_if.makeEndIf();
+  }
+
   // End the main function and make it the entry point.
   builder.leaveFunction();
-  builder.addExecutionMode(main_function, spv::ExecutionModeOriginUpperLeft);
-  if (output_fragment_depth != spv::NoResult) {
-    builder.addExecutionMode(main_function, spv::ExecutionModeDepthReplacing);
+  spv::Instruction* entry_point;
+  if (stencil_compute) {
+    builder.addExecutionMode(main_function, spv::ExecutionModeLocalSize,
+                             kStencilComputeGroupSizeX, kStencilComputeGroupSizeY, 1);
+    entry_point = builder.addEntryPoint(spv::ExecutionModelGLCompute, main_function, "main");
+  } else {
+    builder.addExecutionMode(main_function, spv::ExecutionModeOriginUpperLeft);
+    if (output_fragment_depth != spv::NoResult) {
+      builder.addExecutionMode(main_function, spv::ExecutionModeDepthReplacing);
+    }
+    if (output_fragment_stencil_ref != spv::NoResult) {
+      builder.addExecutionMode(main_function, spv::ExecutionModeStencilRefReplacingEXT);
+    }
+    entry_point = builder.addEntryPoint(spv::ExecutionModelFragment, main_function, "main");
   }
-  if (output_fragment_stencil_ref != spv::NoResult) {
-    builder.addExecutionMode(main_function, spv::ExecutionModeStencilRefReplacingEXT);
-  }
-  spv::Instruction* entry_point =
-      builder.addEntryPoint(spv::ExecutionModelFragment, main_function, "main");
   for (spv::Id interface_id : main_interface) {
     entry_point->addIdOperand(interface_id);
   }
@@ -5191,6 +5474,14 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
       // switches. Also gather stencil rectangles to clear if needed.
       bool need_stencil_bit_draws =
           dest_rt_key.is_depth && !vulkan_device->extensions().ext_EXT_shader_stencil_export;
+      // Single-sampled destinations take the compute + buffer copy route
+      // instead of the eight masked draws, recorded before the render pass.
+      bool stencil_via_compute = need_stencil_bit_draws &&
+                                 dest_rt_key.msaa_samples == xenos::MsaaSamples::k1X &&
+                                 REXCVAR_GET(vulkan_edram_stencil_transfer_compute);
+      if (stencil_via_compute) {
+        need_stencil_bit_draws = false;
+      }
       {
         static bool logged = false;
         if (!logged && dest_rt_key.is_depth) {
@@ -5318,6 +5609,14 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
             host_depth_source_vulkan_rt->SetUsage(kSourceStageMask, kSourceAccessMask,
                                                   kSourceLayout);
           }
+        }
+      }
+
+      if (stencil_via_compute) {
+        if (!RecordStencilBufferTransfers(dest_vulkan_rt, current_transfers,
+                                          resolve_clear_rectangle)) {
+          REXGPU_ERROR("VulkanRenderTargetCache: stencil transfer via compute failed; stencil "
+                       "of the destination is not transferred this time");
         }
       }
 
@@ -7110,6 +7409,268 @@ void VulkanRenderTargetCache::LogResolveCopyToTextureStats() {
   REXGPU_ERROR("VulkanRenderTargetCache: resolve copies to texture images: {} of {} attempts;{}",
               resolve_copy_to_texture_success_count_, resolve_copy_to_texture_attempt_count_,
               rejects.empty() ? " no rejections" : rejects.c_str());
+}
+
+VkPipeline VulkanRenderTargetCache::GetStencilComputePipeline(TransferShaderKey key) {
+  assert_true(key.stencil_compute);
+  auto pipeline_it = stencil_compute_pipelines_.find(key);
+  if (pipeline_it != stencil_compute_pipelines_.end()) {
+    return pipeline_it->second;
+  }
+  VkPipeline pipeline = VK_NULL_HANDLE;
+  VkShaderModule shader_module = GetTransferShader(key);
+  if (shader_module != VK_NULL_HANDLE) {
+    const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+    const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+    const VkDevice device = vulkan_device->device();
+    VkComputePipelineCreateInfo pipeline_create_info;
+    pipeline_create_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    pipeline_create_info.pNext = nullptr;
+    pipeline_create_info.flags = 0;
+    pipeline_create_info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    pipeline_create_info.stage.pNext = nullptr;
+    pipeline_create_info.stage.flags = 0;
+    pipeline_create_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    pipeline_create_info.stage.module = shader_module;
+    pipeline_create_info.stage.pName = "main";
+    pipeline_create_info.stage.pSpecializationInfo = nullptr;
+    pipeline_create_info.layout = key.mode == TransferMode::kDepthToStencilBit
+                                      ? stencil_compute_pipeline_layout_depth_
+                                      : stencil_compute_pipeline_layout_color_;
+    pipeline_create_info.basePipelineHandle = VK_NULL_HANDLE;
+    pipeline_create_info.basePipelineIndex = -1;
+    if (dfn.vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeline_create_info, nullptr,
+                                     &pipeline) != VK_SUCCESS) {
+      REXGPU_ERROR("VulkanRenderTargetCache: Failed to create the stencil transfer compute "
+                   "pipeline 0x{:08X}",
+                   key.key);
+      pipeline = VK_NULL_HANDLE;
+    }
+  }
+  stencil_compute_pipelines_.emplace(key, pipeline);
+  return pipeline;
+}
+
+bool VulkanRenderTargetCache::RecordStencilBufferTransfers(
+    VulkanRenderTarget& dest_vulkan_rt, const std::vector<Transfer>& transfers,
+    const Transfer::Rectangle* resolve_clear_rectangle) {
+  RenderTargetKey dest_rt_key = dest_vulkan_rt.key();
+  assert_true(dest_rt_key.is_depth);
+  assert_true(dest_rt_key.msaa_samples == xenos::MsaaSamples::k1X);
+  uint32_t dest_pitch_tiles = dest_rt_key.GetPitchTiles();
+  uint32_t scale_x = draw_resolution_scale_x();
+  uint32_t scale_y = draw_resolution_scale_y();
+
+  // Gather the rectangles, their pipelines and their places in the buffer.
+  struct Job {
+    const Transfer* transfer;
+    VkPipeline pipeline;
+    Transfer::Rectangle rectangle;  // Scaled.
+    VkDeviceSize buffer_offset;
+    uint32_t row_pitch;
+  };
+  std::vector<Job> jobs;
+  VkDeviceSize buffer_size = 0;
+  for (const Transfer& transfer : transfers) {
+    assert_not_null(transfer.source);
+    auto& source_vulkan_rt = *static_cast<VulkanRenderTarget*>(transfer.source);
+    RenderTargetKey source_rt_key = source_vulkan_rt.key();
+    TransferShaderKey shader_key;
+    shader_key.dest_msaa_samples = dest_rt_key.msaa_samples;
+    shader_key.dest_resource_format = dest_rt_key.resource_format;
+    shader_key.source_msaa_samples = source_rt_key.msaa_samples;
+    shader_key.source_resource_format = source_rt_key.resource_format;
+    shader_key.host_depth_source_msaa_samples = xenos::MsaaSamples::k1X;
+    shader_key.stencil_compute = 1;
+    shader_key.mode = source_rt_key.is_depth ? TransferMode::kDepthToStencilBit
+                                             : TransferMode::kColorToStencilBit;
+    VkPipeline pipeline = GetStencilComputePipeline(shader_key);
+    if (pipeline == VK_NULL_HANDLE) {
+      return false;
+    }
+    Transfer::Rectangle rectangles[Transfer::kMaxRectanglesWithCutout];
+    uint32_t rectangle_count =
+        transfer.GetRectangles(dest_rt_key.base_tiles, dest_pitch_tiles, dest_rt_key.msaa_samples,
+                               false, rectangles, resolve_clear_rectangle);
+    for (uint32_t i = 0; i < rectangle_count; ++i) {
+      Job& job = jobs.emplace_back();
+      job.transfer = &transfer;
+      job.pipeline = pipeline;
+      job.rectangle.x_pixels = rectangles[i].x_pixels * scale_x;
+      job.rectangle.y_pixels = rectangles[i].y_pixels * scale_y;
+      job.rectangle.width_pixels = rectangles[i].width_pixels * scale_x;
+      job.rectangle.height_pixels = rectangles[i].height_pixels * scale_y;
+      // Dwords are shared by four pixels; rows start dword-aligned so the
+      // buffer-image copy can address them.
+      job.row_pitch = rex::align(job.rectangle.width_pixels, UINT32_C(4));
+      job.buffer_offset = buffer_size;
+      buffer_size += VkDeviceSize(job.row_pitch) * job.rectangle.height_pixels;
+    }
+  }
+  if (jobs.empty()) {
+    return true;
+  }
+
+  VulkanCommandProcessor::ScratchBufferAcquisition scratch_buffer_acquisition(
+      command_processor_.AcquireScratchGpuBuffer(buffer_size, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                                 VK_ACCESS_SHADER_WRITE_BIT));
+  VkBuffer scratch_buffer = scratch_buffer_acquisition.buffer();
+  if (scratch_buffer == VK_NULL_HANDLE) {
+    return false;
+  }
+  VkDescriptorSet descriptor_set_output = command_processor_.AllocateSingleTransientDescriptor(
+      VulkanCommandProcessor::SingleTransientDescriptorLayout::kStorageBufferCompute);
+  if (descriptor_set_output == VK_NULL_HANDLE) {
+    return false;
+  }
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  {
+    VkDescriptorBufferInfo buffer_info;
+    buffer_info.buffer = scratch_buffer;
+    buffer_info.offset = 0;
+    buffer_info.range = buffer_size;
+    VkWriteDescriptorSet write;
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.pNext = nullptr;
+    write.dstSet = descriptor_set_output;
+    write.dstBinding = 0;
+    write.dstArrayElement = 0;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    write.pImageInfo = nullptr;
+    write.pBufferInfo = &buffer_info;
+    write.pTexelBufferView = nullptr;
+    dfn.vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+  }
+
+  DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
+  command_processor_.GpuTimerMark("edram transfer stencil (compute)");
+
+  // The sources were transitioned for fragment reads by the caller; extend
+  // that to compute.
+  for (const Transfer& transfer : transfers) {
+    auto& source_vulkan_rt = *static_cast<VulkanRenderTarget*>(transfer.source);
+    constexpr VkPipelineStageFlags kStageMask =
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    command_processor_.PushImageMemoryBarrier(
+        source_vulkan_rt.image(),
+        ui::vulkan::util::InitializeSubresourceRange(
+            source_vulkan_rt.key().is_depth
+                ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
+                : VK_IMAGE_ASPECT_COLOR_BIT),
+        source_vulkan_rt.current_stage_mask(), kStageMask, source_vulkan_rt.current_access_mask(),
+        VK_ACCESS_SHADER_READ_BIT, source_vulkan_rt.current_layout(),
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    source_vulkan_rt.SetUsage(kStageMask, VK_ACCESS_SHADER_READ_BIT,
+                              VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+  }
+  command_processor_.SubmitBarriers(true);
+  command_processor_.GpuTimerMark("edram transfer stencil (compute) dispatch");
+
+  VkPipeline last_pipeline = VK_NULL_HANDLE;
+  VkPipelineLayout last_layout = VK_NULL_HANDLE;
+  VkDescriptorSet last_source_descriptor_set = VK_NULL_HANDLE;
+  for (const Job& job : jobs) {
+    auto& source_vulkan_rt = *static_cast<VulkanRenderTarget*>(job.transfer->source);
+    RenderTargetKey source_rt_key = source_vulkan_rt.key();
+    VkPipelineLayout layout = source_rt_key.is_depth ? stencil_compute_pipeline_layout_depth_
+                                                     : stencil_compute_pipeline_layout_color_;
+    if (last_pipeline != job.pipeline) {
+      last_pipeline = job.pipeline;
+      command_processor_.BindExternalComputePipeline(job.pipeline);
+    }
+    if (last_layout != layout) {
+      last_layout = layout;
+      last_source_descriptor_set = VK_NULL_HANDLE;
+      command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1,
+                                             &descriptor_set_output, 0, nullptr);
+    }
+    VkDescriptorSet source_descriptor_set = source_vulkan_rt.GetDescriptorSetTransferSource();
+    if (last_source_descriptor_set != source_descriptor_set) {
+      last_source_descriptor_set = source_descriptor_set;
+      command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, layout, 1, 1,
+                                             &source_descriptor_set, 0, nullptr);
+    }
+    StencilComputePushConstants push_constants;
+    push_constants.address.dest_pitch = dest_pitch_tiles;
+    push_constants.address.source_pitch = source_rt_key.GetPitchTiles();
+    push_constants.address.source_to_dest =
+        int32_t(dest_rt_key.base_tiles) - int32_t(source_rt_key.base_tiles);
+    push_constants.rect_x = job.rectangle.x_pixels;
+    push_constants.rect_y = job.rectangle.y_pixels;
+    push_constants.rect_width = job.rectangle.width_pixels;
+    push_constants.rect_height = job.rectangle.height_pixels;
+    push_constants.row_pitch = job.row_pitch;
+    push_constants.buffer_offset = uint32_t(job.buffer_offset);
+    command_buffer.CmdVkPushConstants(layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                      sizeof(push_constants), &push_constants);
+    command_buffer.CmdVkDispatch(
+        (job.rectangle.width_pixels + kStencilComputeGroupSizeX - 1) / kStencilComputeGroupSizeX,
+        (job.rectangle.height_pixels + kStencilComputeGroupSizeY - 1) / kStencilComputeGroupSizeY,
+        1);
+  }
+
+  // Copy the bytes into the stencil aspect. The layout the copy goes through
+  // decides whether the driver decompresses the depth/stencil image around it.
+  const VkImageLayout kStencilCopyDestLayout = REXCVAR_GET(vulkan_edram_stencil_copy_general)
+                                                   ? VK_IMAGE_LAYOUT_GENERAL
+                                                   : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+  command_processor_.GpuTimerMark("edram transfer stencil (compute) copy");
+  command_processor_.PushBufferMemoryBarrier(
+      scratch_buffer, 0, VK_WHOLE_SIZE,
+      scratch_buffer_acquisition.SetStageMask(VK_PIPELINE_STAGE_TRANSFER_BIT),
+      VK_PIPELINE_STAGE_TRANSFER_BIT,
+      scratch_buffer_acquisition.SetAccessMask(VK_ACCESS_TRANSFER_READ_BIT),
+      VK_ACCESS_TRANSFER_READ_BIT);
+  command_processor_.PushImageMemoryBarrier(
+      dest_vulkan_rt.image(),
+      ui::vulkan::util::InitializeSubresourceRange(VK_IMAGE_ASPECT_DEPTH_BIT |
+                                                   VK_IMAGE_ASPECT_STENCIL_BIT),
+      dest_vulkan_rt.current_stage_mask(), VK_PIPELINE_STAGE_TRANSFER_BIT,
+      dest_vulkan_rt.current_access_mask(), VK_ACCESS_TRANSFER_WRITE_BIT,
+      dest_vulkan_rt.current_layout(), kStencilCopyDestLayout);
+  dest_vulkan_rt.SetUsage(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                          kStencilCopyDestLayout);
+  command_processor_.SubmitBarriers(false);
+  VkBufferImageCopy* regions = command_buffer.CmdCopyBufferToImageEmplace(
+      scratch_buffer, dest_vulkan_rt.image(), kStencilCopyDestLayout, uint32_t(jobs.size()));
+  for (size_t i = 0; i < jobs.size(); ++i) {
+    const Job& job = jobs[i];
+    VkBufferImageCopy& region = regions[i];
+    region.bufferOffset = job.buffer_offset;
+    region.bufferRowLength = job.row_pitch;
+    region.bufferImageHeight = job.rectangle.height_pixels;
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
+    region.imageSubresource.mipLevel = 0;
+    region.imageSubresource.baseArrayLayer = 0;
+    region.imageSubresource.layerCount = 1;
+    region.imageOffset.x = int32_t(job.rectangle.x_pixels);
+    region.imageOffset.y = int32_t(job.rectangle.y_pixels);
+    region.imageOffset.z = 0;
+    region.imageExtent.width = job.rectangle.width_pixels;
+    region.imageExtent.height = job.rectangle.height_pixels;
+    region.imageExtent.depth = 1;
+  }
+  COUNT_profile_add("gpu/edram_transfer_stencil_compute_rects", int64_t(jobs.size()));
+
+  // Back to the draw usage for the depth draws of the same transfer.
+  {
+    VkPipelineStageFlags dest_dst_stage_mask;
+    VkAccessFlags dest_dst_access_mask;
+    VkImageLayout dest_new_layout;
+    dest_vulkan_rt.GetDrawUsage(&dest_dst_stage_mask, &dest_dst_access_mask, &dest_new_layout);
+    command_processor_.PushImageMemoryBarrier(
+        dest_vulkan_rt.image(),
+        ui::vulkan::util::InitializeSubresourceRange(VK_IMAGE_ASPECT_DEPTH_BIT |
+                                                     VK_IMAGE_ASPECT_STENCIL_BIT),
+        dest_vulkan_rt.current_stage_mask(), dest_dst_stage_mask,
+        dest_vulkan_rt.current_access_mask(), dest_dst_access_mask,
+        dest_vulkan_rt.current_layout(), dest_new_layout);
+    dest_vulkan_rt.SetUsage(dest_dst_stage_mask, dest_dst_access_mask, dest_new_layout);
+  }
+  return true;
 }
 
 bool VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used,

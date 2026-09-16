@@ -543,6 +543,11 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
       // Last bits because this affects the pipeline layout - after sorting,
       // only change it as fewer times as possible. Depth buffers have an
       // additional stencil texture.
+      // Stencil-bit modes only: a compute shader that writes the whole
+      // stencil byte of each destination pixel to a buffer, for a copy into
+      // the stencil aspect, instead of eight masked fragment draws.
+      uint32_t stencil_compute : 1;
+
       static_assert(size_t(TransferMode::kCount) <= (size_t(1) << 4));
       TransferMode mode : 4;
     };
@@ -803,6 +808,32 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // samples. If there was a failure to create a pipeline, returns nullptr.
   VkPipeline const* GetTransferPipelines(TransferPipelineKey key);
 
+  // Stencil transfers through a buffer (see TransferShaderKey::stencil_compute):
+  // without VK_EXT_shader_stencil_export every stencil bit of a destination
+  // needs its own masked draw. Instead, one dispatch per rectangle computes
+  // the destination stencil bytes into the scratch buffer, and
+  // vkCmdCopyBufferToImage writes them into the stencil aspect. Single-sampled
+  // destinations only - buffer-image copies can't target multisampled images.
+  struct StencilComputePushConstants {
+    TransferAddressConstant address;
+    // Rectangle in host pixels of the destination.
+    uint32_t rect_x, rect_y, rect_width, rect_height;
+    // Row pitch in bytes of the rectangle's rows in the output buffer, and
+    // the byte offset of its first row (a multiple of 4).
+    uint32_t row_pitch;
+    uint32_t buffer_offset;
+  };
+  static constexpr uint32_t kStencilComputeGroupSizeX = 8;
+  static constexpr uint32_t kStencilComputeGroupSizeY = 8;
+  VkPipeline GetStencilComputePipeline(TransferShaderKey key);
+  // Records the dispatches and copies for all transfers to the destination.
+  // The sources must already be in the transfer source usage; leaves the
+  // destination in its draw usage. Returns false (recording nothing) if the
+  // path can't be used, so the caller does the draws instead.
+  bool RecordStencilBufferTransfers(VulkanRenderTarget& dest_vulkan_rt,
+                                    const std::vector<Transfer>& transfers,
+                                    const Transfer::Rectangle* resolve_clear_rectangle);
+
   // Do ownership transfers for render targets - each render target / vector may
   // be null / empty in case there's nothing to do for them.
   // resolve_clear_rectangle is expected to be provided by
@@ -892,6 +923,11 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
   VkPipelineLayout dump_pipeline_layout_color_ = VK_NULL_HANDLE;
   VkPipelineLayout dump_pipeline_layout_depth_ = VK_NULL_HANDLE;
+  // [0] output storage buffer, [1] source (color image / depth+stencil images).
+  VkPipelineLayout stencil_compute_pipeline_layout_color_ = VK_NULL_HANDLE;
+  VkPipelineLayout stencil_compute_pipeline_layout_depth_ = VK_NULL_HANDLE;
+  std::unordered_map<TransferShaderKey, VkPipeline, TransferShaderKey::Hasher>
+      stencil_compute_pipelines_;
   // Compute pipelines for copying host render target contents to the EDRAM
   // buffer. VK_NULL_HANDLE if failed to create.
   std::unordered_map<DumpPipelineKey, VkPipeline, DumpPipelineKey::Hasher> dump_pipelines_;
