@@ -797,6 +797,45 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     }
   };
 
+  // Resolve compute shader writing the destination texture image (see
+  // VulkanTextureCache::ResolveComputeHostFormat): the direct resolve's
+  // sampling and packing, with the load shader's unpacking and an image store
+  // instead of the tiled address. Only single-sampled resolve views (any
+  // render target sample count - a multisampled owner read through a 1x view
+  // is the sample-as-pixel alias, exact by the dump mapping).
+  struct ResolveToImagePipelineKey {
+    DumpPipelineKey dump_pipeline_key;
+    uint32_t host_format;  // VulkanTextureCache::ResolveComputeHostFormat
+    bool draw_resolution_scaled;
+    uint64_t packed() const {
+      return uint64_t(dump_pipeline_key.key) | (uint64_t(host_format) << 32) |
+             (uint64_t(draw_resolution_scaled ? 1 : 0) << 40);
+    }
+    struct Hasher {
+      size_t operator()(const ResolveToImagePipelineKey& key) const {
+        return std::hash<uint64_t>{}(key.packed());
+      }
+    };
+    bool operator==(const ResolveToImagePipelineKey& other_key) const {
+      return packed() == other_key.packed();
+    }
+  };
+  struct ResolveToImagePushConstants {
+    DirectResolvePushConstants direct;
+    // The resolve region's origin and the level's extent in the image, in
+    // host texels.
+    uint32_t image_x, image_y, image_width, image_height;
+  };
+  VkPipeline GetResolveToImagePipeline(ResolveToImagePipelineKey key);
+  // Checks the resolve for the compute path and finds the destinations (no
+  // commands); Issue records the dispatches. Uses the same owner/rectangle
+  // state as the copy path (resolve_copy_to_texture_rt_).
+  bool TryPrepareResolveComputeToTexture(
+      const draw_util::ResolveInfo& resolve_info, draw_util::ResolveCopyShaderIndex copy_shader,
+      const draw_util::ResolveCopyShaderConstants& copy_shader_constants,
+      VulkanTextureCache& texture_cache, bool draw_resolution_scaled);
+  void IssueResolveComputeToTexture(VulkanTextureCache& texture_cache);
+
   // Returns the framebuffer object, or VK_NULL_HANDLE if failed to create.
   const Framebuffer* GetHostRenderTargetsFramebuffer(
       RenderPassKey render_pass_key, uint32_t pitch_tiles_at_32bpp,
@@ -851,7 +890,8 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // With direct_key, the packed sample is written to the resolve destination
   // instead of the EDRAM buffer, fusing the dump and the copy.
   VkPipeline BuildRenderTargetSamplingPipeline(DumpPipelineKey key,
-                                               const DirectResolvePipelineKey* direct_key);
+                                               const DirectResolvePipelineKey* direct_key,
+                                               const ResolveToImagePipelineKey* image_key = nullptr);
   // Checks whether the resolve can be done straight from the host render
   // targets, and if so, gathers the dispatches for IssueDirectResolveCopy into
   // dump_rectangles_ / direct_resolve_dispatches_. Doesn't record any commands,
@@ -935,6 +975,17 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   VkPipelineLayout direct_resolve_pipeline_layout_depth_ = VK_NULL_HANDLE;
   std::unordered_map<DirectResolvePipelineKey, VkPipeline, DirectResolvePipelineKey::Hasher>
       direct_resolve_pipelines_;
+  // [0] storage image (transient), [1] source.
+  VkPipelineLayout resolve_to_image_pipeline_layout_color_ = VK_NULL_HANDLE;
+  VkPipelineLayout resolve_to_image_pipeline_layout_depth_ = VK_NULL_HANDLE;
+  std::unordered_map<ResolveToImagePipelineKey, VkPipeline, ResolveToImagePipelineKey::Hasher>
+      resolve_to_image_pipelines_;
+  std::vector<VulkanTextureCache::ResolveComputeDestination> resolve_compute_destinations_;
+  ResolveToImagePipelineKey resolve_compute_pipeline_key_ = {};
+  DirectResolvePushConstants resolve_compute_push_constants_ = {};
+  uint64_t resolve_compute_count_ = 0;
+  uint64_t resolve_compute_attempt_count_ = 0;
+  std::vector<std::pair<const char*, uint64_t>> resolve_compute_rejects_;
 
   // Temporary storage for Resolve.
   std::vector<Transfer> clear_transfers_[2];
@@ -955,6 +1006,8 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // half-pixel offset fill.
   VulkanRenderTarget* resolve_copy_to_texture_rt_ = nullptr;
   bool resolve_copy_to_texture_multisampled_ = false;
+  uint32_t resolve_copy_to_texture_dump_row_length_ = 0;
+  uint32_t resolve_copy_to_texture_dump_rows_ = 0;
   uint32_t resolve_copy_to_texture_source_x_ = 0;
   uint32_t resolve_copy_to_texture_source_y_ = 0;
   uint32_t resolve_copy_to_texture_fill_x_ = 0;

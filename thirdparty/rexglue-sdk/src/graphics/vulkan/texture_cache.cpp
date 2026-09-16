@@ -1717,6 +1717,28 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
   image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
   image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
   image_create_info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+  // Storage usage for the resolve compute shader, where every format the
+  // image may be viewed as allows it (2D images only).
+  bool storage_usable = !is_3d && key.dimension != xenos::DataDimension::kCube;
+  for (uint32_t i = 0; storage_usable && i < 2; ++i) {
+    if (formats[i] == VK_FORMAT_UNDEFINED) {
+      continue;
+    }
+    auto storage_it = format_storage_supported_.find(formats[i]);
+    if (storage_it == format_storage_supported_.end()) {
+      VkFormatProperties format_properties;
+      vulkan_device->vulkan_instance()->functions().vkGetPhysicalDeviceFormatProperties(
+          vulkan_device->physical_device(), formats[i], &format_properties);
+      storage_it = format_storage_supported_
+                       .emplace(formats[i], (format_properties.optimalTilingFeatures &
+                                             VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0)
+                       .first;
+    }
+    storage_usable = storage_it->second;
+  }
+  if (storage_usable) {
+    image_create_info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+  }
   image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   image_create_info.queueFamilyIndexCount = 0;
   image_create_info.pQueueFamilyIndices = nullptr;
@@ -1742,7 +1764,9 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
     return nullptr;
   }
 
-  return std::unique_ptr<Texture>(new VulkanTexture(*this, key, image, allocation));
+  VulkanTexture* texture = new VulkanTexture(*this, key, image, allocation);
+  texture->SetImageStorageUsable(storage_usable);
+  return std::unique_ptr<Texture>(texture);
 }
 
 VkFormat VulkanTextureCache::GetTextureImageFormat(TextureKey key) const {
@@ -1773,14 +1797,162 @@ bool VulkanTextureCache::PrepareResolveCopyDestinations(
                                       pending_resolve_copy_destinations_, reject_reason_out)) {
     return false;
   }
-  for (const ResolveDestination& destination : pending_resolve_copy_destinations_) {
-    if (GetTextureImageFormat(destination.texture->key()) != source_format) {
-      pending_resolve_copy_destinations_.clear();
-      reject_reason_out = "host format";
-      return false;
+  // VK_FORMAT_UNDEFINED: the compute path checks the image format itself.
+  if (source_format != VK_FORMAT_UNDEFINED) {
+    for (const ResolveDestination& destination : pending_resolve_copy_destinations_) {
+      if (GetTextureImageFormat(destination.texture->key()) != source_format) {
+        pending_resolve_copy_destinations_.clear();
+        reject_reason_out = "host format";
+        return false;
+      }
     }
   }
   return true;
+}
+
+VkImageView VulkanTextureCache::VulkanTexture::GetStorageView(uint32_t level) {
+  auto it = storage_views_.find(level);
+  if (it != storage_views_.end()) {
+    return it->second;
+  }
+  const VulkanTextureCache& vulkan_texture_cache =
+      static_cast<const VulkanTextureCache&>(texture_cache());
+  const ui::vulkan::VulkanDevice* const vulkan_device =
+      vulkan_texture_cache.command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  VkImageViewCreateInfo view_create_info;
+  view_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+  view_create_info.pNext = nullptr;
+  view_create_info.flags = 0;
+  view_create_info.image = image_;
+  view_create_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  view_create_info.format = vulkan_texture_cache.GetTextureImageFormat(key());
+  view_create_info.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
+  view_create_info.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
+  view_create_info.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
+  view_create_info.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
+  view_create_info.subresourceRange =
+      ui::vulkan::util::InitializeSubresourceRange(VK_IMAGE_ASPECT_COLOR_BIT, level, 1, 0, 1);
+  VkImageView view = VK_NULL_HANDLE;
+  if (dfn.vkCreateImageView(vulkan_device->device(), &view_create_info, nullptr, &view) !=
+      VK_SUCCESS) {
+    view = VK_NULL_HANDLE;
+  }
+  storage_views_.emplace(level, view);
+  return view;
+}
+
+bool VulkanTextureCache::CheckResolveComputeDestinations(
+    ResolveComputeHostFormat& host_format_out) {
+  std::vector<ResolveComputeDestination>& destinations_out =
+      checked_resolve_compute_destinations_;
+  destinations_out.clear();
+  if (pending_resolve_copy_destinations_.empty()) {
+    return false;
+  }
+  // All destinations share the format (the lookup requires it).
+  switch (pending_resolve_copy_destinations_[0].texture->key().format) {
+    case xenos::TextureFormat::k_8_8_8_8:
+      host_format_out = ResolveComputeHostFormat::kRgba8Unorm;
+      break;
+    case xenos::TextureFormat::k_2_10_10_10:
+      host_format_out = ResolveComputeHostFormat::kRgb10A2Unorm;
+      break;
+    case xenos::TextureFormat::k_16_16_FLOAT:
+      host_format_out = ResolveComputeHostFormat::kRg16Float;
+      break;
+    case xenos::TextureFormat::k_16_16_16_16_FLOAT:
+      host_format_out = ResolveComputeHostFormat::kRgba16Float;
+      break;
+    case xenos::TextureFormat::k_32_FLOAT:
+      host_format_out = ResolveComputeHostFormat::kR32Float;
+      break;
+    case xenos::TextureFormat::k_24_8:
+      host_format_out = ResolveComputeHostFormat::kR32DepthUnorm;
+      break;
+    case xenos::TextureFormat::k_24_8_FLOAT:
+      host_format_out = ResolveComputeHostFormat::kR32DepthFloat;
+      break;
+    default:
+      return false;
+  }
+  VkFormat expected_format = VK_FORMAT_UNDEFINED;
+  switch (host_format_out) {
+    case ResolveComputeHostFormat::kRgba8Unorm:
+      expected_format = VK_FORMAT_R8G8B8A8_UNORM;
+      break;
+    case ResolveComputeHostFormat::kRgb10A2Unorm:
+      expected_format = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+      break;
+    case ResolveComputeHostFormat::kRg16Float:
+      expected_format = VK_FORMAT_R16G16_SFLOAT;
+      break;
+    case ResolveComputeHostFormat::kRgba16Float:
+      expected_format = VK_FORMAT_R16G16B16A16_SFLOAT;
+      break;
+    default:
+      expected_format = VK_FORMAT_R32_SFLOAT;
+      break;
+  }
+  uint32_t scale_x = draw_resolution_scale_x();
+  uint32_t scale_y = draw_resolution_scale_y();
+  for (const ResolveDestination& destination : pending_resolve_copy_destinations_) {
+    VulkanTexture& vulkan_texture = *static_cast<VulkanTexture*>(destination.texture);
+    if (!vulkan_texture.image_storage_usable() || vulkan_texture.key().signed_separate ||
+        GetTextureImageFormat(vulkan_texture.key()) != expected_format) {
+      destinations_out.clear();
+      return false;
+    }
+    VkImageView view = vulkan_texture.GetStorageView(destination.level);
+    if (view == VK_NULL_HANDLE) {
+      destinations_out.clear();
+      return false;
+    }
+    bool texture_scaled = vulkan_texture.key().scaled_resolve;
+    ResolveComputeDestination& out = destinations_out.emplace_back();
+    out.storage_view = view;
+    out.x = destination.dest_x * (texture_scaled ? scale_x : 1);
+    out.y = destination.dest_y * (texture_scaled ? scale_y : 1);
+    out.width = destination.width * (texture_scaled ? scale_x : 1);
+    out.height = destination.height * (texture_scaled ? scale_y : 1);
+  }
+  return true;
+}
+
+void VulkanTextureCache::BeginResolveComputeDestinations(
+    std::vector<ResolveComputeDestination>& destinations_out) {
+  destinations_out = checked_resolve_compute_destinations_;
+  // Transition all of them under one barrier submission.
+  for (const ResolveDestination& destination : pending_resolve_copy_destinations_) {
+    VulkanTexture& vulkan_texture = *static_cast<VulkanTexture*>(destination.texture);
+    vulkan_texture.MarkAsUsed();
+    VulkanTexture::Usage old_usage = vulkan_texture.SetUsage(VulkanTexture::Usage::kComputeWrite);
+    if (old_usage != VulkanTexture::Usage::kComputeWrite) {
+      VkPipelineStageFlags src_stage_mask, dst_stage_mask;
+      VkAccessFlags src_access_mask, dst_access_mask;
+      VkImageLayout old_layout, new_layout;
+      GetTextureUsageMasks(old_usage, src_stage_mask, src_access_mask, old_layout);
+      GetTextureUsageMasks(VulkanTexture::Usage::kComputeWrite, dst_stage_mask, dst_access_mask,
+                           new_layout);
+      command_processor_.PushImageMemoryBarrier(
+          vulkan_texture.image(), ui::vulkan::util::InitializeSubresourceRange(), src_stage_mask,
+          dst_stage_mask, src_access_mask, dst_access_mask, old_layout, new_layout);
+    }
+  }
+}
+
+void VulkanTextureCache::EndResolveComputeDestinations() {
+  for (const ResolveDestination& destination : pending_resolve_copy_destinations_) {
+    VulkanTexture& vulkan_texture = *static_cast<VulkanTexture*>(destination.texture);
+    // The shader writes memory's channel order.
+    if (vulkan_texture.image_rb_swapped()) {
+      vulkan_texture.SetImageRBSwapped(false);
+      RefreshBindingViewsForTexture(vulkan_texture);
+    }
+    auto global_lock = AcquireGlobalCriticalRegion();
+    vulkan_texture.MakeUpToDateAndWatch(global_lock);
+  }
+  pending_resolve_copy_destinations_.clear();
 }
 
 void VulkanTextureCache::IssueResolveCopies(VkImage source_image, bool source_multisampled,
@@ -2649,6 +2821,9 @@ VulkanTextureCache::VulkanTexture::~VulkanTexture() {
   const VkDevice device = vulkan_device->device();
   for (const auto& view_pair : views_) {
     dfn.vkDestroyImageView(device, view_pair.second, nullptr);
+  }
+  for (const auto& storage_view_pair : storage_views_) {
+    dfn.vkDestroyImageView(device, storage_view_pair.second, nullptr);
   }
   if (image_view_3d_as_2d_unsigned_ != VK_NULL_HANDLE) {
     dfn.vkDestroyImageView(device, image_view_3d_as_2d_unsigned_, nullptr);
@@ -4018,6 +4193,11 @@ void VulkanTextureCache::GetTextureUsageMasks(VulkanTexture::Usage usage,
       stage_mask = VK_PIPELINE_STAGE_TRANSFER_BIT;
       access_mask = VK_ACCESS_TRANSFER_READ_BIT;
       layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+      break;
+    case VulkanTexture::Usage::kComputeWrite:
+      stage_mask = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+      access_mask = VK_ACCESS_SHADER_WRITE_BIT;
+      layout = VK_IMAGE_LAYOUT_GENERAL;
       break;
     case VulkanTexture::Usage::kGuestShaderSampled:
       stage_mask = guest_shader_pipeline_stages_;

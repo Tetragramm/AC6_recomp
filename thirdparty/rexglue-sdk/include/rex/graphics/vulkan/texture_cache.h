@@ -159,6 +159,36 @@ class VulkanTextureCache final : public TextureCache {
   // A multisampled source is averaged with vkCmdResolveImage instead.
   void IssueResolveCopies(VkImage source_image, bool source_multisampled, uint32_t source_x,
                           uint32_t source_y, uint32_t fill_x, uint32_t fill_y);
+
+  // The compute variant: the render target cache's resolve shader writes the
+  // prepared destinations as storage images. How the host texel is produced
+  // from the packed guest dword.
+  enum class ResolveComputeHostFormat : uint32_t {
+    kRgba8Unorm,     // k_8_8_8_8 -> R8G8B8A8_UNORM, raw bytes
+    kRgb10A2Unorm,   // k_2_10_10_10 -> A2B10G10R10_UNORM_PACK32
+    kRg16Float,      // k_16_16_FLOAT -> R16G16_SFLOAT
+    kRgba16Float,    // k_16_16_16_16_FLOAT -> R16G16B16A16_SFLOAT (64bpp)
+    kR32Float,       // k_32_FLOAT -> R32_SFLOAT, raw bits
+    kR32DepthUnorm,  // k_24_8 -> R32_SFLOAT, depth24 / 0xFFFFFF
+    kR32DepthFloat,  // k_24_8_FLOAT -> R32_SFLOAT, 20e4 -> float
+    kCount,
+  };
+  struct ResolveComputeDestination {
+    VkImageView storage_view;
+    // Host texels within the level.
+    uint32_t x, y, width, height;
+  };
+  // Checks that every prepared destination can be written as a storage image
+  // (the format is the same for all of them - they share the key's format)
+  // and works out the rectangles. Records nothing and changes no state, so
+  // the caller can still fall back to another path. Must be called before
+  // the resolve range is marked as resolved.
+  bool CheckResolveComputeDestinations(ResolveComputeHostFormat& host_format_out);
+  // Transitions the checked destinations and returns their rectangles.
+  void BeginResolveComputeDestinations(std::vector<ResolveComputeDestination>& destinations_out);
+  // After the dispatches: the images hold memory's channel order (the swap
+  // is applied in the shader), and are declared current.
+  void EndResolveComputeDestinations();
   void UseScaledResolveBufferForRead();
   void UseScaledResolveBufferForWrite(uint64_t written_start_scaled,
                                       uint64_t written_length_scaled);
@@ -226,6 +256,8 @@ class VulkanTextureCache final : public TextureCache {
       kTransferDestination,
       // Reading the image back on the host - AC6 texture dumps.
       kTransferSource,
+      // Written as a storage image by the resolve compute shader.
+      kComputeWrite,
       kGuestShaderSampled,
       kSwapSampled,
     };
@@ -254,6 +286,13 @@ class VulkanTextureCache final : public TextureCache {
     // binding views on every change.
     bool image_rb_swapped() const { return image_rb_swapped_; }
     void SetImageRBSwapped(bool swapped) { image_rb_swapped_ = swapped; }
+
+    // Whether the image was created with storage usage (the resolve compute
+    // shader can write it).
+    bool image_storage_usable() const { return image_storage_usable_; }
+    void SetImageStorageUsable(bool usable) { image_storage_usable_ = usable; }
+    // A single-level 2D view in the image's own format for storage writes.
+    VkImageView GetStorageView(uint32_t level);
 
    private:
     union ViewKey {
@@ -308,6 +347,8 @@ class VulkanTextureCache final : public TextureCache {
 
     Usage usage_ = Usage::kUndefined;
     bool image_rb_swapped_ = false;
+    bool image_storage_usable_ = false;
+    std::unordered_map<uint32_t, VkImageView> storage_views_;
 
     std::unordered_map<ViewKey, VkImageView, ViewKey::Hasher> views_;
     std::unique_ptr<VulkanTexture> texture_3d_as_2d_;
@@ -501,9 +542,13 @@ class VulkanTextureCache final : public TextureCache {
   // IssueResolveCopies.
   std::vector<ResolveDestination> pending_resolve_copy_destinations_;
   bool pending_resolve_copy_rb_swap_ = false;
+  // Filled by CheckResolveComputeDestinations for BeginResolveComputeDestinations.
+  std::vector<ResolveComputeDestination> checked_resolve_compute_destinations_;
   // Diagnostic: which textures go through the untiling load.
   std::unordered_map<std::string, uint32_t> load_tally_;
   uint64_t load_tally_total_ = 0;
+  // VkFormat -> optimal tiling storage image support, for texture creation.
+  std::unordered_map<uint32_t, bool> format_storage_supported_;
   std::unordered_map<std::string, uint32_t> copy_tally_;
   uint64_t copy_tally_total_ = 0;
   uint64_t copy_tally_pixels_ = 0;
