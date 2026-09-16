@@ -85,6 +85,12 @@ REXCVAR_DEFINE_BOOL(vulkan_edram_stencil_copy_general, false, "GPU",
                     "instead of TRANSFER_DST_OPTIMAL")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(vulkan_resolve_to_texture_prefer_compute, false, "GPU",
+                    "Let the compute shader take every resolve it can rather than only those the "
+                    "image copy cannot express (measured slower: the copy moves the same pixels "
+                    "in less time, so this is off)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(vulkan_resolve_to_texture_compute, false, "GPU",
                     "Resolve single-sampled resolve views into the destination texture images with "
                     "a compute shader (sampling the render target and unpacking as the texture "
@@ -1508,18 +1514,17 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
       bool copy_to_texture = false;
       bool compute_to_texture = false;
       if (GetPath() == Path::kHostRenderTargets) {
-        // The copy is exact and cheap where it applies (bitwise-equivalent
-        // formats, a single-sampled owner); the compute shader then picks up
-        // what the copy can't express - depth resolves and the alias reads of
-        // multisampled owners - which would otherwise take the tiled round
+        // Two ways into the destination texture's image: an image copy, which
+        // needs bitwise-equivalent formats and a single-sampled owner, and the
+        // compute shader, which samples and repacks and so also covers depth
+        // resolves and multisampled views. Whichever doesn't claim the resolve
+        // leaves it to the other; what neither claims takes the tiled round
         // trip (dump, copy shader, then untiling at the consuming draw).
         if (REXCVAR_GET(vulkan_resolve_to_texture_image)) {
-          copy_to_texture =
-              TryPrepareResolveCopyToTexture(resolve_info, texture_cache, draw_resolution_scaled);
-          if (!(resolve_copy_to_texture_attempt_count_ & UINT64_C(2047))) {
-            LogResolveCopyToTextureStats();
-          }
-          if (!copy_to_texture && REXCVAR_GET(vulkan_resolve_to_texture_compute)) {
+          bool compute_enabled = REXCVAR_GET(vulkan_resolve_to_texture_compute);
+          bool prefer_compute =
+              compute_enabled && REXCVAR_GET(vulkan_resolve_to_texture_prefer_compute);
+          auto try_compute = [&]() {
             compute_to_texture = TryPrepareResolveComputeToTexture(
                 resolve_info, copy_shader, copy_shader_constants, texture_cache,
                 draw_resolution_scaled);
@@ -1533,8 +1538,26 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
                            resolve_compute_count_, resolve_compute_attempt_count_,
                            rejects.empty() ? " no rejections" : rejects.c_str());
             }
-            copy_to_texture = compute_to_texture;
+            return compute_to_texture;
+          };
+          auto try_copy = [&]() {
+            copy_to_texture =
+                TryPrepareResolveCopyToTexture(resolve_info, texture_cache, draw_resolution_scaled);
+            if (!(resolve_copy_to_texture_attempt_count_ & UINT64_C(2047))) {
+              LogResolveCopyToTextureStats();
+            }
+            return copy_to_texture;
+          };
+          if (prefer_compute) {
+            if (!try_compute()) {
+              try_copy();
+            }
+          } else {
+            if (!try_copy() && compute_enabled) {
+              try_compute();
+            }
           }
+          copy_to_texture = copy_to_texture || compute_to_texture;
         }
         if (!copy_to_texture && REXCVAR_GET(direct_host_resolve)) {
           direct_resolved =
@@ -7874,8 +7897,8 @@ void VulkanRenderTargetCache::IssueResolveComputeToTexture(VulkanTextureCache& t
     command_buffer.CmdVkPushConstants(pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                       sizeof(push_constants), &push_constants);
     command_buffer.CmdVkDispatch(group_count_x, group_count_y, 1);
-    ++resolve_compute_count_;
   }
+  ++resolve_compute_count_;
   COUNT_profile_add("gpu/render_target_cache/resolve_compute_to_texture", 1);
   texture_cache.EndResolveComputeDestinations();
 }
