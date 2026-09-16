@@ -1783,8 +1783,9 @@ bool VulkanTextureCache::PrepareResolveCopyDestinations(
   return true;
 }
 
-void VulkanTextureCache::IssueResolveCopies(VkImage source_image, uint32_t source_x,
-                                            uint32_t source_y, uint32_t fill_x, uint32_t fill_y) {
+void VulkanTextureCache::IssueResolveCopies(VkImage source_image, bool source_multisampled,
+                                            uint32_t source_x, uint32_t source_y, uint32_t fill_x,
+                                            uint32_t fill_y) {
   assert_false(pending_resolve_copy_destinations_.empty());
   command_processor_.GpuTimerMark("resolve copy to texture");
   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
@@ -1866,7 +1867,22 @@ void VulkanTextureCache::IssueResolveCopies(VkImage source_image, uint32_t sourc
       }
     }
 
-    if (REXCVAR_GET(vulkan_resolve_to_texture_blit)) {
+    if (source_multisampled) {
+      // Same regions, averaged. VkImageResolve has the same members as
+      // VkImageCopy.
+      VkImageResolve* resolves = command_buffer.CmdResolveImageEmplace(
+          source_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, vulkan_texture.image(),
+          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region_count);
+      for (uint32_t i = 0; i < region_count; ++i) {
+        const VkImageCopy& region = regions[i];
+        VkImageResolve& resolve = resolves[i];
+        resolve.srcSubresource = region.srcSubresource;
+        resolve.srcOffset = region.srcOffset;
+        resolve.dstSubresource = region.dstSubresource;
+        resolve.dstOffset = region.dstOffset;
+        resolve.extent = region.extent;
+      }
+    } else if (REXCVAR_GET(vulkan_resolve_to_texture_blit)) {
       // 1:1 blits of the same regions. Measured no faster than the copy on an
       // RTX 2080 Ti (the bubble dominates, not the pixels); kept for A/B.
       VkImageBlit* blits = command_buffer.CmdBlitImageEmplace(
@@ -1890,11 +1906,12 @@ void VulkanTextureCache::IssueResolveCopies(VkImage source_image, uint32_t sourc
                                     region_count, regions);
     }
     if (rex::debug::profiling::IsEnabled()) {
-      std::string what = fmt::format("{}x{} fmt {} level {} {}x{} px x{} dest",
+      std::string what = fmt::format("{}x{} fmt {} level {} {}x{} px x{} dest{}",
                                      vulkan_texture.key().GetWidth(),
                                      vulkan_texture.key().GetHeight(),
                                      uint32_t(vulkan_texture.key().format), destination.level,
-                                     width, height, pending_resolve_copy_destinations_.size());
+                                     width, height, pending_resolve_copy_destinations_.size(),
+                                     source_multisampled ? " msaa" : "");
       ++copy_tally_[what];
       copy_tally_pixels_ += uint64_t(width) * height;
       if (++copy_tally_total_ % 4000 == 0) {

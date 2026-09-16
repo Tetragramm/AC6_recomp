@@ -156,8 +156,9 @@ class VulkanTextureCache final : public TextureCache {
   // (destination columns / rows below the fill read the source column / row
   // at the fill, like the copy shaders). The caller calls MarkRangeAsResolved
   // BEFORE this, since that fires the watches that this clears.
-  void IssueResolveCopies(VkImage source_image, uint32_t source_x, uint32_t source_y,
-                          uint32_t fill_x, uint32_t fill_y);
+  // A multisampled source is averaged with vkCmdResolveImage instead.
+  void IssueResolveCopies(VkImage source_image, bool source_multisampled, uint32_t source_x,
+                          uint32_t source_y, uint32_t fill_x, uint32_t fill_y);
   void UseScaledResolveBufferForRead();
   void UseScaledResolveBufferForWrite(uint64_t written_start_scaled,
                                       uint64_t written_length_scaled);

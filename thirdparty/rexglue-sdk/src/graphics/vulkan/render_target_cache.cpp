@@ -74,6 +74,11 @@ REXCVAR_DEFINE_BOOL(ac6_edram_no_transfers, false, "AC6/Enhancements",
                     "ownership change. Logs every transfer it skips ([EDRAM-SKIP]) so the "
                     "aliases the game actually relies on can be identified.");
 
+REXCVAR_DEFINE_BOOL(vulkan_resolve_to_texture_msaa, true, "GPU",
+                    "Also resolve multisampled render targets into texture images with "
+                    "vkCmdResolveImage when the resolve averages all samples")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(vulkan_resolve_to_texture_image, false, "GPU",
                     "Resolve straight into the destination texture's host image with a copy when "
                     "the texture already exists and the render target holds its exact bits, "
@@ -5438,6 +5443,10 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
                           dest_rt_key.is_depth ? "depth" : "color", uint32_t(dest_rt_key.base_tiles),
                           uint32_t(dest_pitch_tiles), 1u << uint32_t(dest_rt_key.msaa_samples),
                           transfer_rectangle_count);
+            // Per-pattern GPU time: the label carries the pattern, keyed on
+            // its hash, so the report shows which alias pair costs what.
+            command_processor_.GpuTimerMarkPass(std::hash<std::string_view>{}(buf),
+                                                std::string("xfer ") + buf);
             static std::mutex hist_mutex;
             static std::unordered_map<std::string, uint32_t> hist;
             static auto last = std::chrono::steady_clock::now();
@@ -6941,17 +6950,35 @@ bool VulkanRenderTargetCache::TryPrepareResolveCopyToTexture(
   if (uint32_t(dest_info.copy_dest_endian) >= 4) {
     return reject("endian128");
   }
-  if (edram_info.msaa_samples != xenos::MsaaSamples::k1X) {
-    if (resolve_copy_to_texture_msaa_log_count_ < 12) {
-      ++resolve_copy_to_texture_msaa_log_count_;
-      REXGPU_ERROR("[RTT] msaa: {}x source, sample select {}, {} -> fmt {}, {}x{} px, dest {:08X}",
-                   1u << uint32_t(edram_info.msaa_samples),
-                   uint32_t(resolve_info.copy_dest_coordinate_info.copy_sample_select),
-                   xenos::GetColorRenderTargetFormatName(rt_format), uint32_t(dest_format),
-                   resolve_info.coordinate_info.width_div_8 << 3, resolve_info.height_div_8 << 3,
-                   resolve_info.copy_dest_base);
+  // Multisampled sources: only an averaging sample select over all the
+  // samples is a hardware resolve. Guest 2x is native 2-sample only when the
+  // device supports it; emulated as 4x it writes samples 0 and 3 alone, and
+  // the hardware average would mix in the two unwritten ones.
+  xenos::MsaaSamples msaa_samples = edram_info.msaa_samples;
+  if (msaa_samples != xenos::MsaaSamples::k1X) {
+    if (!REXCVAR_GET(vulkan_resolve_to_texture_msaa)) {
+      return reject("msaa (disabled)");
     }
-    return reject("msaa");
+    xenos::CopySampleSelect sample_select =
+        resolve_info.copy_dest_coordinate_info.copy_sample_select;
+    bool averaging_all =
+        (msaa_samples == xenos::MsaaSamples::k2X && sample_select == xenos::CopySampleSelect::k01) ||
+        (msaa_samples == xenos::MsaaSamples::k4X &&
+         sample_select == xenos::CopySampleSelect::k0123);
+    if (!averaging_all) {
+      if (resolve_copy_to_texture_msaa_log_count_ < 12) {
+        ++resolve_copy_to_texture_msaa_log_count_;
+        REXGPU_ERROR("[RTT] msaa: {}x source, sample select {}, {} -> fmt {}, {}x{} px, dest {:08X}",
+                     1u << uint32_t(msaa_samples), uint32_t(sample_select),
+                     xenos::GetColorRenderTargetFormatName(rt_format), uint32_t(dest_format),
+                     resolve_info.coordinate_info.width_div_8 << 3, resolve_info.height_div_8 << 3,
+                     resolve_info.copy_dest_base);
+      }
+      return reject("msaa sample select");
+    }
+    if (msaa_samples == xenos::MsaaSamples::k2X && !msaa_2x_attachments_supported_) {
+      return reject("msaa 2x emulated");
+    }
   }
   if (!xenos::IsColorResolveFormatBitwiseEquivalent(rt_format, xenos::ColorFormat(dest_format))) {
     return reject("format");
@@ -6973,8 +7000,11 @@ bool VulkanRenderTargetCache::TryPrepareResolveCopyToTexture(
   }
   auto& vulkan_rt = *static_cast<VulkanRenderTarget*>(rectangle.render_target);
   RenderTargetKey rt_key = vulkan_rt.key();
-  if (rt_key.is_depth || rt_key.msaa_samples != xenos::MsaaSamples::k1X) {
+  if (rt_key.is_depth) {
     return reject("owner kind");
+  }
+  if (rt_key.msaa_samples != msaa_samples) {
+    return reject("owner msaa");
   }
   // The owner's pixels are what the dump would have packed; they are only the
   // resolve's bits if the formats agree.
@@ -6993,16 +7023,21 @@ bool VulkanRenderTargetCache::TryPrepareResolveCopyToTexture(
   }
 
   // Source rectangle in unscaled render target pixels (CPU mirror of the dump
-  // shader's addressing for 1x MSAA).
+  // shader's addressing): an EDRAM tile is 80x16 samples, so 80x16 pixels at
+  // 1x, 80x8 at 2x, 40x8 at 4x (and half as wide at 64bpp); the resolve
+  // offsets within the tile are in pixels.
   uint32_t width = resolve_info.coordinate_info.width_div_8 << xenos::kResolveAlignmentPixelsLog2;
   uint32_t height = resolve_info.height_div_8 << xenos::kResolveAlignmentPixelsLog2;
   uint32_t rt_pitch_tiles = rt_key.GetPitchTiles();
   uint32_t source_tile = dump_base - rt_key.base_tiles;
-  uint32_t tile_width = xenos::kEdramTileWidthSamples >> uint32_t(rt_key.Is64bpp());
+  uint32_t tile_width = (xenos::kEdramTileWidthSamples >> uint32_t(rt_key.Is64bpp())) >>
+                        uint32_t(msaa_samples >= xenos::MsaaSamples::k4X);
+  uint32_t tile_height =
+      xenos::kEdramTileHeightSamples >> uint32_t(msaa_samples >= xenos::MsaaSamples::k2X);
   uint32_t src_x = (source_tile % rt_pitch_tiles) * tile_width +
                    (resolve_info.coordinate_info.edram_offset_x_div_8
                     << xenos::kResolveAlignmentPixelsLog2);
-  uint32_t src_y = (source_tile / rt_pitch_tiles) * xenos::kEdramTileHeightSamples +
+  uint32_t src_y = (source_tile / rt_pitch_tiles) * tile_height +
                    (resolve_info.coordinate_info.edram_offset_y_div_8
                     << xenos::kResolveAlignmentPixelsLog2);
   if (src_x + width > rt_key.GetWidth() ||
@@ -7024,6 +7059,7 @@ bool VulkanRenderTargetCache::TryPrepareResolveCopyToTexture(
 
   // Host pixels: the render target and a scaled-resolve texture are scaled
   // alike, so the copy is 1:1.
+  resolve_copy_to_texture_multisampled_ = msaa_samples != xenos::MsaaSamples::k1X;
   resolve_copy_to_texture_source_x_ = src_x * draw_resolution_scale_x();
   resolve_copy_to_texture_source_y_ = src_y * draw_resolution_scale_y();
   // Half-pixel offset fill: with resolution scaling the guest's half-pixel
@@ -7058,7 +7094,8 @@ void VulkanRenderTargetCache::IssueResolveCopyToTexture(VulkanTextureCache& text
   vulkan_rt.SetUsage(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
                      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
   // Submits the barriers (ending any render pass) before each copy.
-  texture_cache.IssueResolveCopies(vulkan_rt.image(), resolve_copy_to_texture_source_x_,
+  texture_cache.IssueResolveCopies(vulkan_rt.image(), resolve_copy_to_texture_multisampled_,
+                                   resolve_copy_to_texture_source_x_,
                                    resolve_copy_to_texture_source_y_,
                                    resolve_copy_to_texture_fill_x_, resolve_copy_to_texture_fill_y_);
   COUNT_profile_add("gpu/render_target_cache/resolve_copies_to_texture", 1);

@@ -918,6 +918,7 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // the owning render target, the resolve origin in its host pixels, and the
   // half-pixel offset fill.
   VulkanRenderTarget* resolve_copy_to_texture_rt_ = nullptr;
+  bool resolve_copy_to_texture_multisampled_ = false;
   uint32_t resolve_copy_to_texture_source_x_ = 0;
   uint32_t resolve_copy_to_texture_source_y_ = 0;
   uint32_t resolve_copy_to_texture_fill_x_ = 0;
