@@ -342,6 +342,166 @@ void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_
   shared_memory().RangeWrittenByGpu(start_unscaled, length_unscaled);
 }
 
+bool TextureCache::FindResolveDestinationTextures(
+    uint32_t copy_dest_base, uint32_t extent_start, uint32_t extent_length,
+    xenos::TextureFormat format, uint32_t endianness, uint32_t pitch_div_32, uint32_t bpp_log2,
+    uint32_t offset_x_div_8, uint32_t offset_y_div_8, bool scaled, uint32_t width,
+    uint32_t height, std::vector<ResolveDestination>& destinations_out,
+    const char*& reject_reason_out) {
+  destinations_out.clear();
+  reject_reason_out = nullptr;
+  if (!extent_length) {
+    reject_reason_out = "empty";
+    return false;
+  }
+  // Below 32bpp the tiled address function interleaves 64x64 / 128x128
+  // portions, so whole 32x32 tiles are not laid out linearly and the base
+  // offset can't be inverted into a texel position the simple way.
+  if (bpp_log2 < 2) {
+    reject_reason_out = "bpp";
+    return false;
+  }
+  if (!pitch_div_32) {
+    reject_reason_out = "pitch0";
+    return false;
+  }
+  copy_dest_base &= 0x1FFFFFFF;
+  extent_start &= 0x1FFFFFFF;
+  uint32_t extent_end = extent_start + std::min(extent_length, 0x20000000 - extent_start);
+  uint32_t tile_bytes_log2 = 10 + bpp_log2;
+
+  auto reject = [&](const char* reason) {
+    destinations_out.clear();
+    reject_reason_out = reason;
+    return false;
+  };
+
+  for (const auto& texture_pair : textures_) {
+    Texture* texture = texture_pair.second.get();
+    const TextureKey& key = texture->key();
+    const texture_util::TextureGuestLayout& layout = texture->guest_layout();
+    uint32_t base_start = key.base_page << 12;
+    uint32_t base_size = key.base_page ? texture->GetGuestBaseSize() : 0;
+    uint32_t mips_start = key.mip_page << 12;
+    uint32_t mips_size = key.mip_page ? texture->GetGuestMipsSize() : 0;
+    bool in_base = base_size && base_start < extent_end && base_start + base_size > extent_start;
+    bool in_mips = mips_size && mips_start < extent_end && mips_start + mips_size > extent_start;
+    if (!in_base && !in_mips) {
+      continue;
+    }
+    if (scaled && !key.scaled_resolve) {
+      // Dead: with the pages marked resolved, the scaled key is the one the
+      // fetch constant selects from now on. A CPU write unmarks them, and
+      // fires this texture's own watch, so it reloads from memory correctly.
+      continue;
+    }
+    if (key.dimension != xenos::DataDimension::k2DOrStacked ||
+        key.depth_or_array_size_minus_1 || !key.tiled) {
+      return reject("layout");
+    }
+    if (key.format != format) {
+      return reject("format");
+    }
+    if (uint32_t(key.endianness) != endianness) {
+      return reject("endian");
+    }
+    // With resolution scaling the render target is scaled, so the texture
+    // image must be too (unscaled here means the format has no scaled resolve
+    // support, and the copy can't downsample).
+    if (bool(key.scaled_resolve) != scaled) {
+      return reject("scaled state");
+    }
+    if (in_base && in_mips) {
+      return reject("base and mips");
+    }
+    // An outdated image still owes memory a reload that would overwrite the
+    // copy; and after the copy the texture is declared current, so nothing
+    // pending may be hidden behind that.
+    if (texture->outdated_mask()) {
+      return reject("texture outdated");
+    }
+
+    // Locate the level and its origin.
+    uint32_t level = 0;
+    uint32_t level_start;
+    uint32_t level_pitch_div_32;
+    uint32_t level_width, level_height;
+    if (in_base) {
+      level_start = base_start;
+      level_pitch_div_32 = key.pitch;
+      level_width = key.GetWidth();
+      level_height = key.GetHeight();
+    } else {
+      if (copy_dest_base < mips_start) {
+        return reject("base before mips");
+      }
+      uint32_t mips_offset = copy_dest_base - mips_start;
+      uint32_t max_level = std::min(uint32_t(key.mip_max_level), layout.max_level);
+      level = 0;
+      for (uint32_t i = 1; i <= max_level; ++i) {
+        if (layout.mip_offsets_bytes[i] <= mips_offset) {
+          level = i;
+        }
+      }
+      if (!level) {
+        return reject("mip level");
+      }
+      if (level >= layout.packed_level) {
+        // The packed mip tail stores several levels in one tile.
+        return reject("packed mips");
+      }
+      level_start = mips_start + layout.mip_offsets_bytes[level];
+      level_pitch_div_32 = layout.mips[level].row_pitch_bytes >> (5 + bpp_log2);
+      level_width = std::max(key.GetWidth() >> level, UINT32_C(1));
+      level_height = std::max(key.GetHeight() >> level, UINT32_C(1));
+    }
+    if (level_pitch_div_32 != pitch_div_32) {
+      if (resolve_destination_log_count_[1] < 16) {
+        ++resolve_destination_log_count_[1];
+        REXGPU_ERROR(
+            "[RTT] pitch: resolve pitch {} x32, texture {}x{} pitch {} level {} (pitch {}) fmt {} "
+            "base {:08X}",
+            pitch_div_32, key.GetWidth(), key.GetHeight(), uint32_t(key.pitch), level,
+            level_pitch_div_32, uint32_t(key.format), level_start);
+      }
+      return reject("pitch");
+    }
+    if (copy_dest_base < level_start) {
+      return reject("base before level");
+    }
+    // The resolve base is the level base plus the tiled offset of the
+    // 32x32-aligned corner of the rectangle, which at >= 32bpp is whole tiles
+    // of (1024 << bpp_log2) bytes in row-major order at the 32-texel pitch.
+    uint32_t delta = copy_dest_base - level_start;
+    if (delta & ((UINT32_C(1) << tile_bytes_log2) - 1)) {
+      return reject("base not tile-aligned");
+    }
+    uint32_t tile = delta >> tile_bytes_log2;
+    uint32_t dest_x = ((tile % pitch_div_32) << xenos::kTextureTileWidthHeightLog2) +
+                      (offset_x_div_8 << xenos::kResolveAlignmentPixelsLog2);
+    uint32_t dest_y = ((tile / pitch_div_32) << xenos::kTextureTileWidthHeightLog2) +
+                      (offset_y_div_8 << xenos::kResolveAlignmentPixelsLog2);
+    // Resolve rectangles are 8-aligned, so they routinely overshoot a texture
+    // like 160x90 by a few rows; memory has room for that in the 32x32 tiles,
+    // the image doesn't, and nothing reads the overshoot. Clip to the level.
+    if (dest_x >= level_width || dest_y >= level_height) {
+      return reject("rectangle outside texture");
+    }
+    ResolveDestination& destination = destinations_out.emplace_back();
+    destination.texture = texture;
+    destination.level = level;
+    destination.dest_x = dest_x;
+    destination.dest_y = dest_y;
+    destination.width = std::min(width, level_width - dest_x);
+    destination.height = std::min(height, level_height - dest_y);
+  }
+  if (destinations_out.empty()) {
+    reject_reason_out = "no texture";
+    return false;
+  }
+  return true;
+}
+
 uint32_t TextureCache::GuestToHostSwizzle(uint32_t guest_swizzle, uint32_t host_format_swizzle) {
   uint32_t host_swizzle = 0;
   for (uint32_t i = 0; i < 4; ++i) {

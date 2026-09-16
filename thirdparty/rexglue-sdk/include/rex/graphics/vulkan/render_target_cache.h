@@ -836,6 +836,19 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
                               VkDescriptorSet descriptor_set_dest, bool draw_resolution_scaled,
                               uint32_t dest_binding_offset);
 
+  // Render-target-as-texture: when the resolve rectangle is owned by one
+  // single-sampled color render target whose bits are what the destination
+  // texture would load anyway, the resolve becomes a vkCmdCopyImage from the
+  // render target into the texture's own image, skipping both the tiled
+  // memory write and the untiling load. TryPrepare records nothing; on
+  // success, Issue records the copy. Counted and rejected-by-reason for the
+  // periodic log line.
+  bool TryPrepareResolveCopyToTexture(const draw_util::ResolveInfo& resolve_info,
+                                      VulkanTextureCache& texture_cache,
+                                      bool draw_resolution_scaled);
+  void IssueResolveCopyToTexture(VulkanTextureCache& texture_cache);
+  void LogResolveCopyToTextureStats();
+
   // Writes contents of host render targets within rectangles from
   // ResolveInfo::GetCopyEdramTileSpan to edram_buffer_.
   bool DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used, uint32_t dump_rows,
@@ -900,6 +913,19 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   uint64_t direct_resolve_attempt_count_ = 0;
   uint64_t direct_resolve_success_count_ = 0;
   uint64_t direct_resolve_fallback_count_ = 0;
+
+  // State between TryPrepareResolveCopyToTexture and IssueResolveCopyToTexture:
+  // the owning render target, the resolve origin in its host pixels, and the
+  // half-pixel offset fill.
+  VulkanRenderTarget* resolve_copy_to_texture_rt_ = nullptr;
+  uint32_t resolve_copy_to_texture_source_x_ = 0;
+  uint32_t resolve_copy_to_texture_source_y_ = 0;
+  uint32_t resolve_copy_to_texture_fill_x_ = 0;
+  uint32_t resolve_copy_to_texture_fill_y_ = 0;
+  uint64_t resolve_copy_to_texture_attempt_count_ = 0;
+  uint64_t resolve_copy_to_texture_success_count_ = 0;
+  uint32_t resolve_copy_to_texture_msaa_log_count_ = 0;
+  std::vector<std::pair<const char*, uint64_t>> resolve_copy_to_texture_rejects_;
 
   // For traces.
   VkBuffer edram_snapshot_download_buffer_ = VK_NULL_HANDLE;

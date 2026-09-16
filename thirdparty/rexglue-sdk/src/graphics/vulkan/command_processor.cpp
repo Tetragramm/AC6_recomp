@@ -2119,8 +2119,9 @@ bool VulkanCommandProcessor::SetupContext() {
 }
 
 void VulkanCommandProcessor::ShutdownContext() {
-  GpuTimerShutdown();
   AwaitAllQueueOperationsCompletion();
+  // After the wait: the last submission still references the query pool.
+  GpuTimerShutdown();
   InvalidateAllVertexBufferResidency();
   ShutdownOcclusionQueryResources();
 

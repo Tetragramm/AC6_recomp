@@ -132,6 +132,32 @@ class VulkanTextureCache final : public TextureCache {
                                               length_scaled_alignment_log2);
   }
   VkBuffer scaled_resolve_buffer() const { return scaled_resolve_buffer_; }
+
+  // Render-target-as-texture: a resolve whose destination textures already
+  // exist is written as host image copies into those textures instead of a
+  // tiled-memory round trip (see TextureCache::FindResolveDestinationTextures
+  // for the rules). Prepare records nothing and, on success, holds the
+  // destinations for Issue, which must follow within the same resolve.
+  // source_format is the render target's VkFormat: the copy is a bit copy, so
+  // the textures' images must use it too. rb_swap is the resolve's red/blue
+  // swap, which the textures' views then compose (VulkanTexture::
+  // image_rb_swapped).
+  bool PrepareResolveCopyDestinations(uint32_t copy_dest_base, uint32_t extent_start,
+                                      uint32_t extent_length, xenos::TextureFormat format,
+                                      uint32_t endianness, uint32_t pitch_div_32,
+                                      uint32_t bpp_log2, uint32_t offset_x_div_8,
+                                      uint32_t offset_y_div_8, bool scaled, uint32_t width,
+                                      uint32_t height, VkFormat source_format, bool rb_swap,
+                                      const char*& reject_reason_out);
+  // Records the copies from a source image already in TRANSFER_SRC_OPTIMAL
+  // into the prepared textures (transitioning them), then declares them
+  // current and re-arms their memory watches. source_x/y is the resolve
+  // origin in host (scaled) pixels; fill_x/y is the half-pixel offset fill
+  // (destination columns / rows below the fill read the source column / row
+  // at the fill, like the copy shaders). The caller calls MarkRangeAsResolved
+  // BEFORE this, since that fires the watches that this clears.
+  void IssueResolveCopies(VkImage source_image, uint32_t source_x, uint32_t source_y,
+                          uint32_t fill_x, uint32_t fill_y);
   void UseScaledResolveBufferForRead();
   void UseScaledResolveBufferForWrite(uint64_t written_start_scaled,
                                       uint64_t written_length_scaled);
@@ -145,6 +171,9 @@ class VulkanTextureCache final : public TextureCache {
   uint32_t GetMaxHostTextureDepthOrArraySize(xenos::DataDimension dimension) const override;
 
   std::unique_ptr<Texture> CreateTexture(TextureKey key) override;
+  // The VkFormat CreateTexture gives the image for the key (the unsigned
+  // format unless the key is a separate signed one), or VK_FORMAT_UNDEFINED.
+  VkFormat GetTextureImageFormat(TextureKey key) const;
 
   bool EnsureScaledResolveMemoryCommitted(uint32_t start_unscaled, uint32_t length_unscaled,
                                           uint32_t length_scaled_alignment_log2 = 0) override;
@@ -217,6 +246,14 @@ class VulkanTextureCache final : public TextureCache {
     VkImageView GetView(bool is_signed, uint32_t host_swizzle, bool is_array = true);
     VkImageView GetOrCreate3DAs2DImageView(bool is_signed, uint32_t host_swizzle);
 
+    // Whether the image holds the render target's channel order rather than
+    // memory's: a resolve with the red/blue swap is written to the image by a
+    // straight copy, and the views compose the swap instead. Set by the
+    // resolve copy, cleared by a load from memory; the cache refreshes the
+    // binding views on every change.
+    bool image_rb_swapped() const { return image_rb_swapped_; }
+    void SetImageRBSwapped(bool swapped) { image_rb_swapped_ = swapped; }
+
    private:
     union ViewKey {
       uint32_t key;
@@ -269,12 +306,19 @@ class VulkanTextureCache final : public TextureCache {
     VmaAllocation allocation_;
 
     Usage usage_ = Usage::kUndefined;
+    bool image_rb_swapped_ = false;
 
     std::unordered_map<ViewKey, VkImageView, ViewKey::Hasher> views_;
     std::unique_ptr<VulkanTexture> texture_3d_as_2d_;
     VkImageView image_view_3d_as_2d_unsigned_ = VK_NULL_HANDLE;
     VkImageView image_view_3d_as_2d_signed_ = VK_NULL_HANDLE;
   };
+
+  // Re-derives the image views of one binding from the texture cache state.
+  void UpdateTextureBindingViews(uint32_t binding_index);
+  // For a change in how a texture's views must be built (image_rb_swapped):
+  // refreshes the bindings referencing it. Descriptors are written per draw.
+  void RefreshBindingViewsForTexture(const VulkanTexture& texture);
 
   struct VulkanTextureBinding {
     VkImageView image_view_unsigned;
@@ -451,6 +495,17 @@ class VulkanTextureCache final : public TextureCache {
   uint32_t custom_border_color_sampler_count_ = 0;
 
   VkBuffer scaled_resolve_buffer_ = VK_NULL_HANDLE;
+
+  // Destinations held between PrepareResolveCopyDestinations and
+  // IssueResolveCopies.
+  std::vector<ResolveDestination> pending_resolve_copy_destinations_;
+  bool pending_resolve_copy_rb_swap_ = false;
+  // Diagnostic: which textures go through the untiling load.
+  std::unordered_map<std::string, uint32_t> load_tally_;
+  uint64_t load_tally_total_ = 0;
+  std::unordered_map<std::string, uint32_t> copy_tally_;
+  uint64_t copy_tally_total_ = 0;
+  uint64_t copy_tally_pixels_ = 0;
   uint64_t scaled_resolve_buffer_size_ = 0;
   bool scaled_resolve_buffer_sparse_ = false;
   uint32_t scaled_resolve_buffer_memory_type_ = UINT32_MAX;

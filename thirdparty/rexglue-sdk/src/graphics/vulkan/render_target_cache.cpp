@@ -69,6 +69,16 @@ REXCVAR_DEFINE_STRING(render_target_path_vulkan, "", "GPU/Vulkan",
 //     "GPU");
 
 REXCVAR_DECLARE(bool, gpu_timestamps);
+REXCVAR_DEFINE_BOOL(ac6_edram_no_transfers, false, "AC6/Enhancements",
+                    "EXPERIMENT: never copy EDRAM contents between host render targets on "
+                    "ownership change. Logs every transfer it skips ([EDRAM-SKIP]) so the "
+                    "aliases the game actually relies on can be identified.");
+
+REXCVAR_DEFINE_BOOL(vulkan_resolve_to_texture_image, false, "GPU",
+                    "Resolve straight into the destination texture's host image with a copy when "
+                    "the texture already exists and the render target holds its exact bits, "
+                    "skipping the tiled-memory write and the untiling load")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics::vulkan {
 
@@ -1376,8 +1386,16 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
       const draw_util::ResolveCopyShaderInfo& copy_shader_info =
           draw_util::resolve_copy_shader_info[size_t(copy_shader)];
       bool direct_resolved = false;
+      bool copy_to_texture = false;
       if (GetPath() == Path::kHostRenderTargets) {
-        if (REXCVAR_GET(direct_host_resolve)) {
+        if (REXCVAR_GET(vulkan_resolve_to_texture_image)) {
+          copy_to_texture =
+              TryPrepareResolveCopyToTexture(resolve_info, texture_cache, draw_resolution_scaled);
+          if (!(resolve_copy_to_texture_attempt_count_ & UINT64_C(2047))) {
+            LogResolveCopyToTextureStats();
+          }
+        }
+        if (!copy_to_texture && REXCVAR_GET(direct_host_resolve)) {
           direct_resolved =
               TryResolveCopyDirectly(resolve_info, copy_shader, draw_resolution_scaled);
           if (direct_resolved) {
@@ -1402,7 +1420,7 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
                 direct_resolve_fallback_count_);
           }
         }
-        if (!direct_resolved) {
+        if (!copy_to_texture && !direct_resolved) {
           // Dump the current contents of the render targets owning the affected
           // range to edram_buffer_.
           uint32_t dump_base;
@@ -1452,6 +1470,16 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
         REXGPU_ERROR(
             "VulkanRenderTargetCache: Failed to obtain the resolve destination "
             "memory region");
+      } else if (copy_to_texture) {
+        // Fires the destination texture's watch (and marks the pages as
+        // scaled-resolved); IssueResolveCopy declares it current again after
+        // the copy, so the order matters.
+        texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
+                                          resolve_info.copy_dest_extent_length);
+        IssueResolveCopyToTexture(texture_cache);
+        written_address_out = resolve_info.copy_dest_extent_start;
+        written_length_out = resolve_info.copy_dest_extent_length;
+        copied = true;
       } else {
         // TODO(Triang3l): Switching between descriptors if exceeding
         // maxStorageBufferRange.
@@ -1636,8 +1664,56 @@ bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
       RenderTarget* const* depth_and_color_render_targets =
           last_update_accumulated_render_targets();
 
-      PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
-                                       depth_and_color_render_targets, last_update_transfers());
+      if (REXCVAR_GET(ac6_edram_no_transfers)) {
+        // Experiment: ownership changes, contents do not follow. Each host
+        // render target keeps its own pixels, as on a PC; a target bound over
+        // another's EDRAM range starts with whatever it held last time it was
+        // bound. Aliases the game relies on WITHOUT resolving (reading depth,
+        // stencil or colour written under a different key) break here, and
+        // that is the point: the skipped-transfer log below names them.
+        static std::mutex hist_mutex;
+        static std::unordered_map<std::string, uint32_t> hist;
+        static auto last = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> lock(hist_mutex);
+        for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+          const RenderTarget* dest = depth_and_color_render_targets[i];
+          const std::vector<Transfer>& transfers = last_update_transfers()[i];
+          if (!dest || transfers.empty()) {
+            continue;
+          }
+          COUNT_profile_add("gpu/edram_transfers_skipped", int64_t(transfers.size()));
+          const RenderTargetKey dk = dest->key();
+          for (const Transfer& t : transfers) {
+            const RenderTargetKey sk = t.source->key();
+            char buf[96];
+            std::snprintf(buf, sizeof(buf), "%s %u/%u/%ux -> %s %u/%u/%ux",
+                          sk.is_depth ? "depth" : "color", uint32_t(sk.base_tiles),
+                          uint32_t(sk.GetPitchTiles()), 1u << uint32_t(sk.msaa_samples),
+                          dk.is_depth ? "depth" : "color", uint32_t(dk.base_tiles),
+                          uint32_t(dk.GetPitchTiles()), 1u << uint32_t(dk.msaa_samples));
+            ++hist[buf];
+          }
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last >= std::chrono::seconds(3) && !hist.empty()) {
+          last = now;
+          std::vector<std::pair<uint32_t, std::string>> rows;
+          for (auto& kv : hist) rows.emplace_back(kv.second, kv.first);
+          std::sort(rows.rbegin(), rows.rend());
+          REXGPU_ERROR("[EDRAM-SKIP] transfers skipped in the last 3s, by pattern:");
+          for (size_t i = 0; i < rows.size() && i < 12; ++i) {
+            REXGPU_ERROR("[EDRAM-SKIP]   {:6}  {}", rows[i].first, rows[i].second);
+          }
+          hist.clear();
+        }
+        // Resolve clears are real clears and must still happen.
+        std::vector<Transfer> none[1 + xenos::kMaxColorRenderTargets];
+        PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
+                                         depth_and_color_render_targets, none);
+      } else {
+        PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
+                                         depth_and_color_render_targets, last_update_transfers());
+      }
 
       if (depth_and_color_render_targets[0]) {
         render_pass_key.depth_and_color_used |= 1 << 0;
@@ -2138,7 +2214,9 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
     if (image_create_info.format != transfer_format || is_srgb_view_needed) {
       image_create_info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
     }
-    image_create_info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    // Source of the render-target-as-texture resolve copy.
+    image_create_info.usage |=
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
   }
   if (image_create_info.format == VK_FORMAT_UNDEFINED) {
     REXGPU_ERROR("VulkanRenderTargetCache: Unknown {} render target format {}",
@@ -6817,6 +6895,184 @@ void VulkanRenderTargetCache::IssueDirectResolveCopy(
             kDumpSamplesPerGroupY,
         1);
   }
+}
+
+bool VulkanRenderTargetCache::TryPrepareResolveCopyToTexture(
+    const draw_util::ResolveInfo& resolve_info, VulkanTextureCache& texture_cache,
+    bool draw_resolution_scaled) {
+  ++resolve_copy_to_texture_attempt_count_;
+  resolve_copy_to_texture_rt_ = nullptr;
+  auto reject = [this](const char* reason) {
+    for (auto& entry : resolve_copy_to_texture_rejects_) {
+      if (!std::strcmp(entry.first, reason)) {
+        ++entry.second;
+        return false;
+      }
+    }
+    resolve_copy_to_texture_rejects_.emplace_back(reason, 1);
+    return false;
+  };
+
+  // The copy is a bit copy: everything the copy shader would have changed on
+  // the way to memory, and everything the load shader would have undone on the
+  // way back, has to cancel out.
+  if (resolve_info.IsCopyingDepth()) {
+    return reject("depth");
+  }
+  const reg::RB_COPY_DEST_INFO& dest_info = resolve_info.copy_dest_info;
+  if (dest_info.copy_dest_array) {
+    return reject("array");
+  }
+  if (dest_info.copy_dest_exp_bias) {
+    return reject("exp bias");
+  }
+  const draw_util::ResolveEdramInfo& edram_info = resolve_info.color_edram_info;
+  xenos::ColorRenderTargetFormat rt_format = xenos::ColorRenderTargetFormat(edram_info.format);
+  xenos::TextureFormat dest_format = xenos::TextureFormat(dest_info.copy_dest_format);
+  // The red/blue swap (Direct3D 9's A8R8G8B8, so every AC6 resolve) is not
+  // applied to the copied bits; the texture's views compose it instead, which
+  // is exact for four 8-bit channels only.
+  bool rb_swap = bool(dest_info.copy_dest_swap);
+  if (rb_swap && dest_format != xenos::TextureFormat::k_8_8_8_8) {
+    return reject("swap");
+  }
+  // Texture keys hold a 2-bit Endian; the 64/128-bit swaps have no texture
+  // equivalent.
+  if (uint32_t(dest_info.copy_dest_endian) >= 4) {
+    return reject("endian128");
+  }
+  if (edram_info.msaa_samples != xenos::MsaaSamples::k1X) {
+    if (resolve_copy_to_texture_msaa_log_count_ < 12) {
+      ++resolve_copy_to_texture_msaa_log_count_;
+      REXGPU_ERROR("[RTT] msaa: {}x source, sample select {}, {} -> fmt {}, {}x{} px, dest {:08X}",
+                   1u << uint32_t(edram_info.msaa_samples),
+                   uint32_t(resolve_info.copy_dest_coordinate_info.copy_sample_select),
+                   xenos::GetColorRenderTargetFormatName(rt_format), uint32_t(dest_format),
+                   resolve_info.coordinate_info.width_div_8 << 3, resolve_info.height_div_8 << 3,
+                   resolve_info.copy_dest_base);
+    }
+    return reject("msaa");
+  }
+  if (!xenos::IsColorResolveFormatBitwiseEquivalent(rt_format, xenos::ColorFormat(dest_format))) {
+    return reject("format");
+  }
+
+  // One render target must own the whole tile span - the dump path would
+  // otherwise read whatever the EDRAM buffer holds for the rest.
+  uint32_t dump_base, dump_row_length_used, dump_rows, dump_pitch;
+  resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used, dump_rows, dump_pitch);
+  GetResolveCopyRectanglesToDump(dump_base, dump_row_length_used, dump_rows, dump_pitch,
+                                 dump_rectangles_);
+  if (dump_rectangles_.size() != 1) {
+    return reject(dump_rectangles_.empty() ? "no owner" : "several owners");
+  }
+  const ResolveCopyDumpRectangle& rectangle = dump_rectangles_[0];
+  if (!rectangle.render_target || rectangle.row_first != 0 || rectangle.rows != dump_rows ||
+      rectangle.row_first_start != 0 || rectangle.row_last_end != dump_row_length_used) {
+    return reject("partial owner");
+  }
+  auto& vulkan_rt = *static_cast<VulkanRenderTarget*>(rectangle.render_target);
+  RenderTargetKey rt_key = vulkan_rt.key();
+  if (rt_key.is_depth || rt_key.msaa_samples != xenos::MsaaSamples::k1X) {
+    return reject("owner kind");
+  }
+  // The owner's pixels are what the dump would have packed; they are only the
+  // resolve's bits if the formats agree.
+  if (rt_key.GetColorFormat() != rt_format) {
+    return reject("owner format");
+  }
+  if (rt_key.GetPitchTiles() != dump_pitch) {
+    return reject("owner pitch");
+  }
+  if (dump_base < rt_key.base_tiles) {
+    return reject("owner base");
+  }
+  VkFormat rt_vk_format = GetColorVulkanFormat(rt_format);
+  if (rt_vk_format == VK_FORMAT_UNDEFINED) {
+    return reject("owner host format");
+  }
+
+  // Source rectangle in unscaled render target pixels (CPU mirror of the dump
+  // shader's addressing for 1x MSAA).
+  uint32_t width = resolve_info.coordinate_info.width_div_8 << xenos::kResolveAlignmentPixelsLog2;
+  uint32_t height = resolve_info.height_div_8 << xenos::kResolveAlignmentPixelsLog2;
+  uint32_t rt_pitch_tiles = rt_key.GetPitchTiles();
+  uint32_t source_tile = dump_base - rt_key.base_tiles;
+  uint32_t tile_width = xenos::kEdramTileWidthSamples >> uint32_t(rt_key.Is64bpp());
+  uint32_t src_x = (source_tile % rt_pitch_tiles) * tile_width +
+                   (resolve_info.coordinate_info.edram_offset_x_div_8
+                    << xenos::kResolveAlignmentPixelsLog2);
+  uint32_t src_y = (source_tile / rt_pitch_tiles) * xenos::kEdramTileHeightSamples +
+                   (resolve_info.coordinate_info.edram_offset_y_div_8
+                    << xenos::kResolveAlignmentPixelsLog2);
+  if (src_x + width > rt_key.GetWidth() ||
+      src_y + height > GetRenderTargetHeight(rt_key.pitch_tiles_at_32bpp, rt_key.msaa_samples)) {
+    return reject("source outside owner");
+  }
+
+  uint32_t bpp_log2 = rt_key.Is64bpp() ? 3 : 2;
+  const char* texture_reject_reason;
+  if (!texture_cache.PrepareResolveCopyDestinations(
+          resolve_info.copy_dest_base, resolve_info.copy_dest_extent_start,
+          resolve_info.copy_dest_extent_length, dest_format, uint32_t(dest_info.copy_dest_endian),
+          resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32, bpp_log2,
+          resolve_info.copy_dest_coordinate_info.offset_x_div_8,
+          resolve_info.copy_dest_coordinate_info.offset_y_div_8, draw_resolution_scaled, width,
+          height, rt_vk_format, rb_swap, texture_reject_reason)) {
+    return reject(texture_reject_reason);
+  }
+
+  // Host pixels: the render target and a scaled-resolve texture are scaled
+  // alike, so the copy is 1:1.
+  resolve_copy_to_texture_source_x_ = src_x * draw_resolution_scale_x();
+  resolve_copy_to_texture_source_y_ = src_y * draw_resolution_scale_y();
+  // Half-pixel offset fill: with resolution scaling the guest's half-pixel
+  // offset becomes a full-pixel one and leaves the left / top edge of the
+  // region uncovered; the copy shaders fill destination columns and rows
+  // below the fill from the first surely covered column / row, and the copies
+  // have to as well or the tile seam comes back.
+  resolve_copy_to_texture_fill_x_ = 0;
+  resolve_copy_to_texture_fill_y_ = 0;
+  if (draw_resolution_scaled && edram_info.fill_half_pixel_offset) {
+    resolve_copy_to_texture_fill_x_ = draw_resolution_scale_x() >> 1;
+    resolve_copy_to_texture_fill_y_ = draw_resolution_scale_y() >> 1;
+  }
+
+  resolve_copy_to_texture_rt_ = &vulkan_rt;
+  ++resolve_copy_to_texture_success_count_;
+  if (resolve_copy_to_texture_success_count_ == 1) {
+    REXGPU_ERROR("VulkanRenderTargetCache: resolving into texture images by copy");
+  }
+  return true;
+}
+
+void VulkanRenderTargetCache::IssueResolveCopyToTexture(VulkanTextureCache& texture_cache) {
+  assert_not_null(resolve_copy_to_texture_rt_);
+  VulkanRenderTarget& vulkan_rt = *resolve_copy_to_texture_rt_;
+  resolve_copy_to_texture_rt_ = nullptr;
+  command_processor_.PushImageMemoryBarrier(
+      vulkan_rt.image(), ui::vulkan::util::InitializeSubresourceRange(VK_IMAGE_ASPECT_COLOR_BIT),
+      vulkan_rt.current_stage_mask(), VK_PIPELINE_STAGE_TRANSFER_BIT,
+      vulkan_rt.current_access_mask(), VK_ACCESS_TRANSFER_READ_BIT, vulkan_rt.current_layout(),
+      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+  vulkan_rt.SetUsage(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+  // Submits the barriers (ending any render pass) before each copy.
+  texture_cache.IssueResolveCopies(vulkan_rt.image(), resolve_copy_to_texture_source_x_,
+                                   resolve_copy_to_texture_source_y_,
+                                   resolve_copy_to_texture_fill_x_, resolve_copy_to_texture_fill_y_);
+  COUNT_profile_add("gpu/render_target_cache/resolve_copies_to_texture", 1);
+}
+
+void VulkanRenderTargetCache::LogResolveCopyToTextureStats() {
+  std::string rejects;
+  for (const auto& entry : resolve_copy_to_texture_rejects_) {
+    rejects += fmt::format(" [{}: {}]", entry.first, entry.second);
+  }
+  // Error level so the tally survives the performance-mode log level.
+  REXGPU_ERROR("VulkanRenderTargetCache: resolve copies to texture images: {} of {} attempts;{}",
+              resolve_copy_to_texture_success_count_, resolve_copy_to_texture_attempt_count_,
+              rejects.empty() ? " no rejections" : rejects.c_str());
 }
 
 bool VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used,

@@ -81,6 +81,7 @@ class TextureCache {
   virtual void BeginFrame();
 
   void MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled);
+
   // Ensures the memory backing the range in the scaled resolve address space is
   // allocated and returns whether it is.
   virtual bool EnsureScaledResolveMemoryCommitted(uint32_t /*start_unscaled*/,
@@ -545,6 +546,36 @@ class TextureCache {
   // implementation to update the internal dependencies of the binding.
   virtual void UpdateTextureBindingsImpl(uint32_t /*fetch_constant_mask*/) {}
 
+  // Render-target-as-texture: locates the textures that would consume a
+  // resolve to the given tiled guest range, so the render target can be
+  // copied into their host images directly instead of round-tripping through
+  // tiled guest memory and the untiling load. Every live texture overlapping
+  // the range must be a valid destination (the tiled memory behind a copied
+  // resolve is stale, so any texture left out would later reload garbage),
+  // except that with resolution scaling, unscaled keys are dead once the pages
+  // are marked resolved and are ignored. A destination may be a mip level.
+  // The rectangle is clipped to each level. Never records any commands.
+  struct ResolveDestination {
+    Texture* texture;
+    uint32_t level;
+    // Unscaled texels within the level.
+    uint32_t dest_x, dest_y, width, height;
+  };
+  bool FindResolveDestinationTextures(uint32_t copy_dest_base, uint32_t extent_start,
+                                      uint32_t extent_length, xenos::TextureFormat format,
+                                      uint32_t endianness, uint32_t pitch_div_32,
+                                      uint32_t bpp_log2, uint32_t offset_x_div_8,
+                                      uint32_t offset_y_div_8, bool scaled, uint32_t width,
+                                      uint32_t height,
+                                      std::vector<ResolveDestination>& destinations_out,
+                                      const char*& reject_reason_out);
+
+  // For the implementation to finish a resolve copy under the same lock the
+  // normal load takes for Texture::MakeUpToDateAndWatch.
+  std::unique_lock<std::recursive_mutex> AcquireGlobalCriticalRegion() {
+    return global_critical_region_.Acquire();
+  }
+
  private:
   struct PendingTextureLoad {
     Texture* texture = nullptr;
@@ -606,6 +637,8 @@ class TextureCache {
   uint64_t current_submission_time_ = 0;
 
   std::unordered_map<TextureKey, std::unique_ptr<Texture>, TextureKey::Hasher> textures_;
+  // Sample-logging budget for FindResolveDestinationTextures rejections.
+  uint32_t resolve_destination_log_count_[2] = {};
 
   uint64_t textures_total_host_memory_usage_ = 0;
 
