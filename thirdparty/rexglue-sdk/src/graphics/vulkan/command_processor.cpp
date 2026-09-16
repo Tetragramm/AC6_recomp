@@ -4251,9 +4251,73 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
 
   const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider;
   // Set up the render targets - this may perform dispatches and draws.
+  // Tell the render target cache which targets this draw would overwrite
+  // completely, so it can count how much of the ownership transfer work it is
+  // about to do would be thrown away. The Clear quad already elides its
+  // transfers; this measures whether extending that to ordinary full-target
+  // opaque passes (the post-processing chain) is worth building.
+  if (rex::debug::profiling::IsEnabled()) {
+    uint32_t overwrite_mask = 0;
+    // Screen-space geometry, which is what a full-target pass is drawn with.
+    const uint32_t vte = regs.values[XE_GPU_REG_PA_CL_VTE_CNTL];
+    auto color_control = regs.Get<reg::RB_COLORCONTROL>();
+    if (vte == 0x300u &&
+        (prim_type == xenos::PrimitiveType::kRectangleList ||
+         prim_type == xenos::PrimitiveType::kTriangleStrip ||
+         prim_type == xenos::PrimitiveType::kTriangleList) &&
+        !color_control.alpha_test_enable && !color_control.alpha_to_mask_enable) {
+      const uint32_t stencil_ref_mask = regs.values[XE_GPU_REG_RB_STENCILREFMASK];
+      if (normalized_depth_control.z_enable && normalized_depth_control.z_write_enable &&
+          normalized_depth_control.zfunc == xenos::CompareFunction::kAlways &&
+          normalized_depth_control.stencil_enable &&
+          normalized_depth_control.stencilfunc == xenos::CompareFunction::kAlways &&
+          normalized_depth_control.stencilzpass == xenos::StencilOp::kReplace &&
+          ((stencil_ref_mask >> 16) & 0xFF) == 0xFF) {
+        overwrite_mask |= 1u;
+      }
+      for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+        auto blend_control =
+            regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[i]);
+        bool blending = blend_control.color_srcblend != xenos::BlendFactor::kOne ||
+                        blend_control.color_destblend != xenos::BlendFactor::kZero ||
+                        blend_control.color_comb_fcn != xenos::BlendOp::kAdd ||
+                        blend_control.alpha_srcblend != xenos::BlendFactor::kOne ||
+                        blend_control.alpha_destblend != xenos::BlendFactor::kZero ||
+                        blend_control.alpha_comb_fcn != xenos::BlendOp::kAdd;
+        if (!blending && ((normalized_color_mask >> (i * 4)) & 0xF) == 0xF) {
+          overwrite_mask |= 1u << (1 + i);
+        }
+      }
+    }
+    render_target_cache_->SetNextDrawOverwriteMeasurementMask(overwrite_mask);
+    last_draw_overwrite_mask_ = overwrite_mask;
+  }
+
   if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
                                     normalized_color_mask, *vertex_shader)) {
     return draw_fail("render_target_update");
+  }
+
+
+  // What the draws that actually pay for ownership transfers look like, so the
+  // full-overwrite rule can be matched against the real post-processing passes
+  // rather than a guess.
+  if (rex::debug::profiling::IsEnabled() && render_target_cache_->last_update_transfer_tiles()) {
+    static std::atomic<uint32_t> logged{0};
+    if (logged.load(std::memory_order_relaxed) < 16) {
+      ++logged;
+      auto color_control_log = regs.Get<reg::RB_COLORCONTROL>();
+      auto blend_0 = regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[0]);
+      REXGPU_ERROR(
+          "[XFER-DRAW] {} tiles | prim {} vte {:04X} scissor_br {:08X} | color_mask {:08X} "
+          "blend0 {:08X} | alpha_test {} a2m {} | depthcontrol {:08X} | overwrite_mask {:X}",
+          render_target_cache_->last_update_transfer_tiles(), uint32_t(prim_type),
+          regs.values[XE_GPU_REG_PA_CL_VTE_CNTL],
+          regs.values[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR], normalized_color_mask, blend_0.value,
+          uint32_t(color_control_log.alpha_test_enable),
+          uint32_t(color_control_log.alpha_to_mask_enable),
+          normalized_depth_control.value, last_draw_overwrite_mask_);
+    }
   }
 
   // Create the pipeline (for this, need the render pass from the render target

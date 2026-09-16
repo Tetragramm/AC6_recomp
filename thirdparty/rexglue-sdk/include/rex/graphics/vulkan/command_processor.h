@@ -882,6 +882,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkPipeline current_guest_graphics_pipeline_;
   VkPipeline current_external_graphics_pipeline_;
   VkPipeline current_external_compute_pipeline_;
+  // Diagnostics: which targets the last draw would overwrite completely.
+  uint32_t last_draw_overwrite_mask_ = 0;
 
   // Pipeline layout of the current guest graphics pipeline.
   const PipelineLayout* current_guest_graphics_pipeline_layout_;

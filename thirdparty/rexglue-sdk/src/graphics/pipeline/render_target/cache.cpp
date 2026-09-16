@@ -17,6 +17,7 @@
 #include <unordered_set>
 #include <utility>
 
+#include <rex/dbg.h>
 #include <rex/assert.h>
 #include <rex/cvar.h>
 #include <rex/graphics/flags.h>
@@ -402,6 +403,9 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
                                uint32_t normalized_color_mask, const Shader& vertex_shader) {
   const RegisterFile& regs = register_file();
   bool interlock_barrier_only = GetPath() == Path::kPixelShaderInterlock;
+  // Reset here, not where it is counted: this function has early returns, and
+  // a stale value would be attributed to the wrong draw.
+  last_update_transfer_tiles_ = 0;
 
   auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
   xenos::MsaaSamples msaa_samples = rb_surface_info.msaa_samples;
@@ -697,6 +701,30 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
     ChangeOwnership(rt_keys[rt_bit_index], 0, rt_lengths_tiles[i],
                     (interlock_barrier_only || elide) ? nullptr
                                                       : &last_update_transfers_[rt_bit_index]);
+  }
+
+  if (rex::debug::profiling::IsEnabled()) {
+    // Measurement: how many of the tiles just scheduled for copying are about
+    // to be overwritten wholesale by this very draw.
+    const uint32_t overwrite_mask = next_draw_overwrite_measurement_mask_;
+    next_draw_overwrite_measurement_mask_ = 0;
+    uint32_t transfer_tiles_total = 0;
+    uint32_t transfer_tiles_overwritten = 0;
+    for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+      uint32_t rt_tiles = 0;
+      for (const Transfer& transfer : last_update_transfers_[i]) {
+        rt_tiles += transfer.end_tiles - transfer.start_tiles;
+      }
+      transfer_tiles_total += rt_tiles;
+      if ((overwrite_mask >> i) & 1) {
+        transfer_tiles_overwritten += rt_tiles;
+      }
+    }
+    last_update_transfer_tiles_ = transfer_tiles_total;
+    if (transfer_tiles_total) {
+      COUNT_profile_add("gpu/transfer_tiles", transfer_tiles_total);
+      COUNT_profile_add("gpu/transfer_tiles_overwritten_by_the_draw", transfer_tiles_overwritten);
+    }
   }
 
   if (interlock_barrier_only) {

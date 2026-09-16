@@ -703,9 +703,22 @@ class RenderTargetCache {
   // occupant's contents in. Set by the command processor when it recognises a
   // full-target clear. Consumed (reset) by Update().
   void SetNextDrawFullOverwriteMask(uint32_t mask) { next_draw_full_overwrite_mask_ = mask; }
+  // Measurement only: which targets the next draw would overwrite completely,
+  // to count the ownership transfer work that would be thrown away.
+  void SetNextDrawOverwriteMeasurementMask(uint32_t mask) {
+    next_draw_overwrite_measurement_mask_ = mask;
+  }
 
  private:
   uint32_t next_draw_full_overwrite_mask_ = 0;
+  uint32_t next_draw_overwrite_measurement_mask_ = 0;
+
+ public:
+  // Tiles the last Update scheduled for copying, for diagnostics.
+  uint32_t last_update_transfer_tiles() const { return last_update_transfer_tiles_; }
+
+ protected:
+  uint32_t last_update_transfer_tiles_ = 0;
 };
 
 }  // namespace rex::graphics
