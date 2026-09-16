@@ -804,12 +804,19 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // render target sample count - a multisampled owner read through a 1x view
   // is the sample-as-pixel alias, exact by the dump mapping).
   struct ResolveToImagePipelineKey {
+    ResolveToImagePipelineKey() { std::memset(this, 0, sizeof(*this)); }
     DumpPipelineKey dump_pipeline_key;
     uint32_t host_format;  // VulkanTextureCache::ResolveComputeHostFormat
     bool draw_resolution_scaled;
+    // The sample count of the resolve VIEW (not of the owning render target):
+    // it decides how EDRAM samples map to destination pixels, and which of
+    // them the sample select takes or averages.
+    xenos::MsaaSamples view_msaa_samples;
+    xenos::CopySampleSelect sample_select;
     uint64_t packed() const {
       return uint64_t(dump_pipeline_key.key) | (uint64_t(host_format) << 32) |
-             (uint64_t(draw_resolution_scaled ? 1 : 0) << 40);
+             (uint64_t(draw_resolution_scaled ? 1 : 0) << 40) |
+             (uint64_t(view_msaa_samples) << 41) | (uint64_t(sample_select) << 43);
     }
     struct Hasher {
       size_t operator()(const ResolveToImagePipelineKey& key) const {

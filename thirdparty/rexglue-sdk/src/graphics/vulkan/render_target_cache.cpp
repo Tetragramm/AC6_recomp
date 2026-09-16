@@ -6243,6 +6243,39 @@ VkPipeline VulkanRenderTargetCache::BuildRenderTargetSamplingPipeline(
   using HostFormat = VulkanTextureCache::ResolveComputeHostFormat;
   const HostFormat image_host_format =
       image ? HostFormat(image_key->host_format) : HostFormat::kCount;
+  // How the resolve view's samples map to destination pixels: one EDRAM
+  // sample column per pixel at 4x, one sample row per pixel at 2x and 4x.
+  const xenos::MsaaSamples image_view_msaa =
+      image ? image_key->view_msaa_samples : xenos::MsaaSamples::k1X;
+  const uint32_t image_sample_shift_x =
+      uint32_t(image_view_msaa >= xenos::MsaaSamples::k4X);
+  const uint32_t image_sample_shift_y =
+      uint32_t(image_view_msaa >= xenos::MsaaSamples::k2X);
+  const xenos::CopySampleSelect image_sample_select =
+      image ? image_key->sample_select : xenos::CopySampleSelect::k0;
+  // The guest samples this resolve takes: one of them, or the average of a
+  // group (the invocation of the first sample of the group does the work).
+  std::vector<uint32_t> image_guest_samples;
+  if (image && image_view_msaa != xenos::MsaaSamples::k1X) {
+    switch (image_sample_select) {
+      case xenos::CopySampleSelect::k0:
+      case xenos::CopySampleSelect::k1:
+      case xenos::CopySampleSelect::k2:
+      case xenos::CopySampleSelect::k3:
+        image_guest_samples.push_back(uint32_t(image_sample_select));
+        break;
+      case xenos::CopySampleSelect::k01:
+        image_guest_samples = {0, 1};
+        break;
+      case xenos::CopySampleSelect::k23:
+        image_guest_samples = {2, 3};
+        break;
+      case xenos::CopySampleSelect::k0123:
+        image_guest_samples = {0, 1, 2, 3};
+        break;
+    }
+  }
+  const bool image_averaging = image_guest_samples.size() > 1;
 
   std::vector<spv::Id> id_vector_temp;
 
@@ -6550,6 +6583,16 @@ VkPipeline VulkanRenderTargetCache::BuildRenderTargetSamplingPipeline(
             tile_sample_y);
     direct_region_x = bin(spv::OpISub, position_x, origin_in_tile_x);
     direct_region_y = bin(spv::OpISub, position_y, origin_in_tile_y);
+    // The region extents are in pixels; with a multisampled resolve view the
+    // positions above are in samples.
+    spv::Id compare_region_x =
+        image_sample_shift_x
+            ? bin(spv::OpShiftRightLogical, direct_region_x, uconst(image_sample_shift_x))
+            : direct_region_x;
+    spv::Id compare_region_y =
+        image_sample_shift_y
+            ? bin(spv::OpShiftRightLogical, direct_region_y, uconst(image_sample_shift_y))
+            : direct_region_y;
     spv::Id region_width = bin(
         spv::OpIMul,
         bin(spv::OpShiftLeftLogical,
@@ -6568,12 +6611,13 @@ VkPipeline VulkanRenderTargetCache::BuildRenderTargetSamplingPipeline(
             spv::OpLogicalAnd, type_bool_region,
             builder.createBinOp(spv::OpUGreaterThanEqual, type_bool_region, position_x,
                                 origin_in_tile_x),
-            builder.createBinOp(spv::OpULessThan, type_bool_region, direct_region_x, region_width)),
+            builder.createBinOp(spv::OpULessThan, type_bool_region, compare_region_x,
+                                region_width)),
         builder.createBinOp(
             spv::OpLogicalAnd, type_bool_region,
             builder.createBinOp(spv::OpUGreaterThanEqual, type_bool_region, position_y,
                                 origin_in_tile_y),
-            builder.createBinOp(spv::OpULessThan, type_bool_region, direct_region_y,
+            builder.createBinOp(spv::OpULessThan, type_bool_region, compare_region_y,
                                 region_height)));
 
     // Half-pixel offset fill: with resolution scaling the guest's half-pixel
@@ -6679,9 +6723,41 @@ VkPipeline VulkanRenderTargetCache::BuildRenderTargetSamplingPipeline(
   } else {
     source_texture_parameters.lod = builder.makeIntConstant(0);
   }
-  spv::Id source_vec4 = builder.createTextureCall(
-      spv::NoPrecision, builder.makeVectorType(source_component_type, 4), false, true, false, false,
-      false, source_texture_parameters, spv::ImageOperandsMaskNone);
+  spv::Id type_source_vec4 = builder.makeVectorType(source_component_type, 4);
+  spv::Id source_vec4;
+  if (image_averaging) {
+    // Averaging sample select: the samples of the destination pixel are at
+    // the same source pixel, so only the sample index varies. Averaged
+    // before packing, like the resolve hardware.
+    assert_true(!source_is_uint && !key.is_depth);
+    for (size_t i = 0; i < image_guest_samples.size(); ++i) {
+      uint32_t guest_sample = image_guest_samples[i];
+      uint32_t host_sample =
+          key.msaa_samples >= xenos::MsaaSamples::k4X
+              ? guest_sample
+              : draw_util::GetD3D10SampleIndexForGuest2xMSAA(guest_sample,
+                                                             msaa_2x_attachments_supported_);
+      source_texture_parameters.sample = builder.makeIntConstant(int32_t(host_sample));
+      spv::Id sample_vec4 = builder.createTextureCall(
+          spv::NoPrecision, type_source_vec4, false, true, false, false, false,
+          source_texture_parameters, spv::ImageOperandsMaskNone);
+      source_vec4 = i ? builder.createBinOp(spv::OpFAdd, type_source_vec4, source_vec4, sample_vec4)
+                      : sample_vec4;
+    }
+    spv::Id average_scale =
+        builder.makeFloatConstant(1.0f / float(image_guest_samples.size()));
+    id_vector_temp.clear();
+    for (size_t i = 0; i < 4; ++i) {
+      id_vector_temp.push_back(average_scale);
+    }
+    source_vec4 = builder.createBinOp(spv::OpFMul, type_source_vec4, source_vec4,
+                                      builder.createCompositeConstruct(type_source_vec4,
+                                                                       id_vector_temp));
+  } else {
+    source_vec4 = builder.createTextureCall(spv::NoPrecision, type_source_vec4, false, true, false,
+                                            false, false, source_texture_parameters,
+                                            spv::ImageOperandsMaskNone);
+  }
   const bool source_color_16_is_float =
       !key.is_depth && IsColor16FormatFloatLike(key.GetColorFormat());
   spv::Id const_uint_16 = builder.makeUintConstant(16);
@@ -6947,10 +7023,35 @@ VkPipeline VulkanRenderTargetCache::BuildRenderTargetSamplingPipeline(
     (void)coordinate_info;
 
     if (image) {
+      // With a multisampled resolve view, the region positions are in samples:
+      // the destination pixel is the sample position shifted down, and only
+      // the invocation holding the selected guest sample (the first of the
+      // group when averaging) writes it.
+      spv::Id dest_region_x =
+          image_sample_shift_x ? shr(region_x, image_sample_shift_x) : region_x;
+      spv::Id dest_region_y =
+          image_sample_shift_y ? shr(region_y, image_sample_shift_y) : region_y;
+      if (!image_guest_samples.empty()) {
+        spv::Id guest_sample = const_uint_0;
+        if (image_sample_shift_x) {
+          guest_sample = band(region_x, 1);
+        }
+        if (image_sample_shift_y) {
+          spv::Id row_bit = band(region_y, 1);
+          guest_sample = image_sample_shift_x
+                             ? bor(guest_sample, shl(row_bit, 1))
+                             : row_bit;
+        }
+        in_region = builder.createBinOp(
+            spv::OpLogicalAnd, type_bool, in_region,
+            builder.createBinOp(spv::OpIEqual, type_bool, guest_sample,
+                                uconst(image_guest_samples[0])));
+      }
       // The texel within the level: the texture cache's destination origin
       // already includes the offset within the 32x32-aligned base tile.
-      spv::Id image_x = add(region_x, load_push_constant(kResolveToImagePushConstantImageX));
-      spv::Id image_y = add(region_y, load_push_constant(kResolveToImagePushConstantImageX + 1));
+      spv::Id image_x = add(dest_region_x, load_push_constant(kResolveToImagePushConstantImageX));
+      spv::Id image_y =
+          add(dest_region_y, load_push_constant(kResolveToImagePushConstantImageX + 1));
       // Resolve rectangles are 8-aligned and may overshoot the level.
       spv::Id in_image = builder.createBinOp(
           spv::OpLogicalAnd, type_bool,
@@ -7555,10 +7656,11 @@ bool VulkanRenderTargetCache::TryPrepareResolveComputeToTexture(
     resolve_compute_rejects_.emplace_back(reason, 1);
     return false;
   };
-  // The fast 32bpp shader is what the sampling shader's packing replaces:
+  // The fast 32bpp shaders are what the sampling shader's packing replaces:
   // depth, or an unbiased bitwise-equivalent colour format. 64bpp region
   // addressing is untested in the fused path.
-  if (copy_shader != draw_util::ResolveCopyShaderIndex::kFast32bpp1x2xMSAA) {
+  if (copy_shader != draw_util::ResolveCopyShaderIndex::kFast32bpp1x2xMSAA &&
+      copy_shader != draw_util::ResolveCopyShaderIndex::kFast32bpp4xMSAA) {
     return reject("copy shader");
   }
   const reg::RB_COPY_DEST_INFO& dest_info = resolve_info.copy_dest_info;
@@ -7571,10 +7673,8 @@ bool VulkanRenderTargetCache::TryPrepareResolveComputeToTexture(
   bool is_depth = resolve_info.IsCopyingDepth();
   const draw_util::ResolveEdramInfo& edram_info =
       is_depth ? resolve_info.depth_edram_info : resolve_info.color_edram_info;
-  // The fused region mapping treats resolve-view samples as pixels.
-  if (edram_info.msaa_samples != xenos::MsaaSamples::k1X) {
-    return reject("msaa view");
-  }
+  xenos::CopySampleSelect sample_select =
+      resolve_info.copy_dest_coordinate_info.copy_sample_select;
   xenos::TextureFormat dest_format = xenos::TextureFormat(dest_info.copy_dest_format);
   switch (dest_format) {
     case xenos::TextureFormat::k_8_8_8_8:
@@ -7627,6 +7727,27 @@ bool VulkanRenderTargetCache::TryPrepareResolveComputeToTexture(
   if (!rt_key.is_depth && is_depth) {
     return reject("colour owner for depth");
   }
+  // A multisampled resolve view: the shader maps the view's samples to
+  // destination pixels and keeps the selected one - that works whatever the
+  // owner's sample layout is, since the fetch maps the same EDRAM position
+  // through the owner. Averaging a group, though, fetches the group's
+  // samples at one source pixel, which is the right set only when the owner
+  // lays its samples out the way the view does.
+  if (edram_info.msaa_samples != xenos::MsaaSamples::k1X &&
+      !xenos::IsSingleCopySampleSelected(sample_select)) {
+    if (is_depth || rt_key.is_depth) {
+      return reject("averaging depth");
+    }
+    if (rt_key.msaa_samples != edram_info.msaa_samples) {
+      return reject("averaging owner mismatch");
+    }
+    bool source_is_uint = false;
+    GetColorOwnershipTransferVulkanFormat(rt_key.GetColorFormat(), rt_key.msaa_samples,
+                                          &source_is_uint);
+    if (source_is_uint) {
+      return reject("averaging uint source");
+    }
+  }
 
   uint32_t width = resolve_info.coordinate_info.width_div_8 << xenos::kResolveAlignmentPixelsLog2;
   uint32_t height = resolve_info.height_div_8 << xenos::kResolveAlignmentPixelsLog2;
@@ -7654,6 +7775,8 @@ bool VulkanRenderTargetCache::TryPrepareResolveComputeToTexture(
   pipeline_key.dump_pipeline_key.is_depth = rt_key.is_depth;
   pipeline_key.host_format = uint32_t(host_format);
   pipeline_key.draw_resolution_scaled = draw_resolution_scaled;
+  pipeline_key.view_msaa_samples = edram_info.msaa_samples;
+  pipeline_key.sample_select = sample_select;
   if (GetResolveToImagePipeline(pipeline_key) == VK_NULL_HANDLE) {
     return reject("no pipeline");
   }
