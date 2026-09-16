@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cstring>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -264,6 +265,19 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
         return nullptr;
       }
       assert_true(supported_extension_count == supported_extensions.size());
+      {
+        std::string names;
+        bool saw_stencil_export = false;
+        for (const VkExtensionProperties& e : supported_extensions) {
+          if (std::string_view(e.extensionName) == "VK_EXT_shader_stencil_export") {
+            saw_stencil_export = true;
+          }
+        }
+        REXLOG_INFO("Vulkan device '{}': {} supported extensions, {} requested, "
+                    "VK_EXT_shader_stencil_export listed={}",
+                     properties.deviceName, supported_extension_count, requested_extensions.size(),
+                     saw_stencil_export);
+      }
       for (const VkExtensionProperties& supported_extension : supported_extensions) {
         const auto requested_extension_it =
             requested_extensions.find(supported_extension.extensionName);
@@ -279,6 +293,12 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
   }
 
+  {
+    std::string names;
+    for (const char* n : enabled_extensions) { names += n; names += ' '; }
+    REXLOG_INFO("Vulkan device '{}': enabling {} extensions: {}", properties.deviceName,
+                 enabled_extensions.size(), names);
+  }
   if (with_swapchain && !device->extensions_.ext_KHR_swapchain) {
     REXLOG_WARN("Vulkan device '{}' doesn't support swapchains", properties.deviceName);
     return nullptr;

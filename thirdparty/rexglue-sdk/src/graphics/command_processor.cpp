@@ -10,6 +10,10 @@
  */
 
 #include <algorithm>
+#include <chrono>
+#if defined(__linux__)
+#include <pthread.h>
+#endif
 #include <cinttypes>
 #include <filesystem>
 #include <memory>
@@ -46,6 +50,15 @@ REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(occlusion_query_enable, true, "GPU", "Enable host occlusion query handling")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(gpu_wait_trace, false, "GPU",
+                    "Log a timeline of WAIT_REG_MEM sleeps and guest vblank ticks (first 400 events).");
+REXCVAR_DEFINE_INT32(gpu_wait_reg_mem_spin_us, 0, "GPU",
+                     "When a WAIT_REG_MEM packet has to wait, poll for this many microseconds "
+                     "(yielding) before sleeping, and cap each sleep at this long instead of the "
+                     "guest's requested WHOLE-MILLISECOND interval. Polling sooner than asked is "
+                     "safe - the condition is re-read every pass - and avoids losing a scheduler "
+                     "tick to a wait that clears in microseconds. 0 = stock behaviour.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_STRING(readback_resolve, "none", "GPU",
@@ -448,6 +461,20 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
       uint32_t scratch_addr = regs.values[XE_GPU_REG_SCRATCH_ADDR];
       uint32_t mem_addr = scratch_addr + (scratch_reg * 4);
       memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(mem_addr), value);
+      {
+        static std::atomic<int> traced{0};
+        if (REXCVAR_GET(gpu_wait_trace) && traced.load() < 60) {
+          ++traced;
+          char tname[32] = {};
+#if defined(__linux__)
+          pthread_getname_np(pthread_self(), tname, sizeof(tname));
+#endif
+          REXLOG_ERROR("[WAIT-TRACE] scratch{} := {:08X} @ {:08X} on '{}' t={} us", scratch_reg,
+                       value, mem_addr, tname,
+                       std::chrono::duration_cast<std::chrono::microseconds>(
+                           std::chrono::steady_clock::now().time_since_epoch()).count());
+        }
+      }
     }
   } else {
     switch (index) {
@@ -1070,6 +1097,15 @@ bool CommandProcessor::ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader, 
 
   // generate interrupt from the command stream
   uint32_t cpu_mask = reader->ReadAndSwap<uint32_t>();
+  {
+    static std::atomic<int> traced{0};
+    if (REXCVAR_GET(gpu_wait_trace) && traced.load() < 300) {
+      ++traced;
+      REXLOG_ERROR("[WAIT-TRACE] interrupt  t={} us mask={:X}",
+                   std::chrono::duration_cast<std::chrono::microseconds>(
+                       std::chrono::steady_clock::now().time_since_epoch()).count(), cpu_mask);
+    }
+  }
   for (int n = 0; n < 6; n++) {
     if (cpu_mask & (1 << n)) {
       graphics_system_->DispatchInterruptCallback(1, n);
@@ -1129,6 +1165,15 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   // ---- end GUESTCAP ----
 
   rex::debug::Profiler::Flip();
+  {
+    static std::atomic<int> traced{0};
+    if (REXCVAR_GET(gpu_wait_trace) && traced.load() < 300) {
+      ++traced;
+      REXLOG_ERROR("[WAIT-TRACE] xe_swap    t={} us",
+                   std::chrono::duration_cast<std::chrono::microseconds>(
+                       std::chrono::steady_clock::now().time_since_epoch()).count());
+    }
+  }
 
   // Xenia-specific VdSwap hook.
   // VdSwap will post this to tell us we need to swap the screen/fire an
@@ -1176,6 +1221,16 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
   bool is_memory = (wait_info & 0x10) != 0;
 
   bool matched = false;
+  const auto wait_begin = std::chrono::steady_clock::now();
+  bool wait_hook_called = false;
+  static std::atomic<int> wait_traced{0};
+  const bool trace_this = REXCVAR_GET(gpu_wait_trace) && wait_traced.load() < 300;
+  if (trace_this) {
+    ++wait_traced;
+    REXLOG_ERROR("[WAIT-TRACE] wait_begin t={} us {} {:08X} cond={} ref={:08X}",
+                 std::chrono::duration_cast<std::chrono::microseconds>(wait_begin.time_since_epoch()).count(),
+                 is_memory ? "mem" : "reg", poll_reg_addr, wait_info & 7, ref);
+  }
   do {
     uint32_t value = 0;
     if (is_memory) {
@@ -1217,6 +1272,14 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         break;
     }
     if (!matched) {
+      COUNT_profile_add("gpu/wait_reg_mem_poll_misses", 1);
+      if (is_memory && !wait_hook_called) {
+        // Give a game-specific fix one chance to advance the guest state this
+        // wait depends on before we start sleeping on it.
+        wait_hook_called = true;
+        graphics_system_->OnWaitMemory(poll_reg_addr & ~uint32_t(0x3));
+        continue;  // re-poll immediately
+      }
       // Wait.
       if (wait >= 0x100) {
         PrepareForWait();
@@ -1224,7 +1287,62 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
           // User wants it fast and dangerous.
           rex::thread::MaybeYield();
         } else {
-          rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
+          // Measuring this: the sleep is in WHOLE MILLISECONDS, and Linux
+          // over-sleeps a 1ms request to ~1-1.5ms, so a wait whose condition
+          // clears in microseconds still costs a full scheduler tick. These
+          // two counters say how many waits actually sleep and what the
+          // over-sleep costs, which is what decides whether it is worth
+          // replacing with a bounded spin.
+          COUNT_profile_add("gpu/wait_reg_mem_sleeps", 1);
+          // Which waits actually sleep? The fence writes the CP itself makes
+          // (EVENT_WRITE_SHD) are immediate, so a wait that sleeps is on a
+          // value some OTHER thread produces - and which thread decides what
+          // the ~1ms per wait is really costing us.
+          {
+            static std::atomic<int> logged{0};
+            if (REXCVAR_GET(gpu_wait_trace) && logged.load() < 24) {
+              ++logged;
+              REXLOG_ERROR("[WAIT_REG_MEM] sleep: {} {:08X} cond={} ref={:08X} mask={:08X} "
+                           "interval_ms={} value_now={:08X}",
+                           is_memory ? "mem" : "reg", poll_reg_addr, wait_info & 0x7, ref, mask,
+                           wait / 0x100, value);
+            }
+          }
+          const auto sleep_start = std::chrono::steady_clock::now();
+          const int32_t spin_us = REXCVAR_GET(gpu_wait_reg_mem_spin_us);
+          if (spin_us > 0) {
+            const auto budget = std::chrono::microseconds(spin_us);
+            if (sleep_start - wait_begin < budget) {
+              // Still inside the spin budget - stay hot, the condition usually
+              // clears almost immediately.
+              rex::thread::MaybeYield();
+            } else {
+              // Past the budget: sleep, but in spin_us slices rather than the
+              // guest's whole milliseconds, so we re-poll promptly.
+              const auto requested = std::chrono::microseconds(
+                  static_cast<int64_t>(wait / 0x100) * 1000);
+              rex::thread::Sleep(budget < requested ? budget : requested);
+            }
+          } else {
+            rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
+          }
+          COUNT_profile_add("gpu/wait_reg_mem_sleep_us",
+                            std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now() - sleep_start)
+                                .count());
+          // Timeline trace: when does a sleeping wait end, relative to the
+          // guest vblank? If the ends line up with vblank ticks the ring is
+          // vsync-throttled; if they are scattered, something else clears it.
+          {
+            static std::atomic<int> traced{0};
+            if (REXCVAR_GET(gpu_wait_trace) && traced.load() < 400) {
+              ++traced;
+              REXLOG_ERROR("[WAIT-TRACE] wait_poll t={} us addr={:08X} value={:08X}",
+                           std::chrono::duration_cast<std::chrono::microseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch()).count(),
+                           poll_reg_addr, value);
+            }
+          }
         }
         rex::thread::SyncMemory();
         ReturnFromWait();
@@ -1238,6 +1356,11 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
       }
     }
   } while (!matched);
+  if (trace_this) {
+    REXLOG_ERROR("[WAIT-TRACE] wait_end   t={} us",
+                 std::chrono::duration_cast<std::chrono::microseconds>(
+                     std::chrono::steady_clock::now().time_since_epoch()).count());
+  }
 
   return true;
 }

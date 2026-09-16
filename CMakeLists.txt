@@ -34,6 +34,7 @@ set(AC6RECOMP_SOURCES
     src/ac6_pac_index.cpp
     src/d3d_hooks.cpp
     src/render_hooks.cpp
+    src/ac6_register_shadow.cpp
     src/ac6_texture_overrides.cpp
     src/ac6_native_graphics.cpp
     src/ac6_native_graphics_overlay.cpp
@@ -46,6 +47,7 @@ set(AC6RECOMP_SOURCES
     src/ac6_backend_fixes/ac6_fullres_effects.cpp
     src/ac6_backend_fixes/ac6_kbm_input.cpp
     src/ac6_backend_fixes/ac6_storage_submit_order_fix.cpp
+    src/ac6_backend_fixes/ac6_swap_pacing_fix.cpp
     src/ac6_backend_fixes/ac6_widescreen.cpp
 )
 

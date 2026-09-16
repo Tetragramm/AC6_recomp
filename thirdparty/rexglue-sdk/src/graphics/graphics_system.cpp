@@ -12,6 +12,7 @@
 #include <rex/graphics/graphics_system.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <condition_variable>
@@ -34,6 +35,7 @@
 #include <rex/ui/window.h>
 #include <rex/ui/windowed_app_context.h>
 
+REXCVAR_DECLARE(bool, gpu_wait_trace);
 REXCVAR_DEFINE_STRING(trace_gpu_prefix, "", "GPU", "GPU trace file prefix");
 
 REXCVAR_DEFINE_BOOL(trace_gpu_stream, false, "GPU", "Enable GPU trace streaming");
@@ -431,6 +433,16 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
                                          rex::countof(args));
 }
 
+uint64_t GraphicsSystem::DispatchGuestCall(uint32_t address, uint32_t arg0, uint32_t arg1) {
+  auto thread = system::XThread::GetCurrentThread();
+  if (!thread || !function_dispatcher_) {
+    return 0;
+  }
+  uint64_t args[] = {arg0, arg1};
+  return function_dispatcher_->ExecuteInterrupt(thread->thread_state(), address, args,
+                                                rex::countof(args));
+}
+
 namespace {
 std::atomic<double> g_guest_vblank_hz_override{0.0};
 }  // namespace
@@ -445,6 +457,10 @@ double GraphicsSystem::GetGuestVblankHzOverride() {
 
 void GraphicsSystem::SetGuestPresentPacing(double target_hz) {
   g_present_pacing_target_hz.store(target_hz, std::memory_order_relaxed);
+}
+
+double GraphicsSystem::GetGuestPresentPacing() {
+  return g_present_pacing_target_hz.load(std::memory_order_relaxed);
 }
 
 void GraphicsSystem::NotifyGuestPresent() {
@@ -540,6 +556,15 @@ void GraphicsSystem::PaceGuestPresent() {
 }
 
 void GraphicsSystem::MarkVblank() {
+  {
+    static std::atomic<int> traced{0};
+    if (REXCVAR_GET(gpu_wait_trace) && traced.load() < 400) {
+      ++traced;
+      REXLOG_ERROR("[WAIT-TRACE] vblank    t={} us",
+                   std::chrono::duration_cast<std::chrono::microseconds>(
+                       std::chrono::steady_clock::now().time_since_epoch()).count());
+    }
+  }
   // TODO: Enable profiling once ported
   // SCOPE_profile_cpu_f("gpu");
 

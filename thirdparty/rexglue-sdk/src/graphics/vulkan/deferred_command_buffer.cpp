@@ -156,6 +156,39 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
                 rex::align(sizeof(ArgsVkCopyBufferToImage), alignof(VkBufferImageCopy))));
       } break;
 
+      case Command::kVkBlitImage: {
+        auto& args = *reinterpret_cast<const ArgsVkBlitImage*>(stream);
+        dfn.vkCmdBlitImage(command_buffer, args.src_image, args.src_image_layout, args.dst_image,
+                           args.dst_image_layout, args.region_count,
+                           reinterpret_cast<const VkImageBlit*>(
+                               reinterpret_cast<const uint8_t*>(stream) +
+                               rex::align(sizeof(ArgsVkBlitImage), alignof(VkImageBlit))),
+                           args.filter);
+      } break;
+
+      case Command::kVkFillBuffer: {
+        auto& args = *reinterpret_cast<const ArgsVkFillBuffer*>(stream);
+        dfn.vkCmdFillBuffer(command_buffer, args.buffer, args.offset, args.size, args.data);
+      } break;
+
+      case Command::kVkCopyImage: {
+        auto& args = *reinterpret_cast<const ArgsVkCopyImage*>(stream);
+        dfn.vkCmdCopyImage(command_buffer, args.src_image, args.src_image_layout, args.dst_image,
+                           args.dst_image_layout, args.region_count,
+                           reinterpret_cast<const VkImageCopy*>(
+                               reinterpret_cast<const uint8_t*>(stream) +
+                               rex::align(sizeof(ArgsVkCopyImage), alignof(VkImageCopy))));
+      } break;
+
+      case Command::kVkResolveImage: {
+        auto& args = *reinterpret_cast<const ArgsVkCopyImage*>(stream);
+        dfn.vkCmdResolveImage(command_buffer, args.src_image, args.src_image_layout,
+                              args.dst_image, args.dst_image_layout, args.region_count,
+                              reinterpret_cast<const VkImageResolve*>(
+                                  reinterpret_cast<const uint8_t*>(stream) +
+                                  rex::align(sizeof(ArgsVkCopyImage), alignof(VkImageResolve))));
+      } break;
+
       case Command::kVkCopyImageToBuffer: {
         auto& args = *reinterpret_cast<const ArgsVkCopyImageToBuffer*>(stream);
         dfn.vkCmdCopyImageToBuffer(
@@ -194,6 +227,11 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
       case Command::kVkEndQuery: {
         auto& args = *reinterpret_cast<const ArgsVkEndQuery*>(stream);
         dfn.vkCmdEndQuery(command_buffer, args.query_pool, args.query);
+      } break;
+
+      case Command::kVkWriteTimestamp: {
+        auto& args = *reinterpret_cast<const ArgsVkWriteTimestamp*>(stream);
+        dfn.vkCmdWriteTimestamp(command_buffer, args.pipeline_stage, args.query_pool, args.query);
       } break;
 
       case Command::kVkEndRenderPass:

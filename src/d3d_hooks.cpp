@@ -1,12 +1,15 @@
 #include "d3d_hooks.h"
 
 #include <algorithm>
+#include <chrono>
 #include <shared_mutex>
 #include <unordered_set>
 
 #include "ac6_backend_fixes/ac6_fullres_effects.h"
+#include "ac6_register_shadow.h"
 
 #include <rex/cvar.h>
+#include <rex/dbg.h>
 #include <rex/logging.h>
 #include <rex/ppc.h>
 
@@ -205,7 +208,7 @@ ac6::d3d::FrameCaptureSummary MakeFrameCaptureSummary(
                 case ac6::d3d::DrawCallKind::kIndexed:
                     ++summary.indexed_draw_count;
                     break;
-                case ac6::d3d::DrawCallKind::kIndexedShared:
+                case ac6::d3d::DrawCallKind::kVerticesUP:
                     ++summary.indexed_shared_draw_count;
                     break;
                 case ac6::d3d::DrawCallKind::kPrimitive:
@@ -249,7 +252,7 @@ ac6::d3d::DrawStatsSnapshot SnapshotDrawStats() {
     return ac6::d3d::DrawStatsSnapshot{
         g_live_stats.draw_calls.load(std::memory_order_relaxed),
         g_live_stats.draw_calls_indexed.load(std::memory_order_relaxed),
-        g_live_stats.draw_calls_indexed_shared.load(std::memory_order_relaxed),
+        g_live_stats.draw_calls_up.load(std::memory_order_relaxed),
         g_live_stats.draw_calls_primitive.load(std::memory_order_relaxed),
         g_live_stats.total_indices.load(std::memory_order_relaxed),
         g_live_stats.total_vertices.load(std::memory_order_relaxed),
@@ -343,254 +346,168 @@ void CaptureResolve(uint32_t device, const PPCContext& ctx) {
 
 }  // namespace
 
-PPC_EXTERN_FUNC(__imp__rex_sub_821DEF18);  // DrawIndexedVertices
-PPC_EXTERN_FUNC(__imp__rex_sub_821DF300);  // DrawIndexedVertices_Shared
-PPC_EXTERN_FUNC(__imp__rex_sub_821DEA48);  // DrawPrimitive
-PPC_EXTERN_FUNC(__imp__rex_sub_821DD0A8);  // SetTexture
-PPC_EXTERN_FUNC(__imp__rex_sub_821D95C8);  // SetRenderTarget
-PPC_EXTERN_FUNC(__imp__rex_sub_821D9D38);  // SetDepthStencil
+// ---------------------------------------------------------------------------
+// Guest D3D9 entry points.
+//
+// Every identity below was verified against the recompiled body in
+// generated/ac6recomp_recomp.11.cpp on 2026-09-14; twelve of the original
+// nineteen labels were wrong (the earlier "SetRenderTarget" and
+// "SetDepthStencil" hooks were debug-monitor functions whose r4/r5 are never
+// read, so the shadow state they fed was garbage). r3 is the device in every
+// D3D function. "PURE-SETTER" means the body only writes the device struct; the
+// draws, Clear, Resolve and the window-scissor emitter write PM4 directly.
+//
+// The game also writes shader constants and the vertex declaration INLINE,
+// bypassing the Set* entry points, so this shadow can never be complete - the
+// draw path must read the device struct itself at draw time
+// (ac6_register_shadow.cpp does exactly that).
+// ---------------------------------------------------------------------------
+
+PPC_EXTERN_FUNC(__imp__rex_sub_821DEF18);  // DrawVertices (non-indexed)
+PPC_EXTERN_FUNC(__imp__rex_sub_821DF300);  // DrawIndexedVertices
+PPC_EXTERN_FUNC(__imp__rex_sub_821DEA48);  // BeginVertices (DrawVerticesUP path)
+PPC_EXTERN_FUNC(__imp__rex_sub_821DD0A8);  // SetStreamSource
+PPC_EXTERN_FUNC(__imp__rex_sub_821DD260);  // SetRenderTarget
+PPC_EXTERN_FUNC(__imp__rex_sub_821DD5C8);  // SetDepthStencilSurface
+PPC_EXTERN_FUNC(__imp__rex_sub_821DE600);  // SetVertexShader
+PPC_EXTERN_FUNC(__imp__rex_sub_821DE308);  // SetPixelShader
 PPC_EXTERN_FUNC(__imp__rex_sub_821DE7D0);  // SetVertexDeclaration
 PPC_EXTERN_FUNC(__imp__rex_sub_821DD1C8);  // SetIndexBuffer
-PPC_EXTERN_FUNC(__imp__rex_sub_821DA698);  // SetViewport
-PPC_EXTERN_FUNC(__imp__rex_sub_821DC538);  // SetStreamSource
+PPC_EXTERN_FUNC(__imp__rex_sub_821DA698);  // window-scissor emitter (internal)
+PPC_EXTERN_FUNC(__imp__rex_sub_821DC538);  // SetSamplerState_MinFilter
 PPC_EXTERN_FUNC(__imp__rex_sub_821DC6C8);  // SetSamplerState_MagFilter
-PPC_EXTERN_FUNC(__imp__rex_sub_821DC9C0);  // SetSamplerState_C
-PPC_EXTERN_FUNC(__imp__rex_sub_821DCA68);  // SetSamplerState_B
-PPC_EXTERN_FUNC(__imp__rex_sub_821DCB08);  // SetSamplerState_MipLevel
-PPC_EXTERN_FUNC(__imp__rex_sub_821DCB88);  // SetSamplerState_A
-PPC_EXTERN_FUNC(__imp__rex_sub_821DBAF8);  // SetShaderGPRAlloc
+PPC_EXTERN_FUNC(__imp__rex_sub_821DC9C0);  // SetSamplerState_AnisotropyBias
+PPC_EXTERN_FUNC(__imp__rex_sub_821DCA68);  // SetSamplerState_MipMapLodBias
+PPC_EXTERN_FUNC(__imp__rex_sub_821DCB08);  // SetSamplerState_MaxMipLevel
+PPC_EXTERN_FUNC(__imp__rex_sub_821DCB88);  // SetSamplerState_MinMipLevel
+PPC_EXTERN_FUNC(__imp__rex_sub_821DBAF8);  // SetRenderState_Wrap0
 PPC_EXTERN_FUNC(__imp__rex_sub_821E2380);  // Clear
-PPC_EXTERN_FUNC(__imp__rex_sub_821E10C8);  // SetTextureFetchConstant
+PPC_EXTERN_FUNC(__imp__rex_sub_821E10C8);  // SetTexture
 PPC_EXTERN_FUNC(__imp__rex_sub_821E2BB8);  // Resolve
 
-// D3DDevice_DrawIndexedVertices (0x821DEF18)
+PPC_EXTERN_FUNC(__imp__rex_sub_821E61A8);  // fence wait (dev, fence, flags)
+PPC_EXTERN_FUNC(__imp__rex_sub_821F03B0);  // D3DDevice_Swap
+
+// D3D fence wait (0x821E61A8): the guest spins here until the GPU - Xenia's
+// command processor - has executed up to a fence. Its per-frame time on the
+// main thread is the guest's "waiting for the emulated GPU" cost, which is what
+// separates real sim/record work from spin in the thread's busy%.
+PPC_FUNC_IMPL(rex_sub_821E61A8) {
+    PPC_FUNC_PROLOGUE();
+    SCOPE_profile_cpu_f("guest");
+    __imp__rex_sub_821E61A8(ctx, base);
+}
+
+// D3DDevice_Swap (0x821F03B0): contains the VdSwap and, on the 360 D3D, the
+// fence wait that throttles the CPU to one frame ahead of the GPU.
+PPC_FUNC_IMPL(rex_sub_821F03B0) {
+    PPC_FUNC_PROLOGUE();
+    SCOPE_profile_cpu_f("guest");
+    __imp__rex_sub_821F03B0(ctx, base);
+}
+
+// D3DDevice_DrawVertices (0x821DEF18) - EMITS PM4
+// r3=pDevice, r4=PrimitiveType, r5=StartVertex, r6=VertexCount
 PPC_FUNC_IMPL(rex_sub_821DEF18) {
     PPC_FUNC_PROLOGUE();
 
-    uint32_t index_count = ctx.r6.u32;
+    const uint32_t prim_type = ctx.r4.u32;
+    const uint32_t start_vertex = ctx.r5.u32;
+    const uint32_t vertex_count = ctx.r6.u32;
     RememberDevice(ctx.r3.u32);
 
-    g_live_stats.draw_calls.fetch_add(1, std::memory_order_relaxed);
-    g_live_stats.draw_calls_indexed.fetch_add(1, std::memory_order_relaxed);
-    g_live_stats.total_indices.fetch_add(index_count, std::memory_order_relaxed);
-    CaptureDrawCall(ac6::d3d::DrawCallKind::kIndexed, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32,
-                    index_count, 0);
-
-    if (REXCVAR_GET(ac6_d3d_trace)) {
-        REXLOG_CAT_TRACE(kLogGPU,
-            "DrawIndexedVertices: prim={} start={} count={}",
-            ctx.r4.u32, ctx.r5.u32, index_count);
-    }
-
-    __imp__rex_sub_821DEF18(ctx, base);
-}
-
-// D3DDevice_DrawIndexedVertices_Shared (0x821DF300)
-PPC_FUNC_IMPL(rex_sub_821DF300) {
-    PPC_FUNC_PROLOGUE();
-
-    uint32_t index_count = ctx.r7.u32;
-    RememberDevice(ctx.r3.u32);
-
-    g_live_stats.draw_calls.fetch_add(1, std::memory_order_relaxed);
-    g_live_stats.draw_calls_indexed_shared.fetch_add(1, std::memory_order_relaxed);
-    g_live_stats.total_indices.fetch_add(index_count, std::memory_order_relaxed);
-    CaptureDrawCall(ac6::d3d::DrawCallKind::kIndexedShared, ctx.r3.u32, ctx.r4.u32, ctx.r6.u32,
-                    index_count, ctx.r5.u32);
-
-    if (REXCVAR_GET(ac6_d3d_trace)) {
-        REXLOG_CAT_TRACE(kLogGPU,
-            "DrawIndexedVertices_Shared: prim={} flags={} start={} count={}",
-            ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, index_count);
-    }
-
-    __imp__rex_sub_821DF300(ctx, base);
-}
-
-// D3DDevice_SetTexture (0x821DD0A8)
-PPC_FUNC_IMPL(rex_sub_821DD0A8) {
-    PPC_FUNC_PROLOGUE();
-
-    uint32_t slot = ctx.r4.u32;
-    uint32_t texture_ptr = ctx.r5.u32;
-    RememberDevice(ctx.r3.u32);
-
-    if (slot < ac6::d3d::kMaxTextures) {
-        std::unique_lock<std::shared_mutex> lock(g_shadow_mutex);
-        g_shadow.textures[slot] = texture_ptr;
-    }
-    g_live_stats.set_texture_calls.fetch_add(1, std::memory_order_relaxed);
-
-    if (REXCVAR_GET(ac6_d3d_trace)) {
-        REXLOG_CAT_TRACE(kLogGPU,
-            "SetTexture: slot={} texture=0x{:08X}",
-            slot, texture_ptr);
-    }
-
-    __imp__rex_sub_821DD0A8(ctx, base);
-}
-
-// D3DDevice_SetRenderTarget (0x821D95C8)
-PPC_FUNC_IMPL(rex_sub_821D95C8) {
-    PPC_FUNC_PROLOGUE();
-
-    uint32_t index = ctx.r4.u32;
-    uint32_t surface = ctx.r5.u32;
-    RememberDevice(ctx.r3.u32);
-
-    if (index < ac6::d3d::kMaxRenderTargets) {
-        std::unique_lock<std::shared_mutex> lock(g_shadow_mutex);
-        g_shadow.render_targets[index] = surface;
-    }
-    ac6::backend::NoteRt0Bound(index, surface);
-    g_live_stats.set_render_target_calls.fetch_add(1, std::memory_order_relaxed);
-
-    if (REXCVAR_GET(ac6_d3d_trace)) {
-        REXLOG_CAT_TRACE(kLogGPU,
-            "SetRenderTarget: index={} surface=0x{:08X}",
-            index, surface);
-    }
-
-    __imp__rex_sub_821D95C8(ctx, base);
-}
-
-// D3DDevice_SetDepthStencil (0x821D9D38)
-PPC_FUNC_IMPL(rex_sub_821D9D38) {
-    PPC_FUNC_PROLOGUE();
-
-    uint32_t surface = ctx.r4.u32;
-    RememberDevice(ctx.r3.u32);
-    {
-        std::unique_lock<std::shared_mutex> lock(g_shadow_mutex);
-        g_shadow.depth_stencil = surface;
-    }
-    g_live_stats.set_depth_stencil_calls.fetch_add(1, std::memory_order_relaxed);
-
-    if (REXCVAR_GET(ac6_d3d_trace)) {
-        REXLOG_CAT_TRACE(kLogGPU,
-            "SetDepthStencil: surface=0x{:08X}", surface);
-    }
-
-    __imp__rex_sub_821D9D38(ctx, base);
-}
-
-// D3DDevice_SetVertexDeclaration (0x821DE7D0)
-PPC_FUNC_IMPL(rex_sub_821DE7D0) {
-    PPC_FUNC_PROLOGUE();
-
-    uint32_t decl = ctx.r4.u32;
-    RememberDevice(ctx.r3.u32);
-    {
-        std::unique_lock<std::shared_mutex> lock(g_shadow_mutex);
-        g_shadow.vertex_declaration = decl;
-    }
-    g_live_stats.set_vertex_decl_calls.fetch_add(1, std::memory_order_relaxed);
-
-    if (REXCVAR_GET(ac6_d3d_trace)) {
-        REXLOG_CAT_TRACE(kLogGPU,
-            "SetVertexDeclaration: decl=0x{:08X}", decl);
-    }
-
-    __imp__rex_sub_821DE7D0(ctx, base);
-}
-
-// D3DDevice_SetIndexBuffer (0x821DD1C8)
-PPC_FUNC_IMPL(rex_sub_821DD1C8) {
-    PPC_FUNC_PROLOGUE();
-
-    uint32_t buffer = ctx.r4.u32;
-    RememberDevice(ctx.r3.u32);
-    {
-        std::unique_lock<std::shared_mutex> lock(g_shadow_mutex);
-        g_shadow.index_buffer = buffer;
-    }
-    g_live_stats.set_index_buffer_calls.fetch_add(1, std::memory_order_relaxed);
-
-    if (REXCVAR_GET(ac6_d3d_trace)) {
-        REXLOG_CAT_TRACE(kLogGPU,
-            "SetIndexBuffer: buffer=0x{:08X}", buffer);
-    }
-
-    __imp__rex_sub_821DD1C8(ctx, base);
-}
-
-// D3DDevice_SetViewport (0x821DA698)
-PPC_FUNC_IMPL(rex_sub_821DA698) {
-    PPC_FUNC_PROLOGUE();
-
-    RememberDevice(ctx.r3.u32);
-    {
-        std::unique_lock<std::shared_mutex> lock(g_shadow_mutex);
-        g_shadow.viewport.x      = ctx.r4.u32;
-        g_shadow.viewport.y      = ctx.r5.u32;
-        g_shadow.viewport.width  = ctx.r6.u32;
-        g_shadow.viewport.height = ctx.r7.u32;
-    }
-    g_live_stats.set_viewport_calls.fetch_add(1, std::memory_order_relaxed);
-
-    if (REXCVAR_GET(ac6_d3d_trace)) {
-        REXLOG_CAT_TRACE(kLogGPU,
-            "SetViewport: {}x{} at ({},{})",
-            g_shadow.viewport.width, g_shadow.viewport.height,
-            g_shadow.viewport.x, g_shadow.viewport.y);
-    }
-
-    __imp__rex_sub_821DA698(ctx, base);
-}
-
-// D3DDevice_Resolve (0x821E2BB8)
-PPC_FUNC_IMPL(rex_sub_821E2BB8) {
-    PPC_FUNC_PROLOGUE();
-
-    RememberDevice(ctx.r3.u32);
-    g_live_stats.resolve_calls.fetch_add(1, std::memory_order_relaxed);
-    // D3DDevice_Resolve(pDevice=r3, Flags=r4, pSourceRect=r5, pDestTexture=r6,
-    // ...): record the dest as the silhouette mask base if the downscaler just
-    // ran, then lift the effects module's 640x360 source rect to 1280x720.
-    ac6::backend::FxNoteResolveDest(ctx.r6.u32, base);
-    ac6::backend::FullresFixResolveRect(ctx, base);
-    CaptureResolve(ctx.r3.u32, ctx);
-
-    if (REXCVAR_GET(ac6_d3d_trace)) {
-        REXLOG_CAT_TRACE(kLogGPU, "Resolve");
-    }
-
-    __imp__rex_sub_821E2BB8(ctx, base);
-}
-
-// D3DDevice_DrawPrimitive (0x821DEA48)
-// r3=pDevice, r4=PrimitiveType, r5=VertexCount
-PPC_FUNC_IMPL(rex_sub_821DEA48) {
-    PPC_FUNC_PROLOGUE();
-
-    uint32_t prim_type = ctx.r4.u32;
-    uint32_t vertex_count = ctx.r5.u32;
-    RememberDevice(ctx.r3.u32);
-
+    COUNT_profile_add("gpu/guest_d3d_draws", 1);
     g_live_stats.draw_calls.fetch_add(1, std::memory_order_relaxed);
     g_live_stats.draw_calls_primitive.fetch_add(1, std::memory_order_relaxed);
     g_live_stats.total_vertices.fetch_add(vertex_count, std::memory_order_relaxed);
-    CaptureDrawCall(ac6::d3d::DrawCallKind::kPrimitive, ctx.r3.u32, prim_type, 0, vertex_count,
-                    0);
+    CaptureDrawCall(ac6::d3d::DrawCallKind::kPrimitive, ctx.r3.u32, prim_type, start_vertex,
+                    vertex_count, 0);
+    // r3 is also the return register - capture the device before the call.
+    const uint32_t shadow_device = ctx.r3.u32;
+    const uint32_t shadow_wp = ac6::shadow::BeginVerify(base, shadow_device);
 
     if (REXCVAR_GET(ac6_d3d_trace)) {
         REXLOG_CAT_TRACE(kLogGPU,
-            "DrawPrimitive: prim={} count={}",
-            prim_type, vertex_count);
+            "DrawVertices: prim={} start={} count={}",
+            prim_type, start_vertex, vertex_count);
+    }
+
+    __imp__rex_sub_821DEF18(ctx, base);
+    ac6::shadow::EndVerify(base, shadow_device, shadow_wp, start_vertex, "DrawVertices");
+}
+
+// D3DDevice_DrawIndexedVertices (0x821DF300) - EMITS PM4
+// r3=pDevice, r4=PrimitiveType, r5=BaseVertexIndex, r6=StartIndex, r7=IndexCount
+PPC_FUNC_IMPL(rex_sub_821DF300) {
+    PPC_FUNC_PROLOGUE();
+
+    const uint32_t prim_type = ctx.r4.u32;
+    const uint32_t base_vertex = ctx.r5.u32;
+    const uint32_t start_index = ctx.r6.u32;
+    const uint32_t index_count = ctx.r7.u32;
+    RememberDevice(ctx.r3.u32);
+
+    COUNT_profile_add("gpu/guest_d3d_draws", 1);
+    g_live_stats.draw_calls.fetch_add(1, std::memory_order_relaxed);
+    g_live_stats.draw_calls_indexed.fetch_add(1, std::memory_order_relaxed);
+    g_live_stats.total_indices.fetch_add(index_count, std::memory_order_relaxed);
+    // The record's flags slot carries the base vertex index.
+    CaptureDrawCall(ac6::d3d::DrawCallKind::kIndexed, ctx.r3.u32, prim_type, start_index,
+                    index_count, base_vertex);
+    // r3 is also the return register - capture the device before the call.
+    const uint32_t shadow_device = ctx.r3.u32;
+    const uint32_t shadow_wp = ac6::shadow::BeginVerify(base, shadow_device);
+
+    if (REXCVAR_GET(ac6_d3d_trace)) {
+        REXLOG_CAT_TRACE(kLogGPU,
+            "DrawIndexedVertices: prim={} base={} start={} count={}",
+            prim_type, base_vertex, start_index, index_count);
+    }
+
+    __imp__rex_sub_821DF300(ctx, base);
+    ac6::shadow::EndVerify(base, shadow_device, shadow_wp, base_vertex, "DrawIndexedVertices");
+}
+
+// D3DDevice_BeginVertices (0x821DEA48) - EMITS PM4
+// Compiler-specialised: r4/r6 are ignored, the primitive is hard-coded to
+// QUADLIST and the stride to 20 bytes; r5=VertexCount. Returns the allocated
+// vertex pointer in r3 and its only caller (0x821DEED0, DrawVerticesUP) fills it
+// in and commits. This is the "draw from CPU memory" path.
+PPC_FUNC_IMPL(rex_sub_821DEA48) {
+    PPC_FUNC_PROLOGUE();
+
+    const uint32_t vertex_count = ctx.r5.u32;
+    RememberDevice(ctx.r3.u32);
+
+    COUNT_profile_add("gpu/guest_d3d_draws", 1);
+    g_live_stats.draw_calls.fetch_add(1, std::memory_order_relaxed);
+    g_live_stats.draw_calls_up.fetch_add(1, std::memory_order_relaxed);
+    g_live_stats.total_vertices.fetch_add(vertex_count, std::memory_order_relaxed);
+    CaptureDrawCall(ac6::d3d::DrawCallKind::kVerticesUP, ctx.r3.u32, /*QUADLIST*/ 13, 0,
+                    vertex_count, 0);
+    // r3 is also the return register - capture the device before the call.
+    const uint32_t shadow_device = ctx.r3.u32;
+    const uint32_t shadow_wp = ac6::shadow::BeginVerify(base, shadow_device);
+
+    if (REXCVAR_GET(ac6_d3d_trace)) {
+        REXLOG_CAT_TRACE(kLogGPU, "BeginVertices(UP): count={}", vertex_count);
     }
 
     __imp__rex_sub_821DEA48(ctx, base);
+    ac6::shadow::EndVerify(base, shadow_device, shadow_wp, 0, "BeginVertices");
 }
 
-// D3DDevice_SetStreamSource (0x821DC538)
-// r3=pDevice, r4=StreamNumber, r5=pStreamData, r6=OffsetInBytes, r7=Stride
-PPC_FUNC_IMPL(rex_sub_821DC538) {
+// D3DDevice_SetStreamSource (0x821DD0A8) - PURE-SETTER
+// r3=pDevice, r4=StreamNumber, r5=pVertexBuffer, r6=OffsetInBytes, r7=Stride,
+// r8=precomputed 64-bit fetch dirty bit. Writes vertex fetch constant 95-stream
+// at device+1912-8*stream and the buffer pointer at device+12452+4*stream.
+PPC_FUNC_IMPL(rex_sub_821DD0A8) {
     PPC_FUNC_PROLOGUE();
 
-    uint32_t stream = ctx.r4.u32;
-    uint32_t buffer = ctx.r5.u32;
-    uint32_t offset = ctx.r6.u32;
-    uint32_t stride = ctx.r7.u32;
+    const uint32_t stream = ctx.r4.u32;
+    const uint32_t buffer = ctx.r5.u32;
+    const uint32_t offset = ctx.r6.u32;
+    const uint32_t stride = ctx.r7.u32;
     RememberDevice(ctx.r3.u32);
 
     if (stream < ac6::d3d::kMaxStreams) {
@@ -607,40 +524,201 @@ PPC_FUNC_IMPL(rex_sub_821DC538) {
             stream, buffer, offset, stride);
     }
 
-    __imp__rex_sub_821DC538(ctx, base);
+    __imp__rex_sub_821DD0A8(ctx, base);
 }
 
-// D3DDevice_SetSamplerState_MagFilter (0x821DC6C8)
-// r3=pDevice, r4=Sampler, r5=Value
-PPC_FUNC_IMPL(rex_sub_821DC6C8) {
+// D3DDevice_SetRenderTarget (0x821DD260) - PURE-SETTER
+// r3=pDevice, r4=Index, r5=pSurface. Stores the surface at device+12432+4*index
+// and its ColorInfo (surface+28) into the RB_COLOR_INFO shadow; index 0 also
+// refreshes RB_SURFACE_INFO / PA_SC_AA_CONFIG via 0x821DA600.
+PPC_FUNC_IMPL(rex_sub_821DD260) {
     PPC_FUNC_PROLOGUE();
 
-    uint32_t sampler = ctx.r4.u32;
-    uint32_t value = ctx.r5.u32;
+    const uint32_t index = ctx.r4.u32;
+    const uint32_t surface = ctx.r5.u32;
     RememberDevice(ctx.r3.u32);
 
-    if (sampler < ac6::d3d::kMaxSamplers) {
+    if (index < ac6::d3d::kMaxRenderTargets) {
         std::unique_lock<std::shared_mutex> lock(g_shadow_mutex);
-        g_shadow.samplers[sampler].mag_filter = value;
+        g_shadow.render_targets[index] = surface;
     }
-    g_live_stats.set_sampler_state_calls.fetch_add(1, std::memory_order_relaxed);
+    // The full-res effects fix latches RT0 here to tell the R32F downscaler
+    // apart from the effects module at SetViewport time (the device slot can
+    // be stale then, because the game binds after setting the viewport).
+    ac6::backend::NoteRt0Bound(index, surface);
+    g_live_stats.set_render_target_calls.fetch_add(1, std::memory_order_relaxed);
 
     if (REXCVAR_GET(ac6_d3d_trace)) {
         REXLOG_CAT_TRACE(kLogGPU,
-            "SetSamplerState_MagFilter: sampler={} value={}",
-            sampler, value);
+            "SetRenderTarget: index={} surface=0x{:08X}",
+            index, surface);
     }
 
-    __imp__rex_sub_821DC6C8(ctx, base);
+    __imp__rex_sub_821DD260(ctx, base);
 }
 
-// D3DDevice_SetSamplerState_A (0x821DCB88) — min filter
-// r3=pDevice, r4=Sampler, r5=Value
-PPC_FUNC_IMPL(rex_sub_821DCB88) {
+// D3DDevice_SetDepthStencilSurface (0x821DD5C8) - PURE-SETTER
+// r3=pDevice, r4=pSurface -> device+12448, RB_DEPTH_INFO and RB_HIZCONTROL shadows.
+PPC_FUNC_IMPL(rex_sub_821DD5C8) {
     PPC_FUNC_PROLOGUE();
 
-    uint32_t sampler = ctx.r4.u32;
-    uint32_t value = ctx.r5.u32;
+    const uint32_t surface = ctx.r4.u32;
+    RememberDevice(ctx.r3.u32);
+    {
+        std::unique_lock<std::shared_mutex> lock(g_shadow_mutex);
+        g_shadow.depth_stencil = surface;
+    }
+    g_live_stats.set_depth_stencil_calls.fetch_add(1, std::memory_order_relaxed);
+
+    if (REXCVAR_GET(ac6_d3d_trace)) {
+        REXLOG_CAT_TRACE(kLogGPU, "SetDepthStencilSurface: surface=0x{:08X}", surface);
+    }
+
+    __imp__rex_sub_821DD5C8(ctx, base);
+}
+
+// D3DDevice_SetVertexShader (0x821DE600) - PURE-SETTER
+// r3=pDevice, r4=pShader -> device+12688; also copies the shader's embedded
+// fetch-constant defaults into the fetch shadow at device+1152.
+PPC_FUNC_IMPL(rex_sub_821DE600) {
+    PPC_FUNC_PROLOGUE();
+
+    const uint32_t shader = ctx.r4.u32;
+    RememberDevice(ctx.r3.u32);
+    {
+        std::unique_lock<std::shared_mutex> lock(g_shadow_mutex);
+        g_shadow.vertex_shader = shader;
+    }
+
+    if (REXCVAR_GET(ac6_d3d_trace)) {
+        REXLOG_CAT_TRACE(kLogGPU, "SetVertexShader: shader=0x{:08X}", shader);
+    }
+
+    __imp__rex_sub_821DE600(ctx, base);
+}
+
+// D3DDevice_SetPixelShader (0x821DE308) - PURE-SETTER
+// r3=pDevice, r4=pShader -> device+12684.
+PPC_FUNC_IMPL(rex_sub_821DE308) {
+    PPC_FUNC_PROLOGUE();
+
+    const uint32_t shader = ctx.r4.u32;
+    RememberDevice(ctx.r3.u32);
+    {
+        std::unique_lock<std::shared_mutex> lock(g_shadow_mutex);
+        g_shadow.pixel_shader = shader;
+    }
+
+    if (REXCVAR_GET(ac6_d3d_trace)) {
+        REXLOG_CAT_TRACE(kLogGPU, "SetPixelShader: shader=0x{:08X}", shader);
+    }
+
+    __imp__rex_sub_821DE308(ctx, base);
+}
+
+// D3DDevice_SetVertexDeclaration (0x821DE7D0) - PURE-SETTER
+// r3=pDevice, r4=pDecl -> device+11812. NOTE the game also writes 11812 inline,
+// so this hook sees only some of the changes.
+PPC_FUNC_IMPL(rex_sub_821DE7D0) {
+    PPC_FUNC_PROLOGUE();
+
+    const uint32_t decl = ctx.r4.u32;
+    RememberDevice(ctx.r3.u32);
+    {
+        std::unique_lock<std::shared_mutex> lock(g_shadow_mutex);
+        g_shadow.vertex_declaration = decl;
+    }
+    g_live_stats.set_vertex_decl_calls.fetch_add(1, std::memory_order_relaxed);
+
+    if (REXCVAR_GET(ac6_d3d_trace)) {
+        REXLOG_CAT_TRACE(kLogGPU, "SetVertexDeclaration: decl=0x{:08X}", decl);
+    }
+
+    __imp__rex_sub_821DE7D0(ctx, base);
+}
+
+// D3DDevice_SetIndexBuffer (0x821DD1C8) - PURE-SETTER
+// r3=pDevice, r4=pIndexBuffer -> device+12428.
+PPC_FUNC_IMPL(rex_sub_821DD1C8) {
+    PPC_FUNC_PROLOGUE();
+
+    const uint32_t buffer = ctx.r4.u32;
+    RememberDevice(ctx.r3.u32);
+    {
+        std::unique_lock<std::shared_mutex> lock(g_shadow_mutex);
+        g_shadow.index_buffer = buffer;
+    }
+    g_live_stats.set_index_buffer_calls.fetch_add(1, std::memory_order_relaxed);
+
+    if (REXCVAR_GET(ac6_d3d_trace)) {
+        REXLOG_CAT_TRACE(kLogGPU, "SetIndexBuffer: buffer=0x{:08X}", buffer);
+    }
+
+    __imp__rex_sub_821DD1C8(ctx, base);
+}
+
+// Window-scissor emitter (0x821DA698) - EMITS PM4. Internal, not an API entry.
+// r3=pDevice, r4=left, r5=top, r6=right, r7=bottom. Non-tiled it writes TYPE0
+// 0x00022080 (PA_SC_WINDOW_OFFSET / WINDOW_SCISSOR_TL / _BR) straight into the
+// command buffer; tiled it emits a SET_BIN_MASK sequence per tile. Reached from
+// SetScissorRect (0x821DCF28), SetViewport's tail, Clear and Resolve. The real
+// SetViewport is 0x821DD028 -> 0x821DA978 and is hooked by ac6_fullres_effects.
+PPC_FUNC_IMPL(rex_sub_821DA698) {
+    PPC_FUNC_PROLOGUE();
+
+    RememberDevice(ctx.r3.u32);
+    {
+        std::unique_lock<std::shared_mutex> lock(g_shadow_mutex);
+        // Stored as an extent so the signature code's width/height keep meaning.
+        g_shadow.viewport.x = ctx.r4.u32;
+        g_shadow.viewport.y = ctx.r5.u32;
+        g_shadow.viewport.width = ctx.r6.u32 - ctx.r4.u32;
+        g_shadow.viewport.height = ctx.r7.u32 - ctx.r5.u32;
+    }
+    g_live_stats.set_viewport_calls.fetch_add(1, std::memory_order_relaxed);
+
+    if (REXCVAR_GET(ac6_d3d_trace)) {
+        REXLOG_CAT_TRACE(kLogGPU,
+            "WindowScissor: ({},{})-({},{})",
+            ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32);
+    }
+
+    __imp__rex_sub_821DA698(ctx, base);
+}
+
+// D3DDevice_Resolve (0x821E2BB8) - EMITS PM4
+// r3=pDevice, r4=Flags (low 3 bits = RT index, bit 2 = depth), r5=pSourceRect,
+// r6=pDestTexture, r7=pDestPoint, r8=DestLevel, r9=DestSlice, r10=pClearColor,
+// f1=ClearZ. Tile-aware.
+PPC_FUNC_IMPL(rex_sub_821E2BB8) {
+    PPC_FUNC_PROLOGUE();
+
+    RememberDevice(ctx.r3.u32);
+    g_live_stats.resolve_calls.fetch_add(1, std::memory_order_relaxed);
+    // Record the dest as the silhouette mask base if the downscaler just ran,
+    // then lift the effects module's 640x360 source rect to 1280x720.
+    ac6::backend::FxNoteResolveDest(ctx.r6.u32, base);
+    ac6::backend::FullresFixResolveRect(ctx, base);
+    CaptureResolve(ctx.r3.u32, ctx);
+
+    if (REXCVAR_GET(ac6_d3d_trace)) {
+        REXLOG_CAT_TRACE(kLogGPU, "Resolve: flags=0x{:X} dest=0x{:08X}", ctx.r4.u32, ctx.r6.u32);
+    }
+
+    __imp__rex_sub_821E2BB8(ctx, base);
+}
+
+// Sampler state setters - all PURE-SETTER, all r3=pDevice, r4=Sampler, r5=Value.
+// Each edits bits of the 6-dword texture fetch constant at device+1152+24*sampler.
+// The field names in SamplerBinding are historical; the comments say what each
+// actually holds.
+
+// SetSamplerState_MinFilter (0x821DC538): fetch dword3 bits 21-22 (+aniso bits).
+PPC_FUNC_IMPL(rex_sub_821DC538) {
+    PPC_FUNC_PROLOGUE();
+
+    const uint32_t sampler = ctx.r4.u32;
+    const uint32_t value = ctx.r5.u32;
     RememberDevice(ctx.r3.u32);
 
     if (sampler < ac6::d3d::kMaxSamplers) {
@@ -650,21 +728,67 @@ PPC_FUNC_IMPL(rex_sub_821DCB88) {
     g_live_stats.set_sampler_state_calls.fetch_add(1, std::memory_order_relaxed);
 
     if (REXCVAR_GET(ac6_d3d_trace)) {
-        REXLOG_CAT_TRACE(kLogGPU,
-            "SetSamplerState_A: sampler={} value={}",
-            sampler, value);
+        REXLOG_CAT_TRACE(kLogGPU, "SetSamplerState_MinFilter: sampler={} value={}", sampler,
+                         value);
+    }
+
+    __imp__rex_sub_821DC538(ctx, base);
+}
+
+// SetSamplerState_MagFilter (0x821DC6C8): fetch dword3 bits 19-20 (+aniso bits).
+PPC_FUNC_IMPL(rex_sub_821DC6C8) {
+    PPC_FUNC_PROLOGUE();
+
+    const uint32_t sampler = ctx.r4.u32;
+    const uint32_t value = ctx.r5.u32;
+    RememberDevice(ctx.r3.u32);
+
+    if (sampler < ac6::d3d::kMaxSamplers) {
+        std::unique_lock<std::shared_mutex> lock(g_shadow_mutex);
+        g_shadow.samplers[sampler].mag_filter = value;
+    }
+    g_live_stats.set_sampler_state_calls.fetch_add(1, std::memory_order_relaxed);
+
+    if (REXCVAR_GET(ac6_d3d_trace)) {
+        REXLOG_CAT_TRACE(kLogGPU, "SetSamplerState_MagFilter: sampler={} value={}", sampler,
+                         value);
+    }
+
+    __imp__rex_sub_821DC6C8(ctx, base);
+}
+
+// SetSamplerState_MinMipLevel (0x821DCB88): Xbox D3DSAMP_MINMIPLEVEL = hardware
+// mip_max_level, fetch dword4 bits 6-9, clamped against the bound texture.
+// Historically stored in the "min_filter"-adjacent slot as sampler state A.
+PPC_FUNC_IMPL(rex_sub_821DCB88) {
+    PPC_FUNC_PROLOGUE();
+
+    const uint32_t sampler = ctx.r4.u32;
+    const uint32_t value = ctx.r5.u32;
+    RememberDevice(ctx.r3.u32);
+
+    if (sampler < ac6::d3d::kMaxSamplers) {
+        std::unique_lock<std::shared_mutex> lock(g_shadow_mutex);
+        g_shadow.samplers[sampler].min_mip_level = value;
+    }
+    g_live_stats.set_sampler_state_calls.fetch_add(1, std::memory_order_relaxed);
+
+    if (REXCVAR_GET(ac6_d3d_trace)) {
+        REXLOG_CAT_TRACE(kLogGPU, "SetSamplerState_MinMipLevel: sampler={} value={}", sampler,
+                         value);
     }
 
     __imp__rex_sub_821DCB88(ctx, base);
 }
 
-// D3DDevice_SetSamplerState_B (0x821DCA68) — mip filter
-// r3=pDevice, r4=Sampler, r5=Value
+// SetSamplerState_MipMapLodBias (0x821DCA68): float-as-uint -> fixed point into
+// fetch dword4 bits 12-21 (lod_bias). Stored in SamplerBinding::mip_filter,
+// which is therefore NOT a D3DTEXTUREFILTERTYPE.
 PPC_FUNC_IMPL(rex_sub_821DCA68) {
     PPC_FUNC_PROLOGUE();
 
-    uint32_t sampler = ctx.r4.u32;
-    uint32_t value = ctx.r5.u32;
+    const uint32_t sampler = ctx.r4.u32;
+    const uint32_t value = ctx.r5.u32;
     RememberDevice(ctx.r3.u32);
 
     if (sampler < ac6::d3d::kMaxSamplers) {
@@ -674,21 +798,21 @@ PPC_FUNC_IMPL(rex_sub_821DCA68) {
     g_live_stats.set_sampler_state_calls.fetch_add(1, std::memory_order_relaxed);
 
     if (REXCVAR_GET(ac6_d3d_trace)) {
-        REXLOG_CAT_TRACE(kLogGPU,
-            "SetSamplerState_B: sampler={} value={}",
-            sampler, value);
+        REXLOG_CAT_TRACE(kLogGPU, "SetSamplerState_MipMapLodBias: sampler={} raw=0x{:08X}",
+                         sampler, value);
     }
 
     __imp__rex_sub_821DCA68(ctx, base);
 }
 
-// D3DDevice_SetSamplerState_C (0x821DC9C0) — border color
-// r3=pDevice, r4=Sampler, r5=Value
+// SetSamplerState_AnisotropyBias (0x821DC9C0): float-as-uint -> fixed point into
+// fetch dword5 bits 5-8 (aniso_bias; border_color is bits 0-1 and untouched).
+// Stored in SamplerBinding::border_color for historical reasons.
 PPC_FUNC_IMPL(rex_sub_821DC9C0) {
     PPC_FUNC_PROLOGUE();
 
-    uint32_t sampler = ctx.r4.u32;
-    uint32_t value = ctx.r5.u32;
+    const uint32_t sampler = ctx.r4.u32;
+    const uint32_t value = ctx.r5.u32;
     RememberDevice(ctx.r3.u32);
 
     if (sampler < ac6::d3d::kMaxSamplers) {
@@ -698,21 +822,20 @@ PPC_FUNC_IMPL(rex_sub_821DC9C0) {
     g_live_stats.set_sampler_state_calls.fetch_add(1, std::memory_order_relaxed);
 
     if (REXCVAR_GET(ac6_d3d_trace)) {
-        REXLOG_CAT_TRACE(kLogGPU,
-            "SetSamplerState_C: sampler={} value={}",
-            sampler, value);
+        REXLOG_CAT_TRACE(kLogGPU, "SetSamplerState_AnisotropyBias: sampler={} raw=0x{:08X}",
+                         sampler, value);
     }
 
     __imp__rex_sub_821DC9C0(ctx, base);
 }
 
-// D3DDevice_SetSamplerState_MipLevel (0x821DCB08)
-// r3=pDevice, r4=Sampler, r5=Value
+// SetSamplerState_MaxMipLevel (0x821DCB08): D3DSAMP_MAXMIPLEVEL = hardware
+// mip_min_level, fetch dword4 bits 2-5, clamped against the bound texture.
 PPC_FUNC_IMPL(rex_sub_821DCB08) {
     PPC_FUNC_PROLOGUE();
 
-    uint32_t sampler = ctx.r4.u32;
-    uint32_t value = ctx.r5.u32;
+    const uint32_t sampler = ctx.r4.u32;
+    const uint32_t value = ctx.r5.u32;
     RememberDevice(ctx.r3.u32);
 
     if (sampler < ac6::d3d::kMaxSamplers) {
@@ -722,41 +845,46 @@ PPC_FUNC_IMPL(rex_sub_821DCB08) {
     g_live_stats.set_sampler_state_calls.fetch_add(1, std::memory_order_relaxed);
 
     if (REXCVAR_GET(ac6_d3d_trace)) {
-        REXLOG_CAT_TRACE(kLogGPU,
-            "SetSamplerState_MipLevel: sampler={} value={}",
-            sampler, value);
+        REXLOG_CAT_TRACE(kLogGPU, "SetSamplerState_MaxMipLevel: sampler={} value={}", sampler,
+                         value);
     }
 
     __imp__rex_sub_821DCB08(ctx, base);
 }
 
-// D3DDevice_SetShaderGPRAlloc (0x821DBAF8)
-// r3=pDevice, r4=Flags
+// SetRenderState_Wrap0 (0x821DBAF8) - PURE-SETTER
+// r3=pDevice, r4=Value -> low nibble of device+10540 (SQ_WRAPPING_0). Was
+// labelled SetShaderGPRAlloc; the real GPR allocation is 0x821DE960. Kept
+// hooked only for the trace.
 PPC_FUNC_IMPL(rex_sub_821DBAF8) {
     PPC_FUNC_PROLOGUE();
 
-    uint32_t flags = ctx.r4.u32;
     RememberDevice(ctx.r3.u32);
-    {
-        std::unique_lock<std::shared_mutex> lock(g_shadow_mutex);
-        g_shadow.shader_gpr_alloc = flags;
-    }
 
     if (REXCVAR_GET(ac6_d3d_trace)) {
-        REXLOG_CAT_TRACE(kLogGPU,
-            "SetShaderGPRAlloc: flags=0x{:08X}", flags);
+        REXLOG_CAT_TRACE(kLogGPU, "SetRenderState_Wrap0: value=0x{:08X}", ctx.r4.u32);
     }
 
     __imp__rex_sub_821DBAF8(ctx, base);
 }
 
-// D3DDevice_Clear (0x821E2380)
-// r3=pDevice, r4=Count, r5=pRects, r6=Flags, r7=Color, f1=Z, r8=Stencil, r9=EDRAMClear
+// D3DDevice_Clear (0x821E2380) - EMITS PM4
+// r3=pDevice, r4=Count, r5=pRects, r6=Flags, r7=Color, f1=Z, r8=Stencil, r9=passthrough
 PPC_FUNC_IMPL(rex_sub_821E2380) {
     PPC_FUNC_PROLOGUE();
 
     RememberDevice(ctx.r3.u32);
     g_live_stats.clear_calls.fetch_add(1, std::memory_order_relaxed);
+    // How the game clears: full-target vs rect-limited, and which aspects.
+    // Decides whether "a clear elides the EDRAM ownership transfer" is safe.
+    if (ctx.r4.u32) {
+        COUNT_profile_add("gpu/guest_clears_rect", 1);
+    } else {
+        COUNT_profile_add("gpu/guest_clears_full", 1);
+    }
+    if (ctx.r6.u32 & 0x1) COUNT_profile_add("gpu/guest_clears_target", 1);
+    if (ctx.r6.u32 & 0x2) COUNT_profile_add("gpu/guest_clears_zbuffer", 1);
+    if (ctx.r6.u32 & 0x4) COUNT_profile_add("gpu/guest_clears_stencil", 1);
     CaptureClear(base, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.r8.u32,
                  static_cast<float>(ctx.f1.f64));
 
@@ -769,25 +897,32 @@ PPC_FUNC_IMPL(rex_sub_821E2380) {
     __imp__rex_sub_821E2380(ctx, base);
 }
 
-// D3DDevice_SetTextureFetchConstant (0x821E10C8)
-// r3=pDevice, r4=Register, r5=pTexture
+// D3DDevice_SetTexture (0x821E10C8) - PURE-SETTER
+// r3=pDevice, r4=Sampler, r5=pTexture, r6=precomputed 64-bit fetch dirty bit.
+// Merges the texture's fetch words (texture+28..+48) with the sampler-owned bits
+// already in device+1152+24*sampler and stores the object at device+12536+4*sampler.
 PPC_FUNC_IMPL(rex_sub_821E10C8) {
     PPC_FUNC_PROLOGUE();
 
-    uint32_t reg = ctx.r4.u32;
-    uint32_t texture = ctx.r5.u32;
+    const uint32_t sampler = ctx.r4.u32;
+    const uint32_t texture = ctx.r5.u32;
     RememberDevice(ctx.r3.u32);
 
-    if (reg < ac6::d3d::kMaxFetchConstants) {
+    {
         std::unique_lock<std::shared_mutex> lock(g_shadow_mutex);
-        g_shadow.texture_fetch_ptrs[reg] = texture;
+        if (sampler < ac6::d3d::kMaxTextures) {
+            g_shadow.textures[sampler] = texture;
+        }
+        // Kept in step: the signature code counts bound textures from here.
+        if (sampler < ac6::d3d::kMaxFetchConstants) {
+            g_shadow.texture_fetch_ptrs[sampler] = texture;
+        }
     }
+    g_live_stats.set_texture_calls.fetch_add(1, std::memory_order_relaxed);
     g_live_stats.set_texture_fetch_calls.fetch_add(1, std::memory_order_relaxed);
 
     if (REXCVAR_GET(ac6_d3d_trace)) {
-        REXLOG_CAT_TRACE(kLogGPU,
-            "SetTextureFetchConstant: reg={} texture=0x{:08X}",
-            reg, texture);
+        REXLOG_CAT_TRACE(kLogGPU, "SetTexture: sampler={} texture=0x{:08X}", sampler, texture);
     }
 
     __imp__rex_sub_821E10C8(ctx, base);
@@ -797,6 +932,16 @@ namespace ac6::d3d {
 
 void OnFrameBoundary() {
     ac6::d3d::DrawStatsSnapshot draw_stats = SnapshotDrawStats();
+
+    // Stage 1 register-shadow verification summary, once a second.
+    if (REXCVAR_GET(ac6_register_shadow_verify)) {
+        static auto last_summary = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_summary >= std::chrono::seconds(1)) {
+            last_summary = now;
+            ac6::shadow::GuestRegisterShadow::LogSummary();
+        }
+    }
 
     std::unique_lock<std::shared_mutex> lock(g_snapshot_mutex);
     g_snapshot = draw_stats;

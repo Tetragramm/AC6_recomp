@@ -210,6 +210,66 @@ class DeferredCommandBuffer {
                 regions, sizeof(VkBufferImageCopy) * region_count);
   }
 
+  VkImageCopy* CmdCopyImageEmplace(VkImage src_image, VkImageLayout src_image_layout,
+                                   VkImage dst_image, VkImageLayout dst_image_layout,
+                                   uint32_t region_count) {
+    const size_t header_size = rex::align(sizeof(ArgsVkCopyImage), alignof(VkImageCopy));
+    uint8_t* args_ptr = reinterpret_cast<uint8_t*>(
+        WriteCommand(Command::kVkCopyImage, header_size + sizeof(VkImageCopy) * region_count));
+    auto& args = *reinterpret_cast<ArgsVkCopyImage*>(args_ptr);
+    args.src_image = src_image;
+    args.src_image_layout = src_image_layout;
+    args.dst_image = dst_image;
+    args.dst_image_layout = dst_image_layout;
+    args.region_count = region_count;
+    return reinterpret_cast<VkImageCopy*>(args_ptr + header_size);
+  }
+  void CmdVkCopyImage(VkImage src_image, VkImageLayout src_image_layout, VkImage dst_image,
+                      VkImageLayout dst_image_layout, uint32_t region_count,
+                      const VkImageCopy* regions) {
+    std::memcpy(CmdCopyImageEmplace(src_image, src_image_layout, dst_image, dst_image_layout,
+                                    region_count),
+                regions, sizeof(VkImageCopy) * region_count);
+  }
+  // Blit with the copy-image argument block plus the filter.
+  VkImageBlit* CmdBlitImageEmplace(VkImage src_image, VkImageLayout src_image_layout,
+                                   VkImage dst_image, VkImageLayout dst_image_layout,
+                                   uint32_t region_count, VkFilter filter) {
+    const size_t header_size = rex::align(sizeof(ArgsVkBlitImage), alignof(VkImageBlit));
+    uint8_t* args_ptr = reinterpret_cast<uint8_t*>(
+        WriteCommand(Command::kVkBlitImage, header_size + sizeof(VkImageBlit) * region_count));
+    auto& args = *reinterpret_cast<ArgsVkBlitImage*>(args_ptr);
+    args.src_image = src_image;
+    args.src_image_layout = src_image_layout;
+    args.dst_image = dst_image;
+    args.dst_image_layout = dst_image_layout;
+    args.region_count = region_count;
+    args.filter = filter;
+    return reinterpret_cast<VkImageBlit*>(args_ptr + header_size);
+  }
+  void CmdVkFillBuffer(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size, uint32_t data) {
+    auto& args = *reinterpret_cast<ArgsVkFillBuffer*>(
+        WriteCommand(Command::kVkFillBuffer, sizeof(ArgsVkFillBuffer)));
+    args.buffer = buffer;
+    args.offset = offset;
+    args.size = size;
+    args.data = data;
+  }
+  VkImageResolve* CmdResolveImageEmplace(VkImage src_image, VkImageLayout src_image_layout,
+                                         VkImage dst_image, VkImageLayout dst_image_layout,
+                                         uint32_t region_count) {
+    const size_t header_size = rex::align(sizeof(ArgsVkCopyImage), alignof(VkImageResolve));
+    uint8_t* args_ptr = reinterpret_cast<uint8_t*>(WriteCommand(
+        Command::kVkResolveImage, header_size + sizeof(VkImageResolve) * region_count));
+    auto& args = *reinterpret_cast<ArgsVkCopyImage*>(args_ptr);
+    args.src_image = src_image;
+    args.src_image_layout = src_image_layout;
+    args.dst_image = dst_image;
+    args.dst_image_layout = dst_image_layout;
+    args.region_count = region_count;
+    return reinterpret_cast<VkImageResolve*>(args_ptr + header_size);
+  }
+
   VkBufferImageCopy* CmdCopyImageToBufferEmplace(VkImage src_image, VkImageLayout src_image_layout,
                                                  VkBuffer dst_buffer, uint32_t region_count) {
     const size_t header_size =
@@ -284,6 +344,15 @@ class DeferredCommandBuffer {
   // Dynamic rendering (VK_KHR_dynamic_rendering / Vulkan 1.3).
   void CmdVkBeginRendering(const VkRenderingInfo* rendering_info);
   void CmdVkEndRendering() { WriteCommand(Command::kVkEndRendering, 0); }
+
+  void CmdVkWriteTimestamp(VkPipelineStageFlagBits pipeline_stage, VkQueryPool query_pool,
+                           uint32_t query) {
+    auto& args = *reinterpret_cast<ArgsVkWriteTimestamp*>(
+        WriteCommand(Command::kVkWriteTimestamp, sizeof(ArgsVkWriteTimestamp)));
+    args.pipeline_stage = pipeline_stage;
+    args.query_pool = query_pool;
+    args.query = query;
+  }
 
   void CmdVkResetQueryPool(VkQueryPool query_pool, uint32_t first_query, uint32_t query_count) {
     auto& args = *reinterpret_cast<ArgsVkResetQueryPool*>(
@@ -383,9 +452,13 @@ class DeferredCommandBuffer {
     kVkClearColorImage,
     kVkCopyBuffer,
     kVkCopyBufferToImage,
+    kVkBlitImage,
+    kVkCopyImage,
     kVkCopyImageToBuffer,
+    kVkResolveImage,
     kVkCopyQueryPoolResults,
     kVkDispatch,
+    kVkFillBuffer,
     kVkDraw,
     kVkDrawIndexed,
     kVkEndQuery,
@@ -395,6 +468,7 @@ class DeferredCommandBuffer {
     kVkPipelineBarrier,
     kVkPushConstants,
     kVkResetQueryPool,
+    kVkWriteTimestamp,
     kVkSetBlendConstants,
     kVkSetDepthBias,
     kVkSetScissor,
@@ -505,6 +579,33 @@ class DeferredCommandBuffer {
     static_assert(alignof(VkBufferImageCopy) <= alignof(uintmax_t));
   };
 
+  struct ArgsVkCopyImage {
+    VkImage src_image;
+    VkImageLayout src_image_layout;
+    VkImage dst_image;
+    VkImageLayout dst_image_layout;
+    uint32_t region_count;
+    // Followed by aligned VkImageCopy[region_count] (kVkCopyImage) or
+    // VkImageResolve[region_count] (kVkResolveImage).
+  };
+
+  struct ArgsVkBlitImage {
+    VkImage src_image;
+    VkImageLayout src_image_layout;
+    VkImage dst_image;
+    VkImageLayout dst_image_layout;
+    uint32_t region_count;
+    VkFilter filter;
+    // Followed by aligned VkImageBlit[region_count].
+  };
+
+  struct ArgsVkFillBuffer {
+    VkBuffer buffer;
+    VkDeviceSize offset;
+    VkDeviceSize size;
+    uint32_t data;
+  };
+
   struct ArgsVkCopyImageToBuffer {
     VkImage src_image;
     VkImageLayout src_image_layout;
@@ -545,6 +646,12 @@ class DeferredCommandBuffer {
   };
 
   struct ArgsVkEndQuery {
+    VkQueryPool query_pool;
+    uint32_t query;
+  };
+
+  struct ArgsVkWriteTimestamp {
+    VkPipelineStageFlagBits pipeline_stage;
     VkQueryPool query_pool;
     uint32_t query;
   };

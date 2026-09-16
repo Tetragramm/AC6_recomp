@@ -64,6 +64,15 @@ REXCVAR_DEFINE_BOOL(vulkan_async_skip_incomplete_frames, true, "GPU/Vulkan",
                     "used placeholder pipelines to avoid visible flashing")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(ac6_clear_elides_edram_transfer, false, "AC6/Enhancements",
+                    "When the guest's D3D Clear quad is issued, take EDRAM ownership of the "
+                    "targets it fully overwrites without copying the previous occupant in. "
+                    "AC6 packs many passes into the same EDRAM range and clears between "
+                    "them; those copies were most of the GPU frame.");
+REXCVAR_DEFINE_BOOL(gpu_timestamps, false, "GPU",
+                    "Write GPU timestamps at pass changes, EDRAM transfers, resolves and the swap, "
+                    "and report per-frame GPU milliseconds per label in the profiling report. "
+                    "Needs `profiling`.");
 REXCVAR_DEFINE_BOOL(vulkan_submit_on_primary_buffer_end, true, "GPU/Vulkan",
                     "Submit command buffer when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -74,6 +83,11 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics::vulkan {
+
+// The Xbox 360 D3D9 Clear draws a rect-list quad with this vertex shader
+// (learned by fingerprint: 8192x8192 window scissor + untransformed vertices).
+constexpr uint64_t kD3DClearVertexShaderHash = 0x0A6D1DD7767FDF27ull;
+
 
 namespace {
 
@@ -573,6 +587,8 @@ const VkDescriptorPoolSize VulkanCommandProcessor::kDescriptorPoolSizeUniformBuf
 
 const VkDescriptorPoolSize VulkanCommandProcessor::kDescriptorPoolSizeStorageBuffer = {
     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 * kLinkedTypeDescriptorPoolSetCount};
+const VkDescriptorPoolSize VulkanCommandProcessor::kDescriptorPoolSizeStorageImage = {
+    VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kLinkedTypeDescriptorPoolSetCount};
 
 // 2x descriptors for texture images because of unsigned and signed bindings.
 const VkDescriptorPoolSize VulkanCommandProcessor::kDescriptorPoolSizeTextures[2] = {
@@ -592,6 +608,10 @@ VulkanCommandProcessor::VulkanCommandProcessor(VulkanGraphicsSystem* graphics_sy
           static_cast<const ui::vulkan::VulkanProvider*>(graphics_system->provider())
               ->vulkan_device(),
           &kDescriptorPoolSizeStorageBuffer, 1, kLinkedTypeDescriptorPoolSetCount),
+      transient_descriptor_allocator_storage_image_(
+          static_cast<const ui::vulkan::VulkanProvider*>(graphics_system->provider())
+              ->vulkan_device(),
+          &kDescriptorPoolSizeStorageImage, 1, kLinkedTypeDescriptorPoolSetCount),
       transient_descriptor_allocator_textures_(
           static_cast<const ui::vulkan::VulkanProvider*>(graphics_system->provider())
               ->vulkan_device(),
@@ -825,6 +845,157 @@ bool VulkanCommandProcessor::CompileGlslToSpirv(VkShaderStageFlagBits stage,
   return CompileGlslToSpirvInternal(glslang_stage, source, spirv_out, error_out);
 }
 
+
+// ---- GPU timer ------------------------------------------------------------
+
+void VulkanCommandProcessor::GpuTimerInit() {
+  gpu_timer_pool_ = VK_NULL_HANDLE;
+  gpu_timer_period_ns_ = 0.0;
+  gpu_timer_next_block_ = 0;
+  gpu_timer_block_open_ = false;
+  gpu_timer_pending_.clear();
+  gpu_timer_last_pass_key_ = ~uint64_t(0);
+  if (!REXCVAR_GET(gpu_timestamps)) {
+    return;
+  }
+  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  VkDevice device = vulkan_device->device();
+  VkPhysicalDeviceProperties props{};
+  vulkan_device->vulkan_instance()->functions().vkGetPhysicalDeviceProperties(
+      vulkan_device->physical_device(), &props);
+  if (props.limits.timestampPeriod <= 0.0f) {
+    REXGPU_ERROR("gpu_timestamps: device reports no timestamp support");
+    return;
+  }
+  gpu_timer_period_ns_ = props.limits.timestampPeriod;
+  VkQueryPoolCreateInfo pool_info{};
+  pool_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+  pool_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+  pool_info.queryCount = kGpuTimerQueriesPerBlock * kGpuTimerBlocks;
+  if (dfn.vkCreateQueryPool(device, &pool_info, nullptr, &gpu_timer_pool_) != VK_SUCCESS) {
+    REXGPU_ERROR("gpu_timestamps: failed to create the timestamp query pool");
+    gpu_timer_pool_ = VK_NULL_HANDLE;
+    return;
+  }
+  REXGPU_INFO("gpu_timestamps: on, period {} ns", gpu_timer_period_ns_);
+}
+
+void VulkanCommandProcessor::GpuTimerShutdown() {
+  if (gpu_timer_pool_ != VK_NULL_HANDLE) {
+    const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+    vulkan_device->functions().vkDestroyQueryPool(vulkan_device->device(), gpu_timer_pool_,
+                                                  nullptr);
+    gpu_timer_pool_ = VK_NULL_HANDLE;
+  }
+  gpu_timer_pending_.clear();
+}
+
+uint32_t VulkanCommandProcessor::GpuTimerLabelId(const std::string& label) {
+  auto it = gpu_timer_label_ids_.find(label);
+  if (it != gpu_timer_label_ids_.end()) {
+    return it->second;
+  }
+  const uint32_t id = uint32_t(gpu_timer_labels_.size());
+  gpu_timer_labels_.push_back(label);
+  gpu_timer_label_ids_.emplace(label, id);
+  // The profiler counter is keyed by name and reported per guest frame - the
+  // string must outlive registration, which the labels vector guarantees.
+  gpu_timer_counter_ids_.push_back(
+      rex::debug::profiling::RegisterCounter(("gpu-us/" + label).c_str(), true));
+  return id;
+}
+
+void VulkanCommandProcessor::GpuTimerOnSubmissionOpen() {
+  if (gpu_timer_pool_ == VK_NULL_HANDLE) {
+    return;
+  }
+  gpu_timer_current_ = GpuTimerSubmission{};
+  gpu_timer_current_.first_query = gpu_timer_next_block_ * kGpuTimerQueriesPerBlock;
+  gpu_timer_next_block_ = (gpu_timer_next_block_ + 1) % kGpuTimerBlocks;
+  gpu_timer_block_open_ = true;
+  gpu_timer_last_pass_key_ = ~uint64_t(0);
+  // Reset must be outside a render pass; a freshly opened submission has none.
+  deferred_command_buffer_.CmdVkResetQueryPool(gpu_timer_pool_, gpu_timer_current_.first_query,
+                                               kGpuTimerQueriesPerBlock);
+  GpuTimerMark("submission begin");
+}
+
+void VulkanCommandProcessor::GpuTimerMarkLabel(uint32_t label_id) {
+  if (!gpu_timer_block_open_) {
+    return;
+  }
+  const uint32_t used = uint32_t(gpu_timer_current_.marks.size());
+  if (used >= kGpuTimerQueriesPerBlock) {
+    return;  // block full: the tail of this submission is attributed to the last mark
+  }
+  const uint32_t query = gpu_timer_current_.first_query + used;
+  // BOTTOM_OF_PIPE: the timestamp is written once everything before it has
+  // finished, so mark-to-mark intervals measure completed GPU work.
+  deferred_command_buffer_.CmdVkWriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                                               gpu_timer_pool_, query);
+  gpu_timer_current_.marks.push_back(GpuTimerStamp{query, label_id});
+}
+
+void VulkanCommandProcessor::GpuTimerMark(const char* label) {
+  if (gpu_timer_pool_ == VK_NULL_HANDLE || !gpu_timer_block_open_) {
+    return;
+  }
+  GpuTimerMarkLabel(GpuTimerLabelId(label));
+}
+
+void VulkanCommandProcessor::GpuTimerMarkPass(uint64_t key, const std::string& label) {
+  if (gpu_timer_pool_ == VK_NULL_HANDLE || !gpu_timer_block_open_ ||
+      key == gpu_timer_last_pass_key_) {
+    return;
+  }
+  gpu_timer_last_pass_key_ = key;
+  GpuTimerMarkLabel(GpuTimerLabelId(label));
+}
+
+void VulkanCommandProcessor::GpuTimerOnSubmissionEnd(uint64_t submission) {
+  if (gpu_timer_pool_ == VK_NULL_HANDLE || !gpu_timer_block_open_) {
+    return;
+  }
+  GpuTimerMark("submission end");
+  gpu_timer_block_open_ = false;
+  gpu_timer_current_.submission = submission;
+  gpu_timer_pending_.push_back(std::move(gpu_timer_current_));
+  gpu_timer_current_ = GpuTimerSubmission{};
+}
+
+void VulkanCommandProcessor::GpuTimerRetire() {
+  if (gpu_timer_pool_ == VK_NULL_HANDLE) {
+    return;
+  }
+  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  VkDevice device = vulkan_device->device();
+  std::vector<uint64_t> stamps;
+  while (!gpu_timer_pending_.empty() &&
+         gpu_timer_pending_.front().submission <= submission_completed_) {
+    GpuTimerSubmission done = std::move(gpu_timer_pending_.front());
+    gpu_timer_pending_.pop_front();
+    if (done.marks.size() < 2) {
+      continue;
+    }
+    stamps.resize(done.marks.size());
+    // The fence for this submission has passed, so the results are available.
+    const VkResult qr = dfn.vkGetQueryPoolResults(
+        device, gpu_timer_pool_, done.first_query, uint32_t(done.marks.size()),
+        stamps.size() * sizeof(uint64_t), stamps.data(), sizeof(uint64_t),
+        VK_QUERY_RESULT_64_BIT);
+    if (qr != VK_SUCCESS) {
+      continue;
+    }
+    for (size_t i = 0; i + 1 < done.marks.size(); ++i) {
+      const uint64_t dt = stamps[i + 1] > stamps[i] ? stamps[i + 1] - stamps[i] : 0;
+      const int64_t us = int64_t(double(dt) * gpu_timer_period_ns_ / 1000.0);
+      rex::debug::profiling::AddCounter(gpu_timer_counter_ids_[done.marks[i].label], us);
+    }
+  }
+}
+
 bool VulkanCommandProcessor::SetupContext() {
   if (!CommandProcessor::SetupContext()) {
     REXGPU_ERROR("Failed to initialize base command processor context");
@@ -943,6 +1114,20 @@ bool VulkanCommandProcessor::SetupContext() {
     REXGPU_ERROR(
         "Failed to create a Vulkan descriptor set layout for two storage "
         "buffers bound to the compute shader");
+    return false;
+  }
+
+  // Transient: one storage image for compute shaders.
+  descriptor_set_layout_binding_transient.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+  descriptor_set_layout_create_info.bindingCount = 1;
+  descriptor_set_layout_create_info.pBindings = &descriptor_set_layout_binding_transient;
+  if (dfn.vkCreateDescriptorSetLayout(
+          device, &descriptor_set_layout_create_info, nullptr,
+          &descriptor_set_layouts_single_transient_[size_t(
+              SingleTransientDescriptorLayout::kStorageImageCompute)]) != VK_SUCCESS) {
+    REXGPU_ERROR(
+        "Failed to create a Vulkan descriptor set layout for a storage image "
+        "bound to the compute shader");
     return false;
   }
 
@@ -1955,6 +2140,8 @@ bool VulkanCommandProcessor::SetupContext() {
 
 void VulkanCommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
+  // After the wait: the last submission still references the query pool.
+  GpuTimerShutdown();
   InvalidateAllVertexBufferResidency();
   ShutdownOcclusionQueryResources();
 
@@ -3378,12 +3565,16 @@ VkDescriptorSet VulkanCommandProcessor::AllocateSingleTransientDescriptor(
     bool is_storage_buffer =
         transient_descriptor_layout == SingleTransientDescriptorLayout::kStorageBufferCompute ||
         transient_descriptor_layout == SingleTransientDescriptorLayout::kStorageBufferPairCompute;
+    bool is_storage_image =
+        transient_descriptor_layout == SingleTransientDescriptorLayout::kStorageImageCompute;
     ui::vulkan::LinkedTypeDescriptorSetAllocator& transient_descriptor_allocator =
-        is_storage_buffer ? transient_descriptor_allocator_storage_buffer_
-                          : transient_descriptor_allocator_uniform_buffer_;
+        is_storage_image    ? transient_descriptor_allocator_storage_image_
+        : is_storage_buffer ? transient_descriptor_allocator_storage_buffer_
+                            : transient_descriptor_allocator_uniform_buffer_;
     VkDescriptorPoolSize descriptor_count;
-    descriptor_count.type =
-        is_storage_buffer ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    descriptor_count.type = is_storage_image    ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                            : is_storage_buffer ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+                                                : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     descriptor_count.descriptorCount =
         transient_descriptor_layout == SingleTransientDescriptorLayout::kStorageBufferPairCompute
             ? 2
@@ -3564,10 +3755,11 @@ VulkanCommandProcessor::ScratchBufferAcquisition VulkanCommandProcessor::Acquire
   VkDeviceMemory new_scratch_buffer_memory;
   VkBuffer new_scratch_buffer;
   // VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT for
-  // texture loading.
+  // texture loading; TRANSFER_DST so the stencil transfer can clear it.
   if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
           vulkan_device, size,
-          VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+          VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
           ui::vulkan::util::MemoryPurpose::kDeviceLocal, new_scratch_buffer,
           new_scratch_buffer_memory)) {
     REXGPU_ERROR("VulkanCommandProcessor: Failed to create a {} MB scratch GPU buffer", size >> 20);
@@ -3688,7 +3880,26 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
+  COUNT_profile_add("gpu/issue_draws", 1);
+
   const RegisterFile& regs = *register_file_;
+  if (gpu_timer_pool_ != VK_NULL_HANDLE) {
+    // Pass identity: target pitch, MSAA and colour/depth formats. A change is a
+    // new pass (world tile, post, UI...) and starts a new GPU interval.
+    const auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+    const uint32_t color_info = regs.values[XE_GPU_REG_RB_COLOR_INFO];
+    const uint32_t depth_info = regs.values[XE_GPU_REG_RB_DEPTH_INFO];
+    const uint64_t key = uint64_t(rb_surface_info.surface_pitch) |
+                         (uint64_t(rb_surface_info.msaa_samples) << 16) |
+                         (uint64_t((color_info >> 16) & 0xF) << 20) |
+                         (uint64_t((depth_info >> 16) & 0x1) << 24);
+    if (key != gpu_timer_last_pass_key_) {
+      GpuTimerMarkPass(key, fmt::format("draws pitch={} msaa={} cfmt={} dfmt={}",
+                                        rb_surface_info.surface_pitch,
+                                        uint32_t(rb_surface_info.msaa_samples),
+                                        (color_info >> 16) & 0xF, (depth_info >> 16) & 0x1));
+    }
+  }
   (void)index_buffer_info;
   auto draw_fail = [&](const char* stage) {
     auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
@@ -3723,6 +3934,59 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     return draw_fail("missing_vertex_shader");
   }
   pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
+  {
+    // Learn the guest D3D Clear's fingerprint: the canned clear state is an
+    // 8192x8192 window scissor with untransformed vertices. Log the shader it
+    // uses, and how often the fingerprint fires, so a "clear elides the
+    // ownership transfer" rule can key on the exact shader.
+    const uint32_t scissor_br = regs.values[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR];
+    const uint32_t vte = regs.values[XE_GPU_REG_PA_CL_VTE_CNTL];
+    if (scissor_br == 0x20002000u && vte == 0x300u) {
+      COUNT_profile_add("gpu/clear_fingerprint_draws", 1);
+      if (REXCVAR_GET(ac6_clear_elides_edram_transfer) &&
+          vertex_shader->ucode_data_hash() == kD3DClearVertexShaderHash &&
+          prim_type == xenos::PrimitiveType::kRectangleList) {
+        // The D3D9 Clear quad. Work out which targets it fully overwrites from
+        // the state it was issued with, and let the render target cache take
+        // ownership of those without copying the old contents in.
+        uint32_t mask = 0;
+        const auto depth_control = regs.Get<reg::RB_DEPTHCONTROL>();
+        const uint32_t stencil_ref_mask = regs.values[XE_GPU_REG_RB_STENCILREFMASK];
+        const bool clears_depth = depth_control.z_enable && depth_control.z_write_enable &&
+                                  depth_control.zfunc == xenos::CompareFunction::kAlways;
+        const bool clears_stencil =
+            depth_control.stencil_enable &&
+            depth_control.stencilfunc == xenos::CompareFunction::kAlways &&
+            depth_control.stencilzpass == xenos::StencilOp::kReplace &&
+            ((stencil_ref_mask >> 16) & 0xFF) == 0xFF;
+        // Depth and stencil share a host image; only elide when both are
+        // rewritten, otherwise the untouched aspect still needs the copy.
+        if (clears_depth && clears_stencil) {
+          mask |= 1u;
+        }
+        const uint32_t color_mask = regs.values[XE_GPU_REG_RB_COLOR_MASK];
+        for (uint32_t i = 0; i < 4; ++i) {
+          if (((color_mask >> (i * 4)) & 0xF) == 0xF) {
+            mask |= 1u << (1 + i);
+          }
+        }
+        if (mask) {
+          render_target_cache_->SetNextDrawFullOverwriteMask(mask);
+          COUNT_profile_add("gpu/clear_elided_transfers", 1);
+        }
+      }
+      static std::atomic<int> logged{0};
+      if (REXCVAR_GET(gpu_timestamps) && logged.load() < 6) {
+        ++logged;
+        auto* ps = static_cast<VulkanShader*>(active_pixel_shader());
+        REXGPU_ERROR("clear fingerprint: vs {:016X} ps {:016X} color_mask {:08X} depthcontrol "
+                     "{:08X} prim {}",
+                     vertex_shader->ucode_data_hash(), ps ? ps->ucode_data_hash() : 0,
+                     regs.values[XE_GPU_REG_RB_COLOR_MASK], regs.values[XE_GPU_REG_RB_DEPTHCONTROL],
+                     uint32_t(prim_type));
+      }
+    }
+  }
   bool memexport_used_vertex = vertex_shader->memexport_eM_written() != 0;
   if (memexport_used_vertex) {
     if (!device_properties.vertexPipelineStoresAndAtomics) {
@@ -4535,6 +4799,7 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
 }
 
 bool VulkanCommandProcessor::IssueCopy() {
+  GpuTimerMark("resolve");
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -5035,6 +5300,7 @@ bool VulkanCommandProcessor::EndGuestOcclusionQuery(uint32_t sample_count_addres
                                            sizeof(uint64_t) * host_index, sizeof(uint64_t),
                                            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
 
+  COUNT_profile_add("gpu/occlusion_query_stalls", 1);
   if (!EndSubmission(false)) {
     return false;
   }
@@ -5185,6 +5451,7 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
   submissions_in_flight_fences_.erase(submissions_in_flight_fences_.cbegin(),
                                       submissions_in_flight_fences_awaited_end);
   submission_completed_ += fences_awaited;
+  GpuTimerRetire();
 
   // Reclaim semaphores.
   while (!submissions_in_flight_semaphores_.empty()) {
@@ -5306,6 +5573,12 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     // the end of the submission (when async pipeline object creation requests
     // are fulfilled).
     deferred_command_buffer_.Reset();
+    if (gpu_timer_pool_ == VK_NULL_HANDLE && gpu_timer_period_ns_ == 0.0 &&
+        REXCVAR_GET(gpu_timestamps)) {
+      GpuTimerInit();
+      gpu_timer_period_ns_ = gpu_timer_period_ns_ > 0.0 ? gpu_timer_period_ns_ : -1.0;
+    }
+    GpuTimerOnSubmissionOpen();
 
     // Reset cached state of the command buffer.
     dynamic_viewport_update_needed_ = true;
@@ -5556,6 +5829,9 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       REXGPU_ERROR("Failed to begin a Vulkan command buffer");
       return false;
     }
+    // The closing timestamp must be recorded before the deferred stream is
+    // replayed, or it lands in a stream that has already been executed.
+    GpuTimerOnSubmissionEnd(GetCurrentSubmission());
     deferred_command_buffer_.Execute(command_buffer.buffer);
     if (dfn.vkEndCommandBuffer(command_buffer.buffer) != VK_SUCCESS) {
       REXGPU_ERROR("Failed to end a Vulkan command buffer");
@@ -5588,6 +5864,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     {
       ui::vulkan::VulkanDevice::Queue::Acquisition queue_acquisition =
           vulkan_device->AcquireQueue(vulkan_device->queue_family_graphics_compute(), 0);
+      COUNT_profile_add("gpu/submits", 1);
       submit_result = dfn.vkQueueSubmit(queue_acquisition.queue(), 1, &submit_info, fence);
     }
     if (submit_result != VK_SUCCESS) {
@@ -5669,6 +5946,7 @@ void VulkanCommandProcessor::ClearTransientDescriptorPools() {
     transient_descriptors_free.clear();
   }
   single_transient_descriptors_used_.clear();
+  transient_descriptor_allocator_storage_image_.Reset();
   transient_descriptor_allocator_storage_buffer_.Reset();
   transient_descriptor_allocator_uniform_buffer_.Reset();
 }

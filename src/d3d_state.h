@@ -17,7 +17,7 @@ inline constexpr uint32_t kMaxClearRectsPerRecord = 8;
 struct DrawStats {
     std::atomic<uint32_t> draw_calls{0};
     std::atomic<uint32_t> draw_calls_indexed{0};
-    std::atomic<uint32_t> draw_calls_indexed_shared{0};
+    std::atomic<uint32_t> draw_calls_up{0};  // BeginVertices/DrawVerticesUP path
     std::atomic<uint32_t> draw_calls_primitive{0};
     std::atomic<uint64_t> total_indices{0};
     std::atomic<uint64_t> total_vertices{0};
@@ -36,7 +36,7 @@ struct DrawStats {
     void Reset() {
         draw_calls.store(0, std::memory_order_relaxed);
         draw_calls_indexed.store(0, std::memory_order_relaxed);
-        draw_calls_indexed_shared.store(0, std::memory_order_relaxed);
+        draw_calls_up.store(0, std::memory_order_relaxed);
         draw_calls_primitive.store(0, std::memory_order_relaxed);
         total_indices.store(0, std::memory_order_relaxed);
         total_vertices.store(0, std::memory_order_relaxed);
@@ -57,7 +57,7 @@ struct DrawStats {
 struct DrawStatsSnapshot {
     uint32_t draw_calls;
     uint32_t draw_calls_indexed;
-    uint32_t draw_calls_indexed_shared;
+    uint32_t draw_calls_up;
     uint32_t draw_calls_primitive;
     uint64_t total_indices;
     uint64_t total_vertices;
@@ -76,7 +76,7 @@ struct DrawStatsSnapshot {
 
 enum class DrawCallKind : uint8_t {
     kIndexed,
-    kIndexedShared,
+    kVerticesUP,  // BeginVertices/EndVertices: vertices supplied from CPU memory
     kPrimitive,
 };
 
@@ -86,12 +86,16 @@ struct StreamBinding {
     uint32_t stride{0};       // Vertex stride in bytes
 };
 
+// Field names are historical - several were assigned before the setters were
+// identified. The comments give what each actually receives (verified against
+// the recompiled bodies, 2026-09-14).
 struct SamplerBinding {
-    uint32_t mag_filter{0};   // D3DTEXTUREFILTERTYPE
-    uint32_t min_filter{0};   // Sampler state A
-    uint32_t mip_filter{0};   // Sampler state B
-    uint32_t mip_level{0};    // Max mip level
-    uint32_t border_color{0}; // Sampler state C
+    uint32_t mag_filter{0};    // D3DTEXTUREFILTERTYPE (SetSamplerState_MagFilter)
+    uint32_t min_filter{0};    // D3DTEXTUREFILTERTYPE (SetSamplerState_MinFilter)
+    uint32_t mip_filter{0};    // NOT a filter: raw float bits of MipMapLodBias
+    uint32_t mip_level{0};     // MaxMipLevel (hardware mip_min_level)
+    uint32_t border_color{0};  // NOT a colour: raw float bits of AnisotropyBias
+    uint32_t min_mip_level{0}; // MinMipLevel (hardware mip_max_level)
 };
 
 // All values are guest addresses into PPC address space unless noted.
@@ -102,6 +106,8 @@ struct ShadowState {
     std::array<uint32_t, kMaxTextures> textures{};
     uint32_t vertex_declaration{0};
     uint32_t index_buffer{0};
+    uint32_t vertex_shader{0};
+    uint32_t pixel_shader{0};
     std::array<StreamBinding, kMaxStreams> streams{};
     std::array<SamplerBinding, kMaxSamplers> samplers{};
     std::array<uint32_t, kMaxFetchConstants> texture_fetch_ptrs{};

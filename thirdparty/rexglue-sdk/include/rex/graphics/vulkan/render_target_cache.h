@@ -543,6 +543,11 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
       // Last bits because this affects the pipeline layout - after sorting,
       // only change it as fewer times as possible. Depth buffers have an
       // additional stencil texture.
+      // Stencil-bit modes only: a compute shader that writes the whole
+      // stencil byte of each destination pixel to a buffer, for a copy into
+      // the stencil aspect, instead of eight masked fragment draws.
+      uint32_t stencil_compute : 1;
+
       static_assert(size_t(TransferMode::kCount) <= (size_t(1) << 4));
       TransferMode mode : 4;
     };
@@ -792,6 +797,52 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     }
   };
 
+  // Resolve compute shader writing the destination texture image (see
+  // VulkanTextureCache::ResolveComputeHostFormat): the direct resolve's
+  // sampling and packing, with the load shader's unpacking and an image store
+  // instead of the tiled address. Only single-sampled resolve views (any
+  // render target sample count - a multisampled owner read through a 1x view
+  // is the sample-as-pixel alias, exact by the dump mapping).
+  struct ResolveToImagePipelineKey {
+    ResolveToImagePipelineKey() { std::memset(this, 0, sizeof(*this)); }
+    DumpPipelineKey dump_pipeline_key;
+    uint32_t host_format;  // VulkanTextureCache::ResolveComputeHostFormat
+    bool draw_resolution_scaled;
+    // The sample count of the resolve VIEW (not of the owning render target):
+    // it decides how EDRAM samples map to destination pixels, and which of
+    // them the sample select takes or averages.
+    xenos::MsaaSamples view_msaa_samples;
+    xenos::CopySampleSelect sample_select;
+    uint64_t packed() const {
+      return uint64_t(dump_pipeline_key.key) | (uint64_t(host_format) << 32) |
+             (uint64_t(draw_resolution_scaled ? 1 : 0) << 40) |
+             (uint64_t(view_msaa_samples) << 41) | (uint64_t(sample_select) << 43);
+    }
+    struct Hasher {
+      size_t operator()(const ResolveToImagePipelineKey& key) const {
+        return std::hash<uint64_t>{}(key.packed());
+      }
+    };
+    bool operator==(const ResolveToImagePipelineKey& other_key) const {
+      return packed() == other_key.packed();
+    }
+  };
+  struct ResolveToImagePushConstants {
+    DirectResolvePushConstants direct;
+    // The resolve region's origin and the level's extent in the image, in
+    // host texels.
+    uint32_t image_x, image_y, image_width, image_height;
+  };
+  VkPipeline GetResolveToImagePipeline(ResolveToImagePipelineKey key);
+  // Checks the resolve for the compute path and finds the destinations (no
+  // commands); Issue records the dispatches. Uses the same owner/rectangle
+  // state as the copy path (resolve_copy_to_texture_rt_).
+  bool TryPrepareResolveComputeToTexture(
+      const draw_util::ResolveInfo& resolve_info, draw_util::ResolveCopyShaderIndex copy_shader,
+      const draw_util::ResolveCopyShaderConstants& copy_shader_constants,
+      VulkanTextureCache& texture_cache, bool draw_resolution_scaled);
+  void IssueResolveComputeToTexture(VulkanTextureCache& texture_cache);
+
   // Returns the framebuffer object, or VK_NULL_HANDLE if failed to create.
   const Framebuffer* GetHostRenderTargetsFramebuffer(
       RenderPassKey render_pass_key, uint32_t pitch_tiles_at_32bpp,
@@ -802,6 +853,32 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // sample-rate shading, returns a pointer to as many pipelines as there are
   // samples. If there was a failure to create a pipeline, returns nullptr.
   VkPipeline const* GetTransferPipelines(TransferPipelineKey key);
+
+  // Stencil transfers through a buffer (see TransferShaderKey::stencil_compute):
+  // without VK_EXT_shader_stencil_export every stencil bit of a destination
+  // needs its own masked draw. Instead, one dispatch per rectangle computes
+  // the destination stencil bytes into the scratch buffer, and
+  // vkCmdCopyBufferToImage writes them into the stencil aspect. Single-sampled
+  // destinations only - buffer-image copies can't target multisampled images.
+  struct StencilComputePushConstants {
+    TransferAddressConstant address;
+    // Rectangle in host pixels of the destination.
+    uint32_t rect_x, rect_y, rect_width, rect_height;
+    // Row pitch in bytes of the rectangle's rows in the output buffer, and
+    // the byte offset of its first row (a multiple of 4).
+    uint32_t row_pitch;
+    uint32_t buffer_offset;
+  };
+  static constexpr uint32_t kStencilComputeGroupSizeX = 8;
+  static constexpr uint32_t kStencilComputeGroupSizeY = 8;
+  VkPipeline GetStencilComputePipeline(TransferShaderKey key);
+  // Records the dispatches and copies for all transfers to the destination.
+  // The sources must already be in the transfer source usage; leaves the
+  // destination in its draw usage. Returns false (recording nothing) if the
+  // path can't be used, so the caller does the draws instead.
+  bool RecordStencilBufferTransfers(VulkanRenderTarget& dest_vulkan_rt,
+                                    const std::vector<Transfer>& transfers,
+                                    const Transfer::Rectangle* resolve_clear_rectangle);
 
   // Do ownership transfers for render targets - each render target / vector may
   // be null / empty in case there's nothing to do for them.
@@ -820,7 +897,8 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // With direct_key, the packed sample is written to the resolve destination
   // instead of the EDRAM buffer, fusing the dump and the copy.
   VkPipeline BuildRenderTargetSamplingPipeline(DumpPipelineKey key,
-                                               const DirectResolvePipelineKey* direct_key);
+                                               const DirectResolvePipelineKey* direct_key,
+                                               const ResolveToImagePipelineKey* image_key = nullptr);
   // Checks whether the resolve can be done straight from the host render
   // targets, and if so, gathers the dispatches for IssueDirectResolveCopy into
   // dump_rectangles_ / direct_resolve_dispatches_. Doesn't record any commands,
@@ -835,6 +913,19 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
                               draw_util::ResolveCopyShaderConstants copy_shader_constants,
                               VkDescriptorSet descriptor_set_dest, bool draw_resolution_scaled,
                               uint32_t dest_binding_offset);
+
+  // Render-target-as-texture: when the resolve rectangle is owned by one
+  // single-sampled color render target whose bits are what the destination
+  // texture would load anyway, the resolve becomes a vkCmdCopyImage from the
+  // render target into the texture's own image, skipping both the tiled
+  // memory write and the untiling load. TryPrepare records nothing; on
+  // success, Issue records the copy. Counted and rejected-by-reason for the
+  // periodic log line.
+  bool TryPrepareResolveCopyToTexture(const draw_util::ResolveInfo& resolve_info,
+                                      VulkanTextureCache& texture_cache,
+                                      bool draw_resolution_scaled);
+  void IssueResolveCopyToTexture(VulkanTextureCache& texture_cache);
+  void LogResolveCopyToTextureStats();
 
   // Writes contents of host render targets within rectangles from
   // ResolveInfo::GetCopyEdramTileSpan to edram_buffer_.
@@ -879,6 +970,11 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
   VkPipelineLayout dump_pipeline_layout_color_ = VK_NULL_HANDLE;
   VkPipelineLayout dump_pipeline_layout_depth_ = VK_NULL_HANDLE;
+  // [0] output storage buffer, [1] source (color image / depth+stencil images).
+  VkPipelineLayout stencil_compute_pipeline_layout_color_ = VK_NULL_HANDLE;
+  VkPipelineLayout stencil_compute_pipeline_layout_depth_ = VK_NULL_HANDLE;
+  std::unordered_map<TransferShaderKey, VkPipeline, TransferShaderKey::Hasher>
+      stencil_compute_pipelines_;
   // Compute pipelines for copying host render target contents to the EDRAM
   // buffer. VK_NULL_HANDLE if failed to create.
   std::unordered_map<DumpPipelineKey, VkPipeline, DumpPipelineKey::Hasher> dump_pipelines_;
@@ -886,6 +982,17 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   VkPipelineLayout direct_resolve_pipeline_layout_depth_ = VK_NULL_HANDLE;
   std::unordered_map<DirectResolvePipelineKey, VkPipeline, DirectResolvePipelineKey::Hasher>
       direct_resolve_pipelines_;
+  // [0] storage image (transient), [1] source.
+  VkPipelineLayout resolve_to_image_pipeline_layout_color_ = VK_NULL_HANDLE;
+  VkPipelineLayout resolve_to_image_pipeline_layout_depth_ = VK_NULL_HANDLE;
+  std::unordered_map<ResolveToImagePipelineKey, VkPipeline, ResolveToImagePipelineKey::Hasher>
+      resolve_to_image_pipelines_;
+  std::vector<VulkanTextureCache::ResolveComputeDestination> resolve_compute_destinations_;
+  ResolveToImagePipelineKey resolve_compute_pipeline_key_ = {};
+  DirectResolvePushConstants resolve_compute_push_constants_ = {};
+  uint64_t resolve_compute_count_ = 0;
+  uint64_t resolve_compute_attempt_count_ = 0;
+  std::vector<std::pair<const char*, uint64_t>> resolve_compute_rejects_;
 
   // Temporary storage for Resolve.
   std::vector<Transfer> clear_transfers_[2];
@@ -900,6 +1007,22 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   uint64_t direct_resolve_attempt_count_ = 0;
   uint64_t direct_resolve_success_count_ = 0;
   uint64_t direct_resolve_fallback_count_ = 0;
+
+  // State between TryPrepareResolveCopyToTexture and IssueResolveCopyToTexture:
+  // the owning render target, the resolve origin in its host pixels, and the
+  // half-pixel offset fill.
+  VulkanRenderTarget* resolve_copy_to_texture_rt_ = nullptr;
+  bool resolve_copy_to_texture_multisampled_ = false;
+  uint32_t resolve_copy_to_texture_dump_row_length_ = 0;
+  uint32_t resolve_copy_to_texture_dump_rows_ = 0;
+  uint32_t resolve_copy_to_texture_source_x_ = 0;
+  uint32_t resolve_copy_to_texture_source_y_ = 0;
+  uint32_t resolve_copy_to_texture_fill_x_ = 0;
+  uint32_t resolve_copy_to_texture_fill_y_ = 0;
+  uint64_t resolve_copy_to_texture_attempt_count_ = 0;
+  uint64_t resolve_copy_to_texture_success_count_ = 0;
+  uint32_t resolve_copy_to_texture_msaa_log_count_ = 0;
+  std::vector<std::pair<const char*, uint64_t>> resolve_copy_to_texture_rejects_;
 
   // For traces.
   VkBuffer edram_snapshot_download_buffer_ = VK_NULL_HANDLE;

@@ -695,6 +695,17 @@ class RenderTargetCache {
   // render targets. They are reordered so for one source, all transfers are
   // consecutive in the array.
   std::vector<Transfer> last_update_transfers_[1 + xenos::kMaxColorRenderTargets];
+
+ public:
+  // Tells the next Update() that the draw being issued overwrites every pixel
+  // of the range it claims in the given render targets (bit 0 = depth/stencil,
+  // bits 1-4 = colour), so ownership can change WITHOUT copying the previous
+  // occupant's contents in. Set by the command processor when it recognises a
+  // full-target clear. Consumed (reset) by Update().
+  void SetNextDrawFullOverwriteMask(uint32_t mask) { next_draw_full_overwrite_mask_ = mask; }
+
+ private:
+  uint32_t next_draw_full_overwrite_mask_ = 0;
 };
 
 }  // namespace rex::graphics
