@@ -38,6 +38,11 @@
 
 REXCVAR_DEFINE_BOOL(non_seamless_cube_map, false, "GPU", "Use non-seamless cube map sampling");
 
+REXCVAR_DEFINE_BOOL(vulkan_texture_storage_usage, true, "GPU",
+                    "Create texture images with storage usage so the compute resolve can write "
+                    "them (costs the images their compression)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(vulkan_resolve_to_texture_blit, false, "GPU",
                     "Use vkCmdBlitImage rather than vkCmdCopyImage for the render-target-to-texture "
                     "resolve copies (A/B: no faster on an RTX 2080 Ti)")
@@ -1719,7 +1724,11 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
   image_create_info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
   // Storage usage for the resolve compute shader, where every format the
   // image may be viewed as allows it (2D images only).
-  bool storage_usable = !is_3d && key.dimension != xenos::DataDimension::kCube;
+  // Storage usage costs the image its compression, which slows down every
+  // read of it and every copy into it - so it is worth giving only to images
+  // the compute resolve may actually write.
+  bool storage_usable = !is_3d && key.dimension != xenos::DataDimension::kCube &&
+                        REXCVAR_GET(vulkan_texture_storage_usage);
   for (uint32_t i = 0; storage_usable && i < 2; ++i) {
     if (formats[i] == VK_FORMAT_UNDEFINED) {
       continue;
@@ -1955,9 +1964,11 @@ void VulkanTextureCache::EndResolveComputeDestinations() {
   pending_resolve_copy_destinations_.clear();
 }
 
-void VulkanTextureCache::IssueResolveCopies(VkImage source_image, bool source_multisampled,
+void VulkanTextureCache::IssueResolveCopies(const ResolveCopySourceInfo& source,
                                             uint32_t source_x, uint32_t source_y, uint32_t fill_x,
                                             uint32_t fill_y) {
+  VkImage source_image = source.image;
+  bool source_multisampled = source.multisampled;
   assert_false(pending_resolve_copy_destinations_.empty());
   command_processor_.GpuTimerMark("resolve copy to texture");
   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
@@ -2078,6 +2089,48 @@ void VulkanTextureCache::IssueResolveCopies(VkImage source_image, bool source_mu
                                     region_count, regions);
     }
     if (rex::debug::profiling::IsEnabled()) {
+      // Could this copy be replaced by giving the texture the render target's
+      // image outright? That needs the copy to cover the whole level, the
+      // images to have the same shape and format, and a single-sampled source.
+      {
+        const TextureKey& key = vulkan_texture.key();
+        uint32_t level_width = std::max(key.GetWidth() >> destination.level, UINT32_C(1)) *
+                               (key.scaled_resolve ? scale_x : 1);
+        uint32_t level_height = std::max(key.GetHeight() >> destination.level, UINT32_C(1)) *
+                                (key.scaled_resolve ? scale_y : 1);
+        const char* verdict;
+        if (source_multisampled) {
+          verdict = "no: multisampled source";
+        } else if (destination.level || key.mip_max_level) {
+          verdict = "no: mips";
+        } else if (dest_x || dest_y || width < level_width || height < level_height) {
+          verdict = "no: partial level";
+        } else if (GetTextureImageFormat(key) != source.format) {
+          verdict = "no: format";
+        } else if (source.width != level_width || source.height != level_height) {
+          verdict = "no: image shape";
+        } else {
+          verdict = "YES: whole level, same image shape";
+        }
+        alias_tally_bytes_[verdict] += uint64_t(width) * height * 4;
+        if (++alias_tally_copies_ % 4000 == 0) {
+          std::vector<std::pair<std::string, uint64_t>> rows(alias_tally_bytes_.begin(),
+                                                             alias_tally_bytes_.end());
+          std::sort(rows.begin(), rows.end(),
+                    [](const auto& a, const auto& b) { return a.second > b.second; });
+          std::string line;
+          uint64_t total = 0;
+          for (const auto& row : rows) {
+            total += row.second;
+          }
+          for (const auto& row : rows) {
+            line += fmt::format(" [{}: {} MB, {}%]", row.first, row.second >> 20,
+                                total ? row.second * 100 / total : 0);
+          }
+          REXGPU_ERROR("[RTT-ALIAS] over {} copies, {} MB:{}", alias_tally_copies_, total >> 20,
+                       line);
+        }
+      }
       std::string what = fmt::format("{}x{} fmt {} level {} {}x{} px x{} dest{}",
                                      vulkan_texture.key().GetWidth(),
                                      vulkan_texture.key().GetHeight(),

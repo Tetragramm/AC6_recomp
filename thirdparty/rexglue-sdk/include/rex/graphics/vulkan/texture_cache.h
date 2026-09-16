@@ -157,7 +157,15 @@ class VulkanTextureCache final : public TextureCache {
   // at the fill, like the copy shaders). The caller calls MarkRangeAsResolved
   // BEFORE this, since that fires the watches that this clears.
   // A multisampled source is averaged with vkCmdResolveImage instead.
-  void IssueResolveCopies(VkImage source_image, bool source_multisampled, uint32_t source_x,
+  // source_* describe the render target image, for the alias-eligibility
+  // tally (whether the copy could be replaced by handing the image over).
+  struct ResolveCopySourceInfo {
+    VkImage image;
+    VkFormat format;
+    uint32_t width, height;
+    bool multisampled;
+  };
+  void IssueResolveCopies(const ResolveCopySourceInfo& source, uint32_t source_x,
                           uint32_t source_y, uint32_t fill_x, uint32_t fill_y);
 
   // The compute variant: the render target cache's resolve shader writes the
@@ -550,6 +558,10 @@ class VulkanTextureCache final : public TextureCache {
   // VkFormat -> optimal tiling storage image support, for texture creation.
   std::unordered_map<uint32_t, bool> format_storage_supported_;
   std::unordered_map<std::string, uint32_t> copy_tally_;
+  // Alias eligibility: bytes copied that could / could not be replaced by
+  // handing the render target image to the texture, by reason.
+  std::unordered_map<std::string, uint64_t> alias_tally_bytes_;
+  uint64_t alias_tally_copies_ = 0;
   uint64_t copy_tally_total_ = 0;
   uint64_t copy_tally_pixels_ = 0;
   uint64_t scaled_resolve_buffer_size_ = 0;

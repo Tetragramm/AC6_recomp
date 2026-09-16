@@ -8109,8 +8109,18 @@ void VulkanRenderTargetCache::IssueResolveCopyToTexture(VulkanTextureCache& text
   vulkan_rt.SetUsage(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
                      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
   // Submits the barriers (ending any render pass) before each copy.
-  texture_cache.IssueResolveCopies(vulkan_rt.image(), resolve_copy_to_texture_multisampled_,
-                                   resolve_copy_to_texture_source_x_,
+  RenderTargetKey source_rt_key = vulkan_rt.key();
+  VulkanTextureCache::ResolveCopySourceInfo source_info;
+  source_info.image = vulkan_rt.image();
+  source_info.format = source_rt_key.is_depth
+                           ? GetDepthVulkanFormat(source_rt_key.GetDepthFormat())
+                           : GetColorVulkanFormat(source_rt_key.GetColorFormat());
+  source_info.width = source_rt_key.GetWidth() * draw_resolution_scale_x();
+  source_info.height =
+      GetRenderTargetHeight(source_rt_key.pitch_tiles_at_32bpp, source_rt_key.msaa_samples) *
+      draw_resolution_scale_y();
+  source_info.multisampled = resolve_copy_to_texture_multisampled_;
+  texture_cache.IssueResolveCopies(source_info, resolve_copy_to_texture_source_x_,
                                    resolve_copy_to_texture_source_y_,
                                    resolve_copy_to_texture_fill_x_, resolve_copy_to_texture_fill_y_);
   COUNT_profile_add("gpu/render_target_cache/resolve_copies_to_texture", 1);
