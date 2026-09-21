@@ -30,6 +30,9 @@
 #if defined(__linux__)
 #include <pthread.h>
 #endif
+#if defined(__x86_64__) || defined(_M_X64)
+#include <x86intrin.h>
+#endif
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
@@ -60,6 +63,8 @@ constexpr uint32_t kMaxCounters = 256;
 constexpr uint32_t kMaxDepth = 64;
 
 struct ThreadBlock {
+  // Despite the names, these hold NowTicks() units, not nanoseconds; the
+  // report converts them (see NowTicks).
   uint64_t inclusive_ns[kMaxSites]{};
   uint64_t self_ns[kMaxSites]{};
   uint64_t calls[kMaxSites]{};
@@ -113,6 +118,29 @@ uint64_t NowNs() {
                       std::chrono::steady_clock::now().time_since_epoch())
                       .count());
 }
+
+// What a scope reads on entry and exit. Not steady_clock: on a machine whose
+// clocksource is HPET or ACPI-PM rather than the TSC, clock_gettime costs
+// ~1 us per read even through the vDSO, and at ~14 scopes a draw the profiler
+// was 40% of the frame it measured on a Radeon 780M laptop (BeginSubmission's
+// two-bool early-out timed at 2.0 us there against 0.07 on a TSC desktop).
+// The hardware counter is a few nanoseconds anywhere. Scopes accumulate raw
+// ticks; the report converts them with the tick/ns ratio measured over its
+// own interval, so no calibration is needed and no drift accumulates.
+inline uint64_t NowTicks() {
+#if defined(__x86_64__) || defined(_M_X64)
+  return __rdtsc();
+#elif defined(__aarch64__)
+  uint64_t ticks;
+  asm volatile("mrs %0, cntvct_el0" : "=r"(ticks));
+  return ticks;
+#else
+  return NowNs();
+#endif
+}
+// Ticks and nanoseconds at the last report, for the conversion ratio.
+uint64_t g_last_report_ticks = 0;
+double g_ns_per_tick = 1.0;
 
 ThreadBlock* AcquireBlock() {
   if (t_block) {
@@ -217,7 +245,7 @@ void ScopeEnter(uint32_t site) {
   }
   block->site_at[depth] = site;
   block->child_ns[depth] = 0;
-  block->entry_ns[depth] = NowNs();
+  block->entry_ns[depth] = NowTicks();
   ++block->depth;
 }
 
@@ -239,7 +267,7 @@ void ScopeExit(uint32_t site) {
   if (block->site_at[depth] != site) {
     return;
   }
-  const uint64_t elapsed = NowNs() - block->entry_ns[depth];
+  const uint64_t elapsed = NowTicks() - block->entry_ns[depth];
   block->inclusive_ns[site] += elapsed;
   block->self_ns[site] += elapsed - block->child_ns[depth];
   ++block->calls[site];
@@ -327,8 +355,10 @@ void CollectThread(ThreadBlock* block, size_t site_count, double frames, std::ve
     if (d_calls == 0) {
       continue;
     }
-    out.push_back(Row{uint32_t(i), double(d_self) / 1.0e6 / frames,
-                      double(d_incl) / 1.0e6 / frames, double(d_calls) / frames});
+    // The accumulators hold ticks; g_ns_per_tick was measured over this
+    // report interval.
+    out.push_back(Row{uint32_t(i), double(d_self) * g_ns_per_tick / 1.0e6 / frames,
+                      double(d_incl) * g_ns_per_tick / 1.0e6 / frames, double(d_calls) / frames});
   }
   std::sort(out.begin(), out.end(),
             [](const Row& a, const Row& b) { return a.self_ms > b.self_ms; });
@@ -349,6 +379,7 @@ void Flip() {
   EnsureThreadName(AcquireBlock());
 
   const uint64_t now = NowNs();
+  const uint64_t now_ticks = NowTicks();
   std::lock_guard<std::mutex> lock(g_mutex);
   ++g_frames_since_report;
 
@@ -359,6 +390,7 @@ void Flip() {
     // Just turned on: take a baseline instead of reporting whatever happened to
     // accumulate beforehand.
     g_last_report_ns = now;
+    g_last_report_ticks = now_ticks;
     g_frames_since_report = 0;
     for (const auto& block : g_blocks) {
       CollectThread(block.get(), site_count, 1.0, rows);
@@ -375,6 +407,10 @@ void Flip() {
 
   const double frames = double(g_frames_since_report);
   const int32_t max_rows = REXCVAR_GET(profiling_rows);
+  if (now_ticks > g_last_report_ticks) {
+    g_ns_per_tick = double(now - g_last_report_ns) / double(now_ticks - g_last_report_ticks);
+  }
+  g_last_report_ticks = now_ticks;
 
   REXLOG_ERROR("[PROFILE] {} guest frames in {:.2f}s = {:.1f} fps, {:.2f} ms/frame; "
                "columns are ms per guest frame",

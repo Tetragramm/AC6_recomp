@@ -73,6 +73,11 @@ REXCVAR_DEFINE_BOOL(ac6_clear_elides_edram_transfer, false, "AC6/Enhancements",
                     "targets it fully overwrites without copying the previous occupant in. "
                     "AC6 packs many passes into the same EDRAM range and clears between "
                     "them; those copies were most of the GPU frame.");
+REXCVAR_DEFINE_BOOL(ac6_skip_no_effect_draws, false, "AC6/Enhancements",
+                    "Skip draws that rasterize but cannot write anything: no pixel shader "
+                    "needed, depth and stencil off, no memory export. AC6 issues 48 such "
+                    "one-vertex point draws every frame (its D3D perf-counter markers), each "
+                    "paying the full per-draw command-processor cost for no output.");
 REXCVAR_DEFINE_BOOL(ac6_quad_elides_edram_transfer, false, "AC6/Enhancements",
                     "Let a full-viewport unblended quad take EDRAM ownership without copying "
                     "the previous occupant in, as the D3D Clear quad already does. AC6's post "
@@ -4130,6 +4135,20 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     draw_util::AddMemExportRanges(regs, *pixel_shader, memexport_ranges_);
   }
   reg::RB_DEPTHCONTROL normalized_depth_control = draw_util::GetNormalizedDepthControl(regs);
+
+  // A draw that rasterizes but writes nothing: no pixel shader survived the
+  // "is it needed" test, depth and stencil are off, and neither shader
+  // exports to memory. The generic path above only skips draws that cannot
+  // rasterize at all; this one can, to no effect. AC6 issues 48 of these every
+  // frame - one-vertex point lists with a zero colour mask and a 16x16
+  // scissor, its D3D perf-counter markers - and each one otherwise costs a
+  // full render-target update, pipeline lookup, binding update and vkCmdDraw:
+  // ~30 us apiece on a Radeon 780M whose frame is command-processor-bound.
+  if (REXCVAR_GET(ac6_skip_no_effect_draws) && !pixel_shader && !memexport_used_vertex &&
+      !normalized_depth_control.z_enable && !normalized_depth_control.stencil_enable) {
+    COUNT_profile_add("gpu/draws_skipped_no_effect", 1);
+    return true;
+  }
 
   uint32_t ps_param_gen_pos = UINT32_MAX;
   uint32_t interpolator_mask =

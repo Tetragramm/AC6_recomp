@@ -850,10 +850,19 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
 
   uint32_t base_index = (packet & 0x7FFF);
   uint32_t write_one_reg = (packet >> 15) & 0x1;
-  for (uint32_t m = 0; m < count; m++) {
-    uint32_t reg_data = reader->ReadAndSwap<uint32_t>();
-    uint32_t target_index = write_one_reg ? base_index : base_index + m;
-    WriteRegister(target_index, reg_data);
+  if (write_one_reg) {
+    for (uint32_t m = 0; m < count; m++) {
+      WriteRegister(base_index, reader->ReadAndSwap<uint32_t>());
+    }
+  } else {
+    // A consecutive run goes through the range path, which the backend
+    // implements as one copy and one dirty flag for a run inside a shader
+    // constant block, and as the per-register write for anything else. The
+    // Xbox 360 D3D flushes its dirty state in exactly such runs - AC6 writes
+    // ~850 registers per draw, most of them ALU and fetch constants - and the
+    // per-register virtual write was the largest single per-draw cost on the
+    // command processor thread of a machine bound by it.
+    WriteRegisterRangeFromRing(reader, base_index, count);
   }
 
   trace_writer_.WritePacketEnd();
