@@ -693,11 +693,33 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
   // EDRAM emulation cost goes for games that pack many passes into the same
   // EDRAM range and clear between them.
   const uint32_t full_overwrite_mask = next_draw_full_overwrite_mask_;
+  const uint32_t full_overwrite_width = next_draw_full_overwrite_width_;
+  const uint32_t full_overwrite_height = next_draw_full_overwrite_height_;
   next_draw_full_overwrite_mask_ = 0;
+  next_draw_full_overwrite_width_ = 0;
+  next_draw_full_overwrite_height_ = 0;
   for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
     const std::pair<uint32_t, uint32_t>& rt_base_index = edram_bases_sorted[i];
     uint32_t rt_bit_index = rt_base_index.second;
-    const bool elide = (full_overwrite_mask >> rt_bit_index) & 1;
+    bool elide = (full_overwrite_mask >> rt_bit_index) & 1;
+    if (elide && full_overwrite_width) {
+      // A rectangle-checked claim: only skip the copy if the draw's covered
+      // rectangle contains this target's whole extent. An EDRAM tile is 80x16
+      // samples, 4x MSAA packing two samples along x and 2x/4x two along y.
+      const RenderTargetKey rt_key = rt_keys[rt_bit_index];
+      const uint32_t pitch_tiles = rt_key.GetPitchTiles();
+      uint32_t rt_width = 0, rt_height = 0;
+      if (pitch_tiles) {
+        rt_width = pitch_tiles *
+                   (xenos::kEdramTileWidthSamples >>
+                    uint32_t(rt_key.msaa_samples >= xenos::MsaaSamples::k4X));
+        rt_height = (rt_lengths_tiles[i] / pitch_tiles) *
+                    (xenos::kEdramTileHeightSamples >>
+                     uint32_t(rt_key.msaa_samples >= xenos::MsaaSamples::k2X));
+      }
+      elide = pitch_tiles && full_overwrite_width >= rt_width &&
+              full_overwrite_height >= rt_height;
+    }
     ChangeOwnership(rt_keys[rt_bit_index], 0, rt_lengths_tiles[i],
                     (interlock_barrier_only || elide) ? nullptr
                                                       : &last_update_transfers_[rt_bit_index]);
@@ -1457,6 +1479,33 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
   if (end_tiles > xenos::kEdramTileCount) {
     // The ownership change extent goes to the next EDRAM addressing period.
     change_ownership_in_extent(0, std::min(end_tiles & (xenos::kEdramTileCount - 1), start_tiles));
+  }
+}
+
+void RenderTargetCache::DescribeLastUpdate(std::string& targets_out,
+                                           std::string& transfers_out) const {
+  targets_out.clear();
+  transfers_out.clear();
+  if (GetPath() != Path::kHostRenderTargets) {
+    return;
+  }
+  auto key_string = [](RenderTargetKey key) {
+    return fmt::format("{} {}/{}/{}x f{}", key.is_depth ? "depth" : "color",
+                       uint32_t(key.base_tiles), uint32_t(key.GetPitchTiles()),
+                       1u << uint32_t(key.msaa_samples), uint32_t(key.resource_format));
+  };
+  for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+    const RenderTarget* rt = last_update_accumulated_render_targets_[i];
+    if (!rt) {
+      continue;
+    }
+    const std::string slot = i ? fmt::format("C{}", i - 1) : std::string("D");
+    targets_out += fmt::format(" {}:[{}]", slot, key_string(rt->key()));
+    for (const Transfer& t : last_update_transfers_[i]) {
+      transfers_out += fmt::format(" {}<-[{}] t{}-{}{}", slot, key_string(t.source->key()),
+                                   t.start_tiles, t.end_tiles,
+                                   t.host_depth_source ? "+hostdepth" : "");
+    }
   }
 }
 

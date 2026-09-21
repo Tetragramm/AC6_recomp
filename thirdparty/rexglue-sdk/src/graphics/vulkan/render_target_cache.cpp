@@ -37,6 +37,7 @@
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
+#include <rex/graphics/frame_narrative.h>
 #include <rex/graphics/vulkan/render_target_cache.h>
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
@@ -1500,6 +1501,7 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
   if (!resolve_info.coordinate_info.width_div_8 || !resolve_info.height_div_8) {
     return true;
   }
+  narrative::OnResolve(resolve_info);
 
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();

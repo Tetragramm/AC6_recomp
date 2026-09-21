@@ -11,6 +11,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
+#include <cfloat>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <iterator>
@@ -30,6 +33,7 @@
 #include <rex/math.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/flags.h>
+#include <rex/graphics/frame_narrative.h>
 #include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/graphics/registers.h>
@@ -69,6 +73,27 @@ REXCVAR_DEFINE_BOOL(ac6_clear_elides_edram_transfer, false, "AC6/Enhancements",
                     "targets it fully overwrites without copying the previous occupant in. "
                     "AC6 packs many passes into the same EDRAM range and clears between "
                     "them; those copies were most of the GPU frame.");
+REXCVAR_DEFINE_BOOL(ac6_quad_elides_edram_transfer, false, "AC6/Enhancements",
+                    "Let a full-viewport unblended quad take EDRAM ownership without copying "
+                    "the previous occupant in, as the D3D Clear quad already does. AC6's post "
+                    "chain draws such quads over freshly aliased targets; 34-51% of the "
+                    "transferred tiles in a mission frame are copied in and then immediately "
+                    "overwritten. Depth is claimed only when depth AND stencil are rewritten.");
+REXCVAR_DEFINE_DOUBLE(ac6_quad_elides_edram_transfer_alternate_s, 0.0, "AC6/Enhancements",
+                      "With ac6_quad_elides_edram_transfer, turn it on and off every this many "
+                      "seconds, so one run gives interleaved A/B profiler blocks of the same "
+                      "scene and any visual artefact flickers rather than sitting still. Set it "
+                      "to twice the profiling interval. 0 leaves the flag steady.");
+REXCVAR_DEFINE_BOOL(ac6_world_drop_second_tile, false, "AC6/Enhancements",
+                    "MEASUREMENT ONLY, RENDERS INCORRECTLY: skip the draws of every predicated "
+                    "tile after the first (those with a negative window offset). AC6 submits the "
+                    "world twice, once per 640-wide tile; this prices what rendering it once "
+                    "would save. The right half of the screen becomes a copy of the left.");
+REXCVAR_DEFINE_DOUBLE(ac6_world_drop_second_tile_alternate_s, 0.0, "AC6/Enhancements",
+                      "With ac6_world_drop_second_tile, turn it on and off every this many "
+                      "seconds so one run yields interleaved A/B profiler blocks of the same "
+                      "scene, instead of comparing two runs of different scenes. Set it to "
+                      "twice the profiling interval. 0 leaves the flag steady.");
 REXCVAR_DEFINE_BOOL(gpu_timestamps, false, "GPU",
                     "Write GPU timestamps at pass changes, EDRAM transfers, resolves and the swap, "
                     "and report per-frame GPU milliseconds per label in the profiling report. "
@@ -2516,6 +2541,7 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
 void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
+  narrative::OnSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
 
@@ -3921,6 +3947,41 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     return IssueCopy();
   }
 
+  // AC6 predicated tiling, MEASUREMENT ONLY (ac6_world_drop_second_tile).
+  //
+  // The world is one 1280x720 2x MSAA image that the game renders as two
+  // 640-wide tiles, because 1280x720 at 2x MSAA needs 1440 EDRAM tiles of
+  // colour and as many of depth against the console's 2048. The two tiles
+  // submit byte-identical geometry (208 draws each, verified by the frame
+  // narrative); they differ only in PA_SC_WINDOW_OFFSET and the window
+  // scissor, which slide the right half back into the same 640-wide surface.
+  //
+  // Skipping the second tile's draws is NOT a correct renderer - the right
+  // half of the screen ends up holding a copy of the left, because the second
+  // tile still resolves the surface into the right half of the destination
+  // texture. It exists to price the real fix (one 1280-wide target, geometry
+  // submitted once), which needs a render target whose host image is wider
+  // than its EDRAM key implies and is a much larger change.
+  if (REXCVAR_GET(ac6_world_drop_second_tile)) {
+    // Alternating makes the comparison a within-run one: the profiler's
+    // blocks interleave dropped and not-dropped over the same scene.
+    bool dropping = true;
+    const double alternate_s = REXCVAR_GET(ac6_world_drop_second_tile_alternate_s);
+    if (alternate_s > 0.0) {
+      const auto now = std::chrono::steady_clock::now().time_since_epoch();
+      const double seconds = std::chrono::duration<double>(now).count();
+      dropping = (int64_t(seconds / alternate_s) & 1) != 0;
+    }
+    COUNT_profile_add("gpu/ac6_tile_drop_active", dropping ? 1 : 0);
+    if (dropping) {
+      const auto window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+      if (window_offset.window_x_offset < 0 || window_offset.window_y_offset < 0) {
+        COUNT_profile_add("gpu/ac6_tile_draws_dropped", 1);
+        return true;
+      }
+    }
+  }
+
   bool surface_pitch_is_zero = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 0;
 
   const ui::vulkan::VulkanDevice::Properties& device_properties = GetVulkanDevice()->properties();
@@ -4293,9 +4354,116 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     last_draw_overwrite_mask_ = overwrite_mask;
   }
 
+  // A full-viewport quad takes EDRAM ownership without copying the previous
+  // occupant in, the same way the D3D Clear quad already does.
+  //
+  // The earlier measurement of this (gpu/transfer_tiles_overwritten_by_the_draw
+  // above) only ever read zero because it required PA_CL_VTE_CNTL == 0x300,
+  // i.e. vertices already in screen space. AC6's post-processing quads are
+  // drawn with a real viewport (vte 0x43F), so every one of them was excluded.
+  // Judging coverage from the viewport and scissor extents instead, 34-51% of
+  // the transferred tiles in a mission frame go to a target that the first
+  // draw of the pass overwrites completely.
+  //
+  // Coverage is necessary but not sufficient, and the two ways to get this
+  // wrong are worth naming:
+  //  - Only a screen-filling quad may be claimed. Real geometry can satisfy
+  //    every blend and mask test and still cover an unknown subset of pixels.
+  //  - Depth is not colour. A draw can overwrite all colour while depth-testing
+  //    against the depth that was copied in, so the depth aspect is claimed
+  //    only when it is rewritten outright, and, because depth and stencil share
+  //    a host image, only when stencil is rewritten too.
+  bool quad_elision_on = REXCVAR_GET(ac6_quad_elides_edram_transfer);
+  if (quad_elision_on) {
+    const double alternate_s = REXCVAR_GET(ac6_quad_elides_edram_transfer_alternate_s);
+    if (alternate_s > 0.0) {
+      const double seconds =
+          std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch())
+              .count();
+      quad_elision_on = (int64_t(seconds / alternate_s) & 1) != 0;
+    }
+    COUNT_profile_add("gpu/quad_elision_active", quad_elision_on ? 1 : 0);
+  }
+  if (quad_elision_on) {
+    uint32_t mask = 0;
+    uint32_t covered_width = 0, covered_height = 0;
+    const bool is_quad =
+        (prim_type == xenos::PrimitiveType::kRectangleList && index_count <= 3) ||
+        ((prim_type == xenos::PrimitiveType::kTriangleStrip ||
+          prim_type == xenos::PrimitiveType::kTriangleList) &&
+         index_count <= 6);
+    const auto window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+    const auto scissor_tl = regs.Get<reg::PA_SC_WINDOW_SCISSOR_TL>();
+    const auto scissor_br = regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
+    // A shifted window (predicated tiling) or a scissor that does not start at
+    // the origin means the covered region is not anchored at the target's
+    // corner; do not try to reason about it.
+    if (is_quad && !window_offset.window_x_offset && !window_offset.window_y_offset &&
+        !scissor_tl.tl_x && !scissor_tl.tl_y) {
+      const auto vte = regs.Get<reg::PA_CL_VTE_CNTL>();
+      float x_max = FLT_MAX, y_max = FLT_MAX;
+      bool anchored = true;
+      if (vte.vport_x_scale_ena) {
+        const float xs = std::fabs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE));
+        const float xo = regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XOFFSET);
+        anchored &= (xo - xs) <= 0.5f;
+        x_max = xo + xs;
+      }
+      if (vte.vport_y_scale_ena) {
+        const float ys = std::fabs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE));
+        const float yo = regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YOFFSET);
+        anchored &= (yo - ys) <= 0.5f;
+        y_max = yo + ys;
+      }
+      if (anchored) {
+        covered_width = uint32_t(std::min(float(scissor_br.br_x), std::max(x_max, 0.0f)));
+        covered_height = uint32_t(std::min(float(scissor_br.br_y), std::max(y_max, 0.0f)));
+      }
+    }
+    if (covered_width && covered_height) {
+      const auto color_control = regs.Get<reg::RB_COLORCONTROL>();
+      if (!color_control.alpha_test_enable && !color_control.alpha_to_mask_enable) {
+        for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+          if (((normalized_color_mask >> (i * 4)) & 0xF) != 0xF) {
+            continue;
+          }
+          const auto blend_control =
+              regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[i]);
+          const bool blending = blend_control.color_srcblend != xenos::BlendFactor::kOne ||
+                                blend_control.color_destblend != xenos::BlendFactor::kZero ||
+                                blend_control.color_comb_fcn != xenos::BlendOp::kAdd ||
+                                blend_control.alpha_srcblend != xenos::BlendFactor::kOne ||
+                                blend_control.alpha_destblend != xenos::BlendFactor::kZero ||
+                                blend_control.alpha_comb_fcn != xenos::BlendOp::kAdd;
+          if (!blending) {
+            mask |= 1u << (1 + i);
+          }
+        }
+      }
+      const uint32_t stencil_ref_mask = regs.values[XE_GPU_REG_RB_STENCILREFMASK];
+      if (normalized_depth_control.z_enable && normalized_depth_control.z_write_enable &&
+          normalized_depth_control.zfunc == xenos::CompareFunction::kAlways &&
+          normalized_depth_control.stencil_enable &&
+          normalized_depth_control.stencilfunc == xenos::CompareFunction::kAlways &&
+          normalized_depth_control.stencilzpass == xenos::StencilOp::kReplace &&
+          ((stencil_ref_mask >> 16) & 0xFF) == 0xFF) {
+        mask |= 1u;
+      }
+    }
+    if (mask) {
+      render_target_cache_->SetNextDrawFullOverwriteRect(mask, covered_width, covered_height);
+      COUNT_profile_add("gpu/quad_elided_transfer_draws", 1);
+    }
+  }
+
   if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
                                     normalized_color_mask, *vertex_shader)) {
     return draw_fail("render_target_update");
+  }
+  if (narrative::Active()) {
+    narrative::OnDraw(regs, vertex_shader, pixel_shader, prim_type, index_count,
+                      *render_target_cache_, bin_mask_, bin_select_,
+                      vertex_shader->ucode_data_hash() == kD3DClearVertexShaderHash);
   }
 
 

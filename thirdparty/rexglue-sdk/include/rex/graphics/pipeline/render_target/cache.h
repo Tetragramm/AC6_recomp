@@ -16,6 +16,7 @@
 #include <map>
 #include <unordered_map>
 #include <utility>
+#include <string>
 #include <vector>
 
 #include <fmt/format.h>
@@ -703,6 +704,18 @@ class RenderTargetCache {
   // occupant's contents in. Set by the command processor when it recognises a
   // full-target clear. Consumed (reset) by Update().
   void SetNextDrawFullOverwriteMask(uint32_t mask) { next_draw_full_overwrite_mask_ = mask; }
+  // As above, but for a draw whose coverage is known only as a pixel rectangle
+  // (a full-viewport quad rather than the clear's canned 8192x8192 state). The
+  // mask bit is honoured only for a render target whose own extent fits inside
+  // `width_pixels` x `height_pixels`, which Update() works out per target from
+  // its key and tile length - the caller cannot, because the targets are not
+  // resolved until Update() runs.
+  void SetNextDrawFullOverwriteRect(uint32_t mask, uint32_t width_pixels,
+                                    uint32_t height_pixels) {
+    next_draw_full_overwrite_mask_ = mask;
+    next_draw_full_overwrite_width_ = width_pixels;
+    next_draw_full_overwrite_height_ = height_pixels;
+  }
   // Measurement only: which targets the next draw would overwrite completely,
   // to count the ownership transfer work that would be thrown away.
   void SetNextDrawOverwriteMeasurementMask(uint32_t mask) {
@@ -711,11 +724,21 @@ class RenderTargetCache {
 
  private:
   uint32_t next_draw_full_overwrite_mask_ = 0;
+  // 0 means "no rectangle check" - the clear path, whose state guarantees the
+  // whole target is covered.
+  uint32_t next_draw_full_overwrite_width_ = 0;
+  uint32_t next_draw_full_overwrite_height_ = 0;
   uint32_t next_draw_overwrite_measurement_mask_ = 0;
 
  public:
   // Tiles the last Update scheduled for copying, for diagnostics.
   uint32_t last_update_transfer_tiles() const { return last_update_transfer_tiles_; }
+
+  // For the frame narrative: the targets bound by the last Update() and the
+  // ownership transfers it performed, as text - "D:[depth 720/16/4x f1]
+  // C0:[...]" and "C0<-[depth 720/16/4x f1] t0-720". Host render target path
+  // only; both come back empty otherwise.
+  void DescribeLastUpdate(std::string& targets_out, std::string& transfers_out) const;
 
  protected:
   uint32_t last_update_transfer_tiles_ = 0;
