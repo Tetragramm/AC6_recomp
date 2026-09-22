@@ -1580,6 +1580,17 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
         wide_resolve_source_x_offset_tiles_ = wide_key.GetPitchTiles();
         wide_awaiting_second_resolve_.erase(awaited);
         COUNT_profile_add("gpu/ac6_wide_second_tile_resolves", 1);
+      } else if (awaited != wide_awaiting_second_resolve_.end()) {
+        // The span was resolved again after more draws, before any tile-1
+        // draw: the guest resolves tile 0 more than once per pass (the intro
+        // cutscene renders the world, resolves, draws effects over it,
+        // resolves again, then does the same for tile 1). The right half now
+        // holds both sub-passes, so it cannot stand in for tile 1's first
+        // resolve; tile 1 renders. This resolve reads the left half as the
+        // first did, and the entries stay for tile 1's resolves to consume.
+        wide_second_tile_renders_ = true;
+        COUNT_profile_add("gpu/ac6_wide_second_tile_rendered_passes", 1);
+        COUNT_profile_add("gpu/ac6_wide_repeated_first_tile_resolves", 1);
       } else {
         wide_awaiting_second_resolve_[dump_base] = wide;
         COUNT_profile_add("gpu/ac6_wide_first_tile_resolves", 1);
