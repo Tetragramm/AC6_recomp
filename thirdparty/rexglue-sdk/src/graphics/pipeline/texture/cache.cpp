@@ -122,6 +122,14 @@ REXCVAR_DEFINE_INT32(resolution_scale, 1, "GPU",
 //     "96 MB, and with 3x3, it will be 360 + 216 MB.",
 //     "GPU");
 
+REXCVAR_DEFINE_INT32(texture_cache_resolve_destination_index_verify, 0, "GPU",
+                     "Check the resolve-destination index against a full scan for this many "
+                     "lookups, logging any disagreement, then stop checking. Diagnostic only.");
+REXCVAR_DEFINE_BOOL(texture_cache_resolve_destination_index, true, "GPU",
+                    "Look resolve destinations up through the guest-address index instead of "
+                    "scanning every texture in the cache. Off restores the linear scan, which is "
+                    "O(textures) per resolve and ~90 resolves a frame in AC6.");
+
 namespace rex::graphics {
 
 const TextureCache::LoadShaderInfo TextureCache::load_shader_info_[kLoadShaderCount] = {
@@ -289,6 +297,7 @@ void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_inde
     assert_true(found_texture_it != textures_.end());
     if (found_texture_it != textures_.end()) {
       assert_true(found_texture_it->second.get() == texture);
+      RemoveFromResolveDestinationIndex(texture);
       textures_.erase(found_texture_it);
       // `texture` is invalid now.
     }
@@ -342,6 +351,49 @@ void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_
   shared_memory().RangeWrittenByGpu(start_unscaled, length_unscaled);
 }
 
+void TextureCache::ForEachResolveDestinationBucket(
+    uint32_t start, uint32_t length,
+    const std::function<void(std::vector<Texture*>&)>& callback) {
+  if (!length) {
+    return;
+  }
+  if (resolve_destination_buckets_.empty()) {
+    resolve_destination_buckets_.resize(kResolveDestinationBucketCount);
+  }
+  start &= 0x1FFFFFFF;
+  uint32_t last = start + std::min(length, 0x20000000 - start) - 1;
+  uint32_t bucket_first = start >> kResolveDestinationBucketSizeLog2;
+  uint32_t bucket_last = std::min(last >> kResolveDestinationBucketSizeLog2,
+                                  kResolveDestinationBucketCount - 1);
+  for (uint32_t i = bucket_first; i <= bucket_last; ++i) {
+    callback(resolve_destination_buckets_[i]);
+  }
+}
+
+void TextureCache::AddToResolveDestinationIndex(Texture* texture) {
+  const TextureKey& key = texture->key();
+  auto add = [texture](std::vector<Texture*>& bucket) { bucket.push_back(texture); };
+  if (key.base_page) {
+    ForEachResolveDestinationBucket(key.base_page << 12, texture->GetGuestBaseSize(), add);
+  }
+  if (key.mip_page) {
+    ForEachResolveDestinationBucket(key.mip_page << 12, texture->GetGuestMipsSize(), add);
+  }
+}
+
+void TextureCache::RemoveFromResolveDestinationIndex(Texture* texture) {
+  const TextureKey& key = texture->key();
+  auto remove = [texture](std::vector<Texture*>& bucket) {
+    bucket.erase(std::remove(bucket.begin(), bucket.end(), texture), bucket.end());
+  };
+  if (key.base_page) {
+    ForEachResolveDestinationBucket(key.base_page << 12, texture->GetGuestBaseSize(), remove);
+  }
+  if (key.mip_page) {
+    ForEachResolveDestinationBucket(key.mip_page << 12, texture->GetGuestMipsSize(), remove);
+  }
+}
+
 bool TextureCache::FindResolveDestinationTextures(
     uint32_t copy_dest_base, uint32_t extent_start, uint32_t extent_length,
     xenos::TextureFormat format, uint32_t endianness, uint32_t pitch_div_32, uint32_t bpp_log2,
@@ -354,6 +406,10 @@ bool TextureCache::FindResolveDestinationTextures(
     reject_reason_out = "empty";
     return false;
   }
+  SCOPE_profile_cpu_f("gpu");
+  COUNT_profile_add("gpu/texture_cache/resolve_destination_textures_scanned",
+                    int64_t(textures_.size()));
+  COUNT_profile_add("gpu/texture_cache/resolve_destination_lookups", 1);
   // Below 32bpp the tiled address function interleaves 64x64 / 128x128
   // portions, so whole 32x32 tiles are not laid out linearly and the base
   // offset can't be inverted into a texel position the simple way.
@@ -376,8 +432,79 @@ bool TextureCache::FindResolveDestinationTextures(
     return false;
   };
 
-  for (const auto& texture_pair : textures_) {
-    Texture* texture = texture_pair.second.get();
+  // Only textures whose guest range can overlap the resolve destination can
+  // match; the rest of the loop rejects them on the same overlap test. The
+  // index is the same set in a different order, and the outcome does not
+  // depend on the order (every overlapping texture must pass).
+  resolve_destination_candidates_.clear();
+  if (REXCVAR_GET(texture_cache_resolve_destination_index)) {
+    ++resolve_destination_scan_stamp_;
+    const uint64_t stamp = resolve_destination_scan_stamp_;
+    std::vector<Texture*>& candidates = resolve_destination_candidates_;
+    ForEachResolveDestinationBucket(
+        extent_start, extent_end - extent_start, [&candidates, stamp](std::vector<Texture*>& b) {
+          for (Texture* texture : b) {
+            if (texture->resolve_destination_scan_stamp != stamp) {
+              texture->resolve_destination_scan_stamp = stamp;
+              candidates.push_back(texture);
+            }
+          }
+        });
+  } else {
+    for (const auto& texture_pair : textures_) {
+      resolve_destination_candidates_.push_back(texture_pair.second.get());
+    }
+  }
+  COUNT_profile_add("gpu/texture_cache/resolve_destination_textures_visited",
+                    int64_t(resolve_destination_candidates_.size()));
+
+  if (resolve_destination_verify_budget_ < 0) {
+    resolve_destination_verify_budget_ = REXCVAR_GET(texture_cache_resolve_destination_index_verify);
+  }
+  if (resolve_destination_verify_budget_ > 0 &&
+      REXCVAR_GET(texture_cache_resolve_destination_index)) {
+    // The index must return exactly the textures whose guest range overlaps
+    // the destination - the same set the full scan would have reached the
+    // overlap test with. A miss would mean resolved data silently not landing
+    // in a texture, so check it against the scan for a while.
+    --resolve_destination_verify_budget_;
+    std::vector<Texture*> scanned;
+    for (const auto& texture_pair : textures_) {
+      Texture* texture = texture_pair.second.get();
+      const TextureKey& key = texture->key();
+      uint32_t base_start = key.base_page << 12;
+      uint32_t base_size = key.base_page ? texture->GetGuestBaseSize() : 0;
+      uint32_t mips_start = key.mip_page << 12;
+      uint32_t mips_size = key.mip_page ? texture->GetGuestMipsSize() : 0;
+      if ((base_size && base_start < extent_end && base_start + base_size > extent_start) ||
+          (mips_size && mips_start < extent_end && mips_start + mips_size > extent_start)) {
+        scanned.push_back(texture);
+      }
+    }
+    std::vector<Texture*> indexed;
+    for (Texture* texture : resolve_destination_candidates_) {
+      const TextureKey& key = texture->key();
+      uint32_t base_start = key.base_page << 12;
+      uint32_t base_size = key.base_page ? texture->GetGuestBaseSize() : 0;
+      uint32_t mips_start = key.mip_page << 12;
+      uint32_t mips_size = key.mip_page ? texture->GetGuestMipsSize() : 0;
+      if ((base_size && base_start < extent_end && base_start + base_size > extent_start) ||
+          (mips_size && mips_start < extent_end && mips_start + mips_size > extent_start)) {
+        indexed.push_back(texture);
+      }
+    }
+    std::sort(scanned.begin(), scanned.end());
+    std::sort(indexed.begin(), indexed.end());
+    if (scanned != indexed) {
+      REXGPU_ERROR(
+          "[RESOLVE-INDEX] MISMATCH at {:08X}+{:X}: scan found {} overlapping textures, index {}",
+          extent_start, extent_end - extent_start, scanned.size(), indexed.size());
+      COUNT_profile_add("gpu/texture_cache/resolve_destination_index_mismatches", 1);
+    }
+    COUNT_profile_add("gpu/texture_cache/resolve_destination_index_verified", 1);
+  }
+
+  for (Texture* texture : resolve_destination_candidates_) {
     const TextureKey& key = texture->key();
     const texture_util::TextureGuestLayout& layout = texture->guest_layout();
     uint32_t base_start = key.base_page << 12;
@@ -915,6 +1042,9 @@ void TextureCache::WatchCallback(const std::unique_lock<std::recursive_mutex>& g
 
 void TextureCache::DestroyAllTextures(bool from_destructor) {
   ResetTextureBindings(from_destructor);
+  for (std::vector<Texture*>& bucket : resolve_destination_buckets_) {
+    bucket.clear();
+  }
   textures_.clear();
   COUNT_profile_set("gpu/texture_cache/textures", 0);
 }
@@ -1038,6 +1168,7 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
     }
     assert_true(new_texture->key() == key);
     texture = textures_.emplace(key, std::move(new_texture)).first->second.get();
+    AddToResolveDestinationIndex(texture);
   }
   COUNT_profile_set("gpu/texture_cache/textures", textures_.size());
   texture->LogAction("Created");

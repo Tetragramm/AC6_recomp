@@ -16,6 +16,7 @@
 #include <cstring>
 #include <memory>
 #include <unordered_map>
+#include <functional>
 #include <vector>
 
 #include <rex/assert.h>
@@ -205,6 +206,11 @@ class TextureCache {
     const TextureKey& key() const { return key_; }
 
     const texture_util::TextureGuestLayout& guest_layout() const { return guest_layout_; }
+    // Set to resolve_destination_scan_stamp_ while a resolve-destination
+    // lookup is visiting this texture, so one found in several address
+    // buckets is examined once.
+    uint64_t resolve_destination_scan_stamp = 0;
+
     uint32_t GetGuestBaseSize() const { return guest_layout().base.level_data_extent_bytes; }
     uint32_t GetGuestMipsSize() const { return guest_layout().mips_total_extent_bytes; }
 
@@ -637,6 +643,23 @@ class TextureCache {
   uint64_t current_submission_time_ = 0;
 
   std::unordered_map<TextureKey, std::unique_ptr<Texture>, TextureKey::Hasher> textures_;
+
+  // Resolve destinations are looked up by guest address, once per resolve and
+  // ~90 times a frame in AC6. Scanning every texture made that O(textures) -
+  // 791 of them on the tester's machine, which was the whole of the resolve's
+  // CPU cost. Textures are bucketed by the guest ranges their base and mips
+  // occupy so a lookup visits only the ones that can overlap.
+  static constexpr uint32_t kResolveDestinationBucketSizeLog2 = 20;  // 1 MB
+  static constexpr uint32_t kResolveDestinationBucketCount =
+      uint32_t(1) << (29 - kResolveDestinationBucketSizeLog2);
+  std::vector<std::vector<Texture*>> resolve_destination_buckets_;
+  std::vector<Texture*> resolve_destination_candidates_;
+  uint64_t resolve_destination_scan_stamp_ = 0;
+  int32_t resolve_destination_verify_budget_ = -1;
+  void AddToResolveDestinationIndex(Texture* texture);
+  void RemoveFromResolveDestinationIndex(Texture* texture);
+  void ForEachResolveDestinationBucket(uint32_t start, uint32_t length,
+                                       const std::function<void(std::vector<Texture*>&)>& callback);
   // Sample-logging budget for FindResolveDestinationTextures rejections.
   uint32_t resolve_destination_log_count_[2] = {};
 
