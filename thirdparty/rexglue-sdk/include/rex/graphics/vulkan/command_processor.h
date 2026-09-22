@@ -884,6 +884,11 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkPipeline current_external_compute_pipeline_;
   // Diagnostics: which targets the last draw would overwrite completely.
   uint32_t last_draw_overwrite_mask_ = 0;
+  // AC6 wide world target: when non-zero, the draw being issued renders into
+  // a wide target and its scissor extends to this width in guest pixels
+  // instead of stopping at the surface pitch (see
+  // VulkanRenderTargetCache::IsWideKey).
+  uint32_t ac6_wide_draw_width_ = 0;
 
   // Pipeline layout of the current guest graphics pipeline.
   const PipelineLayout* current_guest_graphics_pipeline_layout_;

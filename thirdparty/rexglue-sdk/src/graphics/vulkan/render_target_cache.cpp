@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <string>
 #include <unordered_map>
@@ -70,6 +71,17 @@ REXCVAR_DEFINE_STRING(render_target_path_vulkan, "", "GPU/Vulkan",
 //     "GPU");
 
 REXCVAR_DECLARE(bool, gpu_timestamps);
+REXCVAR_DEFINE_BOOL(ac6_wide_world_target, true, "AC6/Enhancements",
+                    "Render AC6's tiled 1280x720 2x MSAA world in one pass: a 640-wide 2x "
+                    "render target gets a host image twice as wide, the second predicated "
+                    "tile's draws are dropped and the first tile's scissor spans the whole "
+                    "width. Removes ~25% of a frame's draws - the biggest cost on a machine "
+                    "bound by the command processor thread. The EDRAM model is untouched; "
+                    "the two halves are exchanged by image copies around the guest's own "
+                    "clears and resolves (see IsWideKey).");
+REXCVAR_DEFINE_INT32(ac6_wide_world_target_log, 0, "AC6/Enhancements",
+                     "Log this many wide-world-target events ([WIDE] lines: pass starts, "
+                     "rebinds, first/second tile resolves) and then go quiet.");
 REXCVAR_DEFINE_BOOL(ac6_edram_no_transfers, false, "AC6/Enhancements",
                     "EXPERIMENT: never copy EDRAM contents between host render targets on "
                     "ownership change. Logs every transfer it skips ([EDRAM-SKIP]) so the "
@@ -124,6 +136,22 @@ REXCVAR_DEFINE_BOOL(vulkan_resolve_to_texture_image, false, "GPU",
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics::vulkan {
+
+namespace {
+std::atomic<int32_t> g_wide_log_budget{-1};
+bool WideLogTake() {
+  int32_t budget = g_wide_log_budget.load(std::memory_order_relaxed);
+  if (budget < 0) {
+    budget = REXCVAR_GET(ac6_wide_world_target_log);
+    g_wide_log_budget.store(budget, std::memory_order_relaxed);
+  }
+  if (budget <= 0) {
+    return false;
+  }
+  g_wide_log_budget.fetch_sub(1, std::memory_order_relaxed);
+  return true;
+}
+}  // namespace
 
 // Generated with `xb buildshaders`.
 namespace shaders {
@@ -1487,6 +1515,8 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
   SCOPE_profile_cpu_f("gpu");
   written_address_out = 0;
   written_length_out = 0;
+  // Per resolve; the second-tile case below sets it.
+  wide_resolve_source_x_offset_tiles_ = 0;
 
   bool draw_resolution_scaled = IsDrawResolutionScaled();
 
@@ -1502,6 +1532,61 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
     return true;
   }
   narrative::OnResolve(resolve_info);
+
+  if (REXCVAR_GET(ac6_wide_world_target) && GetPath() == Path::kHostRenderTargets &&
+      resolve_info.copy_dest_extent_length) {
+    // The guest resolves each tile of a wide target in turn. The first resolve
+    // of a span reads what the wide pass put in the left half. The second -
+    // no draws into the wide target since - is of a buffer the guest expects
+    // tile 1 to have filled: the right half is moved onto the left first,
+    // and, if the guest's resolve-clear in between handed the span to an
+    // alias-keyed target (the hangar resolves through a 640x1440 1x view),
+    // ownership is handed back to the wide target without a transfer, so the
+    // resolve reads it exactly as it read the first tile.
+    uint32_t dump_base, dump_row_length_used, dump_rows, dump_pitch;
+    resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used, dump_rows, dump_pitch);
+    GetResolveCopyRectanglesToDump(dump_base, dump_row_length_used, dump_rows, dump_pitch,
+                                   dump_rectangles_);
+    RenderTarget* owner =
+        dump_rectangles_.size() == 1 ? dump_rectangles_[0].render_target : nullptr;
+    RenderTarget* wide = owner && IsWideKey(owner->key()) ? owner : nullptr;
+    auto awaited = wide_awaiting_second_resolve_.find(dump_base);
+    if (!wide && awaited != wide_awaiting_second_resolve_.end()) {
+      wide = awaited->second;
+    }
+    if (wide) {
+      uint32_t& draws = wide_draws_since_resolve_[wide];
+      if (WideLogTake()) {
+        REXGPU_ERROR("[WIDE] resolve span {} {} owner {} awaited {} draws {} second_renders {} "
+                     "dest {:08X}",
+                     dump_base, resolve_info.IsCopyingDepth() ? "depth" : "color",
+                     owner == wide ? "wide" : (owner ? "other" : "none"),
+                     awaited != wide_awaiting_second_resolve_.end() ? 1 : 0, draws,
+                     wide_second_tile_renders_ ? 1 : 0, resolve_info.copy_dest_base);
+      }
+      if (wide_second_tile_renders_) {
+        // Both tiles were drawn into the left half; nothing to redirect.
+        if (awaited != wide_awaiting_second_resolve_.end()) {
+          wide_awaiting_second_resolve_.erase(awaited);
+        }
+        COUNT_profile_add("gpu/ac6_wide_rendered_tile_resolves", 1);
+      } else if (draws == 0 && awaited != wide_awaiting_second_resolve_.end()) {
+        const RenderTargetKey wide_key = wide->key();
+        if (owner != wide) {
+          ChangeOwnershipWithoutTransfer(wide_key, dump_base - wide_key.base_tiles,
+                                         dump_rows * dump_pitch);
+        }
+        // Every path below reads the right half through this.
+        wide_resolve_source_x_offset_tiles_ = wide_key.GetPitchTiles();
+        wide_awaiting_second_resolve_.erase(awaited);
+        COUNT_profile_add("gpu/ac6_wide_second_tile_resolves", 1);
+      } else {
+        wide_awaiting_second_resolve_[dump_base] = wide;
+        COUNT_profile_add("gpu/ac6_wide_first_tile_resolves", 1);
+      }
+      draws = 0;
+    }
+  }
 
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -1891,6 +1976,83 @@ bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
       } else {
         PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
                                          depth_and_color_render_targets, last_update_transfers());
+      }
+
+      // Between a wide target's two tile resolves, a draw into another target
+      // that has taken over its span changes what the second tile starts
+      // from - the hangar paints last frame's right half into the range
+      // through a 1x alias right after resolving the first tile. Only one
+      // render for both tiles is then wrong; the second tile is rendered.
+      // Cheap: the map is non-empty only inside that window.
+      if (!wide_awaiting_second_resolve_.empty() && !wide_second_tile_renders_) {
+        for (auto it = wide_awaiting_second_resolve_.begin();
+             it != wide_awaiting_second_resolve_.end();) {
+          RenderTarget* wide = it->second;
+          const RenderTargetKey wide_key = wide->key();
+          const uint32_t span_tiles = wide_key.GetPitchTiles() * 1;
+          GetResolveCopyRectanglesToDump(it->first, span_tiles, 1, span_tiles, dump_rectangles_);
+          RenderTarget* span_owner =
+              dump_rectangles_.size() == 1 ? dump_rectangles_[0].render_target : nullptr;
+          bool drawn_into_by_other = false;
+          if (span_owner && span_owner != wide) {
+            for (uint32_t j = 0; j < 1 + xenos::kMaxColorRenderTargets; ++j) {
+              drawn_into_by_other |= depth_and_color_render_targets[j] == span_owner;
+            }
+          }
+          if (drawn_into_by_other) {
+            // The entries stay: the second tile's own draws rebind the wide
+            // target, and an awaiting entry is what tells that rebind apart
+            // from a clean pass start (which would clear this flag). The
+            // tile's resolves consume them.
+            wide_second_tile_renders_ = true;
+            COUNT_profile_add("gpu/ac6_wide_second_tile_rendered_passes", 1);
+            if (WideLogTake()) {
+              REXGPU_ERROR("[WIDE] span {} drawn into by another target between tile resolves - "
+                           "second tile renders", it->first);
+            }
+          }
+          ++it;
+        }
+      }
+
+      // A wide target that was not bound by the previous update starts a pass:
+      // its left half now holds what the guest's clear and transfers put in
+      // EDRAM, and the right half must start from the same state.
+      for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+        RenderTarget* rt = depth_and_color_render_targets[i];
+        RenderTarget* wide = rt && IsWideKey(rt->key()) ? rt : nullptr;
+        if (wide && wide != wide_bound_last_update_[i]) {
+          if (WideLogTake()) {
+            size_t awaiting_count = 0;
+            for (const auto& kv : wide_awaiting_second_resolve_) {
+              awaiting_count += kv.second == wide ? 1 : 0;
+            }
+            REXGPU_ERROR("[WIDE] rebind slot {} {} awaiting {} transfers {} second_renders {}", i,
+                         wide->key().is_depth ? "depth" : "color", awaiting_count,
+                         last_update_transfers()[i].size(), wide_second_tile_renders_ ? 1 : 0);
+          }
+          bool awaiting = false;
+          for (const auto& kv : wide_awaiting_second_resolve_) {
+            awaiting |= kv.second == wide;
+          }
+          if (awaiting) {
+            // Rebound between its two tile resolves: either the second tile
+            // is being rendered (the span check above), or, if contents were
+            // transferred in, the second tile starts from something the first
+            // did not and must be. Either way not a pass start.
+            if (!last_update_transfers()[i].empty() && !wide_second_tile_renders_) {
+              wide_second_tile_renders_ = true;
+              COUNT_profile_add("gpu/ac6_wide_second_tile_rendered_passes", 1);
+            }
+          } else {
+            // A clean pass start; the transfers that just ran covered both
+            // halves.
+            wide_draws_since_resolve_[wide] = 0;
+            wide_second_tile_renders_ = false;
+            COUNT_profile_add("gpu/ac6_wide_pass_starts", 1);
+          }
+        }
+        wide_bound_last_update_[i] = wide;
       }
 
       if (depth_and_color_render_targets[0]) {
@@ -2361,7 +2523,8 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
   image_create_info.pNext = nullptr;
   image_create_info.flags = 0;
   image_create_info.imageType = VK_IMAGE_TYPE_2D;
-  image_create_info.extent.width = key.GetWidth() * draw_resolution_scale_x();
+  image_create_info.extent.width =
+      key.GetWidth() * draw_resolution_scale_x() * (IsWideKey(key) ? 2 : 1);
   image_create_info.extent.height =
       GetRenderTargetHeight(key.pitch_tiles_at_32bpp, key.msaa_samples) * draw_resolution_scale_y();
   image_create_info.extent.depth = 1;
@@ -2765,6 +2928,16 @@ VulkanRenderTargetCache::GetHostRenderTargetsFramebuffer(
   if (pitch_tiles_at_32bpp) {
     host_extent.width =
         RenderTargetKey::GetWidth(pitch_tiles_at_32bpp, render_pass_key.msaa_samples);
+    {
+      // A pass on wide targets (all of a pass's targets share pitch and MSAA,
+      // so they are all wide or none) draws into the wide framebuffer.
+      RenderTargetKey probe;
+      probe.pitch_tiles_at_32bpp = pitch_tiles_at_32bpp;
+      probe.msaa_samples = render_pass_key.msaa_samples;
+      if (IsWideKey(probe)) {
+        host_extent.width *= 2;
+      }
+    }
     host_extent.height = GetRenderTargetHeight(pitch_tiles_at_32bpp, render_pass_key.msaa_samples);
   } else {
     assert_zero(render_pass_key.depth_and_color_used);
@@ -3267,6 +3440,25 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
   spv::Id const_dest_tile_width_pixels = builder.makeUintConstant(
       tile_width_samples >>
       (uint32_t(dest_is_64bpp) + uint32_t(key.dest_msaa_samples >= xenos::MsaaSamples::k4X)));
+  assert_true(push_constants_member_address != UINT32_MAX);
+  id_vector_temp.clear();
+  id_vector_temp.push_back(builder.makeIntConstant(int32_t(push_constants_member_address)));
+  spv::Id address_constant = builder.createLoad(
+      builder.createAccessChain(spv::StorageClassPushConstant, push_constants, id_vector_temp),
+      spv::NoPrecision);
+  if (REXCVAR_GET(ac6_wide_world_target)) {
+    // AC6 wide world target: a fragment in the right half of a wide target
+    // addresses the same EDRAM as its twin in the left half. The identity for
+    // every other target, whose fragments never reach its pitch.
+    dest_pixel_x = builder.createBinOp(
+        spv::OpUMod, type_uint, dest_pixel_x,
+        builder.createBinOp(
+            spv::OpIMul, type_uint,
+            builder.createTriOp(spv::OpBitFieldUExtract, type_uint, address_constant,
+                                builder.makeUintConstant(0),
+                                builder.makeUintConstant(xenos::kEdramPitchTilesBits)),
+            const_dest_tile_width_pixels));
+  }
   spv::Id dest_tile_index_x =
       builder.createBinOp(spv::OpUDiv, type_uint, dest_pixel_x, const_dest_tile_width_pixels);
   spv::Id dest_tile_pixel_x =
@@ -3278,13 +3470,6 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
       builder.createBinOp(spv::OpUDiv, type_uint, dest_pixel_y, const_dest_tile_height_pixels);
   spv::Id dest_tile_pixel_y =
       builder.createBinOp(spv::OpUMod, type_uint, dest_pixel_y, const_dest_tile_height_pixels);
-
-  assert_true(push_constants_member_address != UINT32_MAX);
-  id_vector_temp.clear();
-  id_vector_temp.push_back(builder.makeIntConstant(int32_t(push_constants_member_address)));
-  spv::Id address_constant = builder.createLoad(
-      builder.createAccessChain(spv::StorageClassPushConstant, push_constants, id_vector_temp),
-      spv::NoPrecision);
 
   // Calculate the 32bpp tile index from its X and Y parts.
   spv::Id dest_tile_index = builder.createBinOp(
@@ -5303,6 +5488,9 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
 
   bool resolve_clear_needed = render_target_resolve_clear_values && resolve_clear_rectangle;
   VkClearRect resolve_clear_rect;
+  // AC6 wide world target: the clear covers both halves (second rect).
+  VkClearRect resolve_clear_rects[2];
+  uint32_t resolve_clear_rect_count = 1;
   if (resolve_clear_needed) {
     // Assuming the rectangle is already clamped by the setup function from the
     // common render target cache.
@@ -5891,7 +6079,12 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
           }
         }
 
-        uint32_t transfer_vertex_count = 6 * transfer_rectangle_count;
+        // AC6 wide world target: the rectangles once more at +width, so the
+        // right half starts from the same EDRAM contents as the left.
+        const uint32_t wide_dest_passes = IsWideKey(dest_rt_key) ? 2 : 1;
+        const float wide_dest_offset_ndc =
+            dest_rt_key.GetWidth() * pixels_to_ndc_x;
+        uint32_t transfer_vertex_count = 6 * transfer_rectangle_count * wide_dest_passes;
         VkBuffer transfer_vertex_buffer;
         VkDeviceSize transfer_vertex_buffer_offset;
         float* transfer_rectangle_write_ptr =
@@ -5901,6 +6094,7 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
         if (!transfer_rectangle_write_ptr) {
           continue;
         }
+        for (uint32_t wide_pass = 0; wide_pass < wide_dest_passes; ++wide_pass)
         for (auto it_merged = it_merged_first; it_merged <= it_merged_last; ++it_merged) {
           Transfer::Rectangle transfer_invocation_rectangles[Transfer::kMaxRectanglesWithCutout];
           uint32_t transfer_invocation_rectangle_count = it_merged->transfer.GetRectangles(
@@ -5909,7 +6103,8 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
           assert_not_zero(transfer_invocation_rectangle_count);
           for (uint32_t j = 0; j < transfer_invocation_rectangle_count; ++j) {
             const Transfer::Rectangle& transfer_rectangle = transfer_invocation_rectangles[j];
-            float transfer_rectangle_x0 = -1.0f + transfer_rectangle.x_pixels * pixels_to_ndc_x;
+            float transfer_rectangle_x0 = -1.0f + transfer_rectangle.x_pixels * pixels_to_ndc_x +
+                                          (wide_pass ? wide_dest_offset_ndc : 0.0f);
             float transfer_rectangle_y0 = -1.0f + transfer_rectangle.y_pixels * pixels_to_ndc_y;
             float transfer_rectangle_x1 =
                 transfer_rectangle_x0 + transfer_rectangle.width_pixels * pixels_to_ndc_x;
@@ -6232,7 +6427,29 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
           } break;
         }
       }
-      command_buffer.CmdVkClearAttachments(1, &resolve_clear_attachment, 1, &resolve_clear_rect);
+      resolve_clear_rects[0] = resolve_clear_rect;
+      resolve_clear_rect_count = 1;
+      if (IsWideKey(dest_rt_key)) {
+        // AC6 wide world target. A resolve-clear between the target's two tile
+        // resolves is the guest preparing EDRAM for the second tile - the
+        // first tile's colour resolve clears depth - and in one wide render
+        // the second tile's contents already sit in the right half, which
+        // the second resolve is about to read. That clear stays on the left
+        // half, as the EDRAM model says. Any other clear is state both tiles
+        // start from and covers both halves.
+        bool between_tile_resolves = false;
+        for (const auto& kv : wide_awaiting_second_resolve_) {
+          between_tile_resolves |= kv.second == dest_rt;
+        }
+        if (!between_tile_resolves) {
+          resolve_clear_rects[1] = resolve_clear_rect;
+          resolve_clear_rects[1].rect.offset.x +=
+              int32_t(dest_rt_key.GetWidth() * draw_resolution_scale_x());
+          resolve_clear_rect_count = 2;
+        }
+      }
+      command_buffer.CmdVkClearAttachments(1, &resolve_clear_attachment, resolve_clear_rect_count,
+                                           resolve_clear_rects);
     }
   }
 }
@@ -6261,6 +6478,7 @@ enum DirectResolvePushConstant : uint32_t {
   kDirectResolvePushConstantSourcePitchTiles,
   kDirectResolvePushConstantDispatchFirstTile,
   kDirectResolvePushConstantHeightDiv8,
+  kDirectResolvePushConstantSourceXOffsetTiles,
 
   kDirectResolvePushConstantCount,
 };
@@ -6445,10 +6663,10 @@ VkPipeline VulkanRenderTargetCache::BuildRenderTargetSamplingPipeline(
       id_vector_temp, direct ? "XeDirectResolvePushConstants" : "XeEdramDumpPushConstants");
   static const char* const kDumpPushConstantNames[] = {"pitches", "offsets"};
   static const char* const kDirectResolvePushConstantNames[] = {
-      "edram_info",  "coordinate_info",   "dest_info",          "dest_coordinate_info",
-      "dest_base",   "source_base_tiles", "source_pitch_tiles", "dispatch_first_tile",
-      "height_div_8", "image_x",          "image_y",            "image_width",
-      "image_height"};
+      "edram_info",   "coordinate_info",       "dest_info",          "dest_coordinate_info",
+      "dest_base",    "source_base_tiles",     "source_pitch_tiles", "dispatch_first_tile",
+      "height_div_8", "source_x_offset_tiles", "image_x",            "image_y",
+      "image_width",  "image_height"};
   for (uint32_t i = 0; i < push_constant_count; ++i) {
     builder.addMemberName(
         type_push_constants, i,
@@ -6711,6 +6929,16 @@ VkPipeline VulkanRenderTargetCache::BuildRenderTargetSamplingPipeline(
       builder.createBinOp(spv::OpUDiv, type_uint, source_tile_index, source_pitch_tiles);
   spv::Id source_tile_index_x =
       builder.createBinOp(spv::OpUMod, type_uint, source_tile_index, source_pitch_tiles);
+  if (REXCVAR_GET(ac6_wide_world_target)) {
+    // AC6 wide world target: the second tile's resolve reads the right half.
+    spv::Id source_x_offset_tiles =
+        direct ? load_push_constant(kDirectResolvePushConstantSourceXOffsetTiles)
+               : builder.createTriOp(spv::OpBitFieldUExtract, type_uint, pitches_constant,
+                                     builder.makeUintConstant(2 * xenos::kEdramPitchTilesBits),
+                                     builder.makeUintConstant(8));
+    source_tile_index_x =
+        builder.createBinOp(spv::OpIAdd, type_uint, source_tile_index_x, source_x_offset_tiles);
+  }
   // Combine the source tile offset and the sample index within the tile.
   spv::Id source_sample_x = builder.createBinOp(
       spv::OpIAdd, type_uint,
@@ -7655,6 +7883,11 @@ void VulkanRenderTargetCache::IssueDirectResolveCopy(
 
     push_constants.source_base_tiles = rt_key.base_tiles;
     push_constants.source_pitch_tiles = rt_key.GetPitchTiles();
+    push_constants.source_x_offset_tiles = wide_resolve_source_x_offset_tiles_;
+    if (wide_resolve_source_x_offset_tiles_ && WideLogTake()) {
+      REXGPU_ERROR("[WIDE]   path direct offset {} {}", wide_resolve_source_x_offset_tiles_,
+                   rt_key.is_depth ? "depth" : "color");
+    }
     push_constants.dispatch_first_tile = dump_base + resolve_copy_dispatch.dispatch.offset;
     command_buffer.CmdVkPushConstants(pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                       sizeof(push_constants), &push_constants);
@@ -7828,6 +8061,11 @@ bool VulkanRenderTargetCache::TryPrepareResolveComputeToTexture(
   resolve_compute_push_constants_.resolve.dest_base = 0;
   resolve_compute_push_constants_.source_base_tiles = rt_key.base_tiles;
   resolve_compute_push_constants_.source_pitch_tiles = rt_key.GetPitchTiles();
+  resolve_compute_push_constants_.source_x_offset_tiles = wide_resolve_source_x_offset_tiles_;
+  if (wide_resolve_source_x_offset_tiles_ && WideLogTake()) {
+    REXGPU_ERROR("[WIDE]   path compute-to-image offset {} {}", wide_resolve_source_x_offset_tiles_,
+                 rt_key.is_depth ? "depth" : "color");
+  }
   resolve_compute_push_constants_.dispatch_first_tile = dump_base;
   resolve_compute_push_constants_.height_div_8 = resolve_info.height_div_8;
   resolve_copy_to_texture_rt_ = &vulkan_rt;
@@ -8057,7 +8295,14 @@ bool VulkanRenderTargetCache::TryPrepareResolveCopyToTexture(
   uint32_t src_y = (source_tile / rt_pitch_tiles) * tile_height +
                    (resolve_info.coordinate_info.edram_offset_y_div_8
                     << xenos::kResolveAlignmentPixelsLog2);
-  if (src_x + width > rt_key.GetWidth() ||
+  // AC6 wide world target: the second tile's resolve reads the right half.
+  const uint32_t wide_multiplier = IsWideKey(rt_key) ? 2 : 1;
+  src_x += wide_resolve_source_x_offset_tiles_ * tile_width;
+  if (wide_resolve_source_x_offset_tiles_ && WideLogTake()) {
+    REXGPU_ERROR("[WIDE]   path image-copy offset {} src_x {}", wide_resolve_source_x_offset_tiles_,
+                 src_x);
+  }
+  if (src_x + width > rt_key.GetWidth() * wide_multiplier ||
       src_y + height > GetRenderTargetHeight(rt_key.pitch_tiles_at_32bpp, rt_key.msaa_samples)) {
     return reject("source outside owner");
   }
@@ -8117,7 +8362,8 @@ void VulkanRenderTargetCache::IssueResolveCopyToTexture(VulkanTextureCache& text
   source_info.format = source_rt_key.is_depth
                            ? GetDepthVulkanFormat(source_rt_key.GetDepthFormat())
                            : GetColorVulkanFormat(source_rt_key.GetColorFormat());
-  source_info.width = source_rt_key.GetWidth() * draw_resolution_scale_x();
+  source_info.width = source_rt_key.GetWidth() * draw_resolution_scale_x() *
+                      (IsWideKey(source_rt_key) ? 2 : 1);
   source_info.height =
       GetRenderTargetHeight(source_rt_key.pitch_tiles_at_32bpp, source_rt_key.msaa_samples) *
       draw_resolution_scale_y();
@@ -8489,6 +8735,11 @@ bool VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dum
     DumpPitches pitches;
     pitches.dest_pitch = dump_pitch;
     pitches.source_pitch = rt_key.GetPitchTiles();
+    pitches.source_x_offset_tiles = wide_resolve_source_x_offset_tiles_;
+    if (wide_resolve_source_x_offset_tiles_ && WideLogTake()) {
+      REXGPU_ERROR("[WIDE]   path dump offset {} {} pitches {:08X}", wide_resolve_source_x_offset_tiles_,
+                   rt_key.is_depth ? "depth" : "color", pitches.pitches);
+    }
     if (last_pitches != pitches) {
       last_pitches = pitches;
       pitches_bound = false;
@@ -8532,6 +8783,31 @@ bool VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dum
     MarkEdramBufferModified();
   }
   return all_pipelines_available;
+}
+
+
+bool VulkanRenderTargetCache::IsWideKey(RenderTargetKey key) const {
+  // AC6's world: surface pitch 640 at 2x MSAA is 8 tiles at 32bpp. Its colour
+  // (8888) and depth (D24S8) targets both match; nothing else in the game
+  // does. A 64bpp key at the same pitch would be 16 tiles and does not.
+  return REXCVAR_GET(ac6_wide_world_target) && key.msaa_samples == xenos::MsaaSamples::k2X &&
+         key.pitch_tiles_at_32bpp == 8;
+}
+
+bool VulkanRenderTargetCache::IsWideSurface(uint32_t surface_pitch,
+                                            xenos::MsaaSamples msaa_samples) const {
+  RenderTargetKey probe;
+  probe.msaa_samples = msaa_samples;
+  probe.pitch_tiles_at_32bpp = xenos::GetSurfacePitchTiles(surface_pitch, msaa_samples, false);
+  return IsWideKey(probe);
+}
+
+void VulkanRenderTargetCache::NoteDrawIntoBoundTargets() {
+  for (RenderTarget* rt : wide_bound_last_update_) {
+    if (rt) {
+      ++wide_draws_since_resolve_[rt];
+    }
+  }
 }
 
 }  // namespace rex::graphics::vulkan

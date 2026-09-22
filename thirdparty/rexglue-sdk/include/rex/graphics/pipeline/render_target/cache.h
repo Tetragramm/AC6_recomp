@@ -657,6 +657,16 @@ class RenderTargetCache {
                                             uint32_t length_tiles) const;
   // Updates ownership_ranges_, adds the transfers needed for the ownership
   // change to transfers_append_out if it's not null.
+ protected:
+  // Gives `dest` the tiles [start, start + length) of its range without
+  // copying the previous owner's contents in (see ChangeOwnership). For a
+  // backend that has put the right contents in place itself.
+  void ChangeOwnershipWithoutTransfer(RenderTargetKey dest, uint32_t start_tiles_base_relative,
+                                      uint32_t length_tiles) {
+    ChangeOwnership(dest, start_tiles_base_relative, length_tiles, nullptr);
+  }
+
+ private:
   void ChangeOwnership(RenderTargetKey dest, uint32_t start_tiles_base_relative,
                        uint32_t length_tiles, std::vector<Transfer>* transfers_append_out,
                        const Transfer::Rectangle* resolve_clear_cutout = nullptr);

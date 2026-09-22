@@ -73,12 +73,12 @@ REXCVAR_DEFINE_BOOL(ac6_clear_elides_edram_transfer, false, "AC6/Enhancements",
                     "targets it fully overwrites without copying the previous occupant in. "
                     "AC6 packs many passes into the same EDRAM range and clears between "
                     "them; those copies were most of the GPU frame.");
-REXCVAR_DEFINE_BOOL(ac6_skip_no_effect_draws, false, "AC6/Enhancements",
+REXCVAR_DEFINE_BOOL(ac6_skip_no_effect_draws, true, "AC6/Enhancements",
                     "Skip draws that rasterize but cannot write anything: no pixel shader "
                     "needed, depth and stencil off, no memory export. AC6 issues 48 such "
                     "one-vertex point draws every frame (its D3D perf-counter markers), each "
                     "paying the full per-draw command-processor cost for no output.");
-REXCVAR_DEFINE_BOOL(ac6_quad_elides_edram_transfer, false, "AC6/Enhancements",
+REXCVAR_DEFINE_BOOL(ac6_quad_elides_edram_transfer, true, "AC6/Enhancements",
                     "Let a full-viewport unblended quad take EDRAM ownership without copying "
                     "the previous occupant in, as the D3D Clear quad already does. AC6's post "
                     "chain draws such quads over freshly aliased targets; 34-51% of the "
@@ -3987,6 +3987,28 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     }
   }
 
+  // AC6 wide world target: the second predicated tile's draws (window offset
+  // shifted left by a tile) are not issued, and the first tile's draws cover
+  // the whole width. See VulkanRenderTargetCache::IsWideKey.
+  ac6_wide_draw_width_ = 0;
+  {
+    const auto surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+    if (render_target_cache_->IsWideSurface(surface_info.surface_pitch,
+                                            surface_info.msaa_samples)) {
+      const auto window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+      if (window_offset.window_x_offset < 0) {
+        if (!render_target_cache_->WideSecondTileRendersNormally()) {
+          COUNT_profile_add("gpu/ac6_wide_tile_draws_dropped", 1);
+          return true;
+        }
+        // Rendered as the guest asked, into the left half at its window
+        // offset; the scissor stays the guest's.
+      } else {
+        ac6_wide_draw_width_ = surface_info.surface_pitch * 2;
+      }
+    }
+  }
+
   bool surface_pitch_is_zero = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 0;
 
   const ui::vulkan::VulkanDevice::Properties& device_properties = GetVulkanDevice()->properties();
@@ -4479,6 +4501,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                                     normalized_color_mask, *vertex_shader)) {
     return draw_fail("render_target_update");
   }
+  render_target_cache_->NoteDrawIntoBoundTargets();
   if (narrative::Active()) {
     narrative::OnDraw(regs, vertex_shader, pixel_shader, prim_type, index_count,
                       *render_target_cache_, bin_mask_, bin_select_,
@@ -6390,6 +6413,11 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
   // Scissor.
   draw_util::Scissor scissor;
   draw_util::GetScissor(regs, scissor);
+  if (ac6_wide_draw_width_ && scissor.offset[0] < ac6_wide_draw_width_) {
+    // The guest scissors tile 0 to the left half and GetScissor clamps to the
+    // surface pitch; the wide target takes the whole width.
+    scissor.extent[0] = ac6_wide_draw_width_ - scissor.offset[0];
+  }
   scissor.offset[0] *= draw_resolution_scale_x;
   scissor.offset[1] *= draw_resolution_scale_y;
   scissor.extent[0] *= draw_resolution_scale_x;

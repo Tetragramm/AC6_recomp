@@ -117,6 +117,47 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
   bool Update(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
               uint32_t normalized_color_mask, const Shader& vertex_shader) override;
+
+  // AC6 wide world target (ac6_wide_world_target). The game renders its
+  // 1280x720 2x MSAA world as two 640-wide predicated tiles into the same
+  // 640-wide EDRAM surface, submitting every draw twice, because colour and
+  // depth at that size would need 2880 of the console's 2048 EDRAM tiles. Host
+  // images have no such limit: a render target whose key says "640 wide, 2x"
+  // gets a host image twice as wide, keeps its EDRAM key and everything that
+  // addresses EDRAM (ownership, transfers, dumps, resolves) untouched, and the
+  // command processor drops the second tile's draws and lets the first tile's
+  // scissor span the whole width. The right half of the image is outside EDRAM
+  // as far as the cache is concerned, and nothing is ever copied between the
+  // halves (an MSAA image copy runs at a few ms per half at 4K on NVIDIA):
+  //  - every transfer and resolve-clear into a wide target is applied to both
+  //    halves - the transfer rectangles are drawn a second time at +width,
+  //    and the transfer shader takes the destination x modulo the target's
+  //    pitch, so a right-half fragment addresses the same EDRAM as its
+  //    left-half twin. Both tiles thus start from the state the guest put in
+  //    EDRAM, which is what they start from on the console;
+  //  - the second tile's resolve (no draws into the wide target since the
+  //    first) samples the right half: the dump and direct resolve shaders take
+  //    a source x offset in tiles, the image copy an offset in pixels;
+  //  - if a wide target receives a transfer BETWEEN its two tile resolves,
+  //    the guest changed EDRAM between the tiles (the hangar restores last
+  //    frame's scene per tile through a 1x alias) and one render cannot stand
+  //    for both: the second tile is rendered normally for that pass.
+  bool IsWideKey(RenderTargetKey key) const;
+  // The same test from the registers of the draw being issued.
+  bool IsWideSurface(uint32_t surface_pitch, xenos::MsaaSamples msaa_samples) const;
+  // The command processor reports each draw issued into the current targets,
+  // so a resolve can tell the second tile's (zero draws since the last) from
+  // the first's.
+  void NoteDrawIntoBoundTargets();
+  // Whether the second tile's draws are to be issued after all this pass. Set
+  // when a wide target that is awaiting its second-tile resolve receives an
+  // ownership transfer: the guest put something new into EDRAM between the
+  // tiles (the hangar restores last frame's scene per tile from a texture
+  // through a 1x alias), so the two tiles do not start from the same state
+  // and one wide render cannot stand for both. Cleared at the next pass
+  // start. Rendering the second tile costs its draws, as before the wide
+  // target; it is correct.
+  bool WideSecondTileRendersNormally() const { return wide_second_tile_renders_; }
   // Binding information for the last successful update.
   RenderPassKey last_update_render_pass_key() const { return last_update_render_pass_key_; }
   VkRenderPass last_update_render_pass() const { return last_update_render_pass_; }
@@ -696,6 +737,9 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
       // Both in tiles.
       uint32_t dest_pitch : xenos::kEdramPitchTilesBits;
       uint32_t source_pitch : xenos::kEdramPitchTilesBits;
+      // AC6 wide world target: tiles added to the source tile column, to read
+      // the right half of a wide target (its second tile). Zero otherwise.
+      uint32_t source_x_offset_tiles : 8;
     };
     DumpPitches() : pitches(0) { static_assert_size(*this, sizeof(pitches)); }
     bool operator==(const DumpPitches& other_pitches) const {
@@ -777,6 +821,9 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     // bottom edge of the region itself (the copy shader needs no such check
     // because its dispatch is sized in region pixels).
     uint32_t height_div_8;
+    // AC6 wide world target: tiles added to the source tile column (see
+    // DumpPitches::source_x_offset_tiles).
+    uint32_t source_x_offset_tiles;
   };
 
   struct DirectResolvePipelineKey {
@@ -1016,6 +1063,23 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   uint32_t resolve_copy_to_texture_dump_row_length_ = 0;
   uint32_t resolve_copy_to_texture_dump_rows_ = 0;
   uint32_t resolve_copy_to_texture_source_x_ = 0;
+
+  // AC6 wide world target state (see IsWideKey).
+  // Tiles the resolve being issued reads to the right of where its EDRAM
+  // addressing says: the wide target's pitch for its second tile, else 0.
+  uint32_t wide_resolve_source_x_offset_tiles_ = 0;
+  // The wide target whose first-tile resolve of a tile span (keyed by its
+  // first tile) has happened and whose second-tile resolve is awaited. Keyed
+  // by span rather than by owner: the guest's resolve-clear through an alias
+  // key (the hangar resolves the world through a 640x1440 1x view) moves the
+  // span's ownership to that alias's target, so at the second resolve the
+  // wide target no longer owns it.
+  std::unordered_map<uint32_t, RenderTarget*> wide_awaiting_second_resolve_;
+  bool wide_second_tile_renders_ = false;
+  // Wide targets bound by the last Update, to tell a newly bound one.
+  RenderTarget* wide_bound_last_update_[1 + xenos::kMaxColorRenderTargets] = {};
+  // Draws issued since each wide target was last resolved.
+  std::unordered_map<RenderTarget*, uint32_t> wide_draws_since_resolve_;
   uint32_t resolve_copy_to_texture_source_y_ = 0;
   uint32_t resolve_copy_to_texture_fill_x_ = 0;
   uint32_t resolve_copy_to_texture_fill_y_ = 0;
