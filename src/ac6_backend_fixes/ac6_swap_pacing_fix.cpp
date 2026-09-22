@@ -30,7 +30,7 @@
 #include <rex/graphics/graphics_system.h>
 #include <rex/logging.h>
 
-REXCVAR_DEFINE_BOOL(ac6_swap_flip_on_fence, false, "AC6/Enhancements",
+REXCVAR_DEFINE_BOOL(ac6_swap_flip_on_fence, true, "AC6/Enhancements",
                     "Complete the guest's swap as soon as the emulated GPU reaches its fence "
                     "instead of waiting for the next 60Hz vblank tick. Removes the vsync "
                     "quantisation of the command-processor thread (a 17ms frame no longer "

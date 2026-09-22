@@ -68,7 +68,7 @@ REXCVAR_DEFINE_BOOL(vulkan_async_skip_incomplete_frames, true, "GPU/Vulkan",
                     "used placeholder pipelines to avoid visible flashing")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_BOOL(ac6_clear_elides_edram_transfer, false, "AC6/Enhancements",
+REXCVAR_DEFINE_BOOL(ac6_clear_elides_edram_transfer, true, "AC6/Enhancements",
                     "When the guest's D3D Clear quad is issued, take EDRAM ownership of the "
                     "targets it fully overwrites without copying the previous occupant in. "
                     "AC6 packs many passes into the same EDRAM range and clears between "

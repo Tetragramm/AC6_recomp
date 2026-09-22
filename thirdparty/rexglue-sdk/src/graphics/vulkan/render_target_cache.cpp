@@ -87,7 +87,7 @@ REXCVAR_DEFINE_BOOL(ac6_edram_no_transfers, false, "AC6/Enhancements",
                     "ownership change. Logs every transfer it skips ([EDRAM-SKIP]) so the "
                     "aliases the game actually relies on can be identified.");
 
-REXCVAR_DEFINE_BOOL(ac6_edram_skip_stencil_transfers, false, "AC6/Enhancements",
+REXCVAR_DEFINE_BOOL(ac6_edram_skip_stencil_transfers, true, "AC6/Enhancements",
                     "Don't carry stencil across EDRAM ownership transfers. Worth about 1 ms of a "
                     "4K / scale 3 frame, and two missions looked identical with it on - but the "
                     "game does test stencil (about 114 draws a frame read it with a real compare "
@@ -129,7 +129,7 @@ REXCVAR_DEFINE_BOOL(vulkan_resolve_to_texture_msaa, true, "GPU",
                     "vkCmdResolveImage when the resolve averages all samples")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_BOOL(vulkan_resolve_to_texture_image, false, "GPU",
+REXCVAR_DEFINE_BOOL(vulkan_resolve_to_texture_image, true, "GPU",
                     "Resolve straight into the destination texture's host image with a copy when "
                     "the texture already exists and the render target holds its exact bits, "
                     "skipping the tiled-memory write and the untiling load")

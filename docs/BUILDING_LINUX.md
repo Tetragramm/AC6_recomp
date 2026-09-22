@@ -44,6 +44,15 @@ sudo dnf install cmake ninja-build pkgconf-pkg-config \
                  vulkan-loader-devel vulkan-tools
 ```
 
+On Arch:
+```bash
+sudo pacman -S base-devel cmake ninja pkgconf \
+                 gtk3 libx11 libxcb \
+                 alsa-lib libpulse \
+                 vulkan-headers vulkan-tools
+sudo yay -S extract-xiso
+```
+
 `extract-xiso` is packaged on some distributions and otherwise builds in a
 minute from <https://github.com/XboxDev/extract-xiso>.
 
