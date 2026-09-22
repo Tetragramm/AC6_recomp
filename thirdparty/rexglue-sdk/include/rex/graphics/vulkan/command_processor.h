@@ -909,6 +909,22 @@ class VulkanCommandProcessor : public CommandProcessor {
   // non-existent descriptor set layouts may also be set, but need to be ignored
   // when they start to matter.
   uint32_t current_graphics_descriptor_sets_bound_up_to_date_;
+
+  // What the previous draw wrote into the texture and sampler descriptor sets,
+  // so a draw binding the same thing can keep them (vulkan_reuse_texture_
+  // descriptor_sets). The layout is part of it - a set allocated for one
+  // pipeline layout's texture set layout cannot stand in for another's.
+  std::vector<VkDescriptorImageInfo> last_texture_descriptor_image_info_vertex_;
+  std::vector<VkDescriptorImageInfo> last_texture_descriptor_image_info_pixel_;
+  VkDescriptorSetLayout last_texture_descriptor_set_layout_vertex_ = VK_NULL_HANDLE;
+  VkDescriptorSetLayout last_texture_descriptor_set_layout_pixel_ = VK_NULL_HANDLE;
+  // Every distinct binding set written this frame, so a draw repeating one
+  // seen earlier binds it again instead of writing a new set. Keyed by the
+  // layout and the descriptor image infos verbatim, so a hash collision
+  // cannot substitute the wrong set. Cleared when a frame opens.
+  std::unordered_map<std::string, VkDescriptorSet> texture_descriptor_set_cache_vertex_;
+  std::unordered_map<std::string, VkDescriptorSet> texture_descriptor_set_cache_pixel_;
+  std::string descriptor_set_cache_key_;
   static_assert(SpirvShaderTranslator::kDescriptorSetCount <=
                     sizeof(current_graphics_descriptor_set_values_up_to_date_) * CHAR_BIT,
                 "Bit fields storing descriptor set validity must be large enough");
