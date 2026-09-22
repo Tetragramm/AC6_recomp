@@ -112,7 +112,7 @@ REXCVAR_DEFINE_BOOL(vulkan_resolve_to_texture_prefer_compute, false, "GPU",
                     "in less time, so this is off)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_BOOL(vulkan_resolve_to_texture_compute, false, "GPU",
+REXCVAR_DEFINE_BOOL(vulkan_resolve_to_texture_compute, true, "GPU",
                     "Resolve single-sampled resolve views into the destination texture images with "
                     "a compute shader (sampling the render target and unpacking as the texture "
                     "load would) instead of a copy or the tiled-memory path; covers owners of any "
