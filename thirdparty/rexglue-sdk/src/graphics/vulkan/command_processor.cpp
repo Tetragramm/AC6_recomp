@@ -7210,6 +7210,11 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
         uint64_t float_constant_map_entry = current_float_constant_map_vertex_[i];
         uint32_t float_constant_index;
         while (rex::bit_scan_forward(float_constant_map_entry, &float_constant_index)) {
+          // One vector at a time on purpose: a memcpy of a CONSTANT 16 bytes
+          // inlines to a single move, while coalescing the contiguous runs
+          // into one variable-length memcpy calls the real thing. Measured -
+          // the runs here average 2.4 vectors, and coalescing them made this
+          // loop 3.5x slower (UpdateBindings 0.72 -> 1.32 us/call).
           float_constant_map_entry &= ~(1ull << float_constant_index);
           std::memcpy(
               mapping,
@@ -7242,6 +7247,11 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
         uint64_t float_constant_map_entry = current_float_constant_map_pixel_[i];
         uint32_t float_constant_index;
         while (rex::bit_scan_forward(float_constant_map_entry, &float_constant_index)) {
+          // One vector at a time on purpose: a memcpy of a CONSTANT 16 bytes
+          // inlines to a single move, while coalescing the contiguous runs
+          // into one variable-length memcpy calls the real thing. Measured -
+          // the runs here average 2.4 vectors, and coalescing them made this
+          // loop 3.5x slower (UpdateBindings 0.72 -> 1.32 us/call).
           float_constant_map_entry &= ~(1ull << float_constant_index);
           std::memcpy(
               mapping,
