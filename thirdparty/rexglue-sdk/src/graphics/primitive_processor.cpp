@@ -924,6 +924,7 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
       cacheable.index_buffer_type == ProcessedIndexBufferType::kHostBuiltinForDMA) {
     // Request the index buffer memory.
     // TODO(Triang3l): Shared memory request cache.
+    COUNT_profile_add("gpu/shared_memory/requests_from_index_buffer", 1);
     if (!shared_memory_.RequestRange(guest_index_base, guest_index_buffer_needed_bytes)) {
       REXGPU_ERROR(
           "PrimitiveProcessor: Failed to request index buffer 0x{:08X}, 0x{:X} "

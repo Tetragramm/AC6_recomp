@@ -16,6 +16,7 @@
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
+#include <rex/dbg.h>
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
 #include <rex/graphics/vulkan/shared_memory.h>
@@ -26,6 +27,10 @@
 REXCVAR_DEFINE_BOOL(vulkan_sparse_shared_memory, true, "GPU/Vulkan",
                     "Use sparse shared memory on Vulkan")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_BOOL(shared_memory_upload_hash, false, "GPU",
+                    "Hash every uploaded guest page and report how many were actually rewritten "
+                    "versus re-uploaded unchanged. Diagnostic only; costs a read of every upload.");
 
 namespace rex::graphics::vulkan {
 
@@ -345,6 +350,10 @@ bool VulkanSharedMemory::UploadRanges(
   if (upload_page_ranges.empty()) {
     return true;
   }
+  // Measurement: RequestRanges' self time includes this (the memcpy of guest
+  // pages plus the barrier), so without a scope here the bookkeeping and the
+  // real upload work are indistinguishable.
+  SCOPE_profile_cpu_f("gpu");
   // upload_page_ranges are sorted, use them to determine the range for the
   // ordering barrier.
   Use(Usage::kTransferDestination,
@@ -375,9 +384,13 @@ bool VulkanSharedMemory::UploadRanges(
         break;
       }
       MakeRangeValid(upload_range_start << page_size_log2(), uint32_t(upload_buffer_size), false);
-      std::memcpy(upload_buffer_mapping,
-                  memory().TranslatePhysical(upload_range_start << page_size_log2()),
-                  upload_buffer_size);
+      const uint8_t* upload_source =
+          memory().TranslatePhysical(upload_range_start << page_size_log2());
+      if (REXCVAR_GET(shared_memory_upload_hash)) {
+        HashUploadedPages(upload_range_start, uint32_t(upload_buffer_size) >> page_size_log2(),
+                          upload_source);
+      }
+      std::memcpy(upload_buffer_mapping, upload_source, upload_buffer_size);
       if (upload_buffer_previous != upload_buffer && !upload_regions_.empty()) {
         assert_true(upload_buffer_previous != VK_NULL_HANDLE);
         command_buffer.CmdVkCopyBuffer(upload_buffer_previous, buffer_,
@@ -404,6 +417,33 @@ bool VulkanSharedMemory::UploadRanges(
     upload_regions_.clear();
   }
   return successful;
+}
+
+void VulkanSharedMemory::HashUploadedPages(uint32_t page_first, uint32_t page_count,
+                                           const uint8_t* source) {
+  if (upload_page_hashes_.empty()) {
+    upload_page_hashes_.resize(size_t(kBufferSize) >> page_size_log2(), 0);
+  }
+  const uint32_t page_size = uint32_t(1) << page_size_log2();
+  for (uint32_t i = 0; i < page_count; ++i) {
+    const uint64_t* words = reinterpret_cast<const uint64_t*>(source + (size_t(i) << page_size_log2()));
+    // Not a cryptographic hash - just enough mixing to tell a rewritten page
+    // from an untouched one across a frame.
+    uint64_t hash = 0xCBF29CE484222325ull;
+    for (uint32_t word = 0; word < page_size / sizeof(uint64_t); ++word) {
+      hash = (hash ^ words[word]) * 0x100000001B3ull;
+    }
+    hash |= 1;  // 0 means "never uploaded"
+    uint64_t& stored = upload_page_hashes_[page_first + i];
+    if (!stored) {
+      COUNT_profile_add("gpu/shared_memory/upload_pages_first_time", 1);
+    } else if (stored == hash) {
+      COUNT_profile_add("gpu/shared_memory/upload_pages_unchanged", 1);
+    } else {
+      COUNT_profile_add("gpu/shared_memory/upload_pages_changed", 1);
+    }
+    stored = hash;
+  }
 }
 
 void VulkanSharedMemory::GetUsageMasks(Usage usage, VkPipelineStageFlags& stage_mask,

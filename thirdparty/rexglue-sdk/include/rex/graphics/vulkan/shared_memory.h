@@ -79,6 +79,13 @@ class VulkanSharedMemory : public SharedMemory {
   std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> upload_buffer_pool_;
   std::vector<VkBufferCopy> upload_regions_;
 
+  void HashUploadedPages(uint32_t page_first, uint32_t page_count, const uint8_t* source);
+
+  // Diagnostic (shared_memory_upload_hash): one hash per guest page of what
+  // was last uploaded from it, to tell pages the guest really rewrote apart
+  // from pages that were only invalidated by the callback's block widening.
+  std::vector<uint64_t> upload_page_hashes_;
+
   // Created temporarily, only for downloading.
   VkBuffer trace_download_buffer_ = VK_NULL_HANDLE;
   VkDeviceMemory trace_download_buffer_memory_ = VK_NULL_HANDLE;

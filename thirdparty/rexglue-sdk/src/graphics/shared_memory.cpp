@@ -15,12 +15,40 @@
 
 #include <rex/assert.h>
 #include <rex/bit.h>
+#include <rex/cvar.h>
 #include <rex/dbg.h>
+#include <rex/logging.h>
 #include <rex/graphics/shared_memory.h>
 #include <rex/math.h>
 #include <rex/memory.h>
 
+REXCVAR_DEFINE_BOOL(shared_memory_keep_uploaded_pages_valid, true, "GPU",
+                    "Keep the valid bits of pages uploaded from guest memory when the end-of-frame "
+                    "page-state refresh runs (Xenia's valid |= valid_and_gpu_written). Off, the "
+                    "refresh replaces the valid mask with the GPU-written mask alone, so every "
+                    "page the CPU uploaded is re-uploaded on the next frame that reads it.");
+REXCVAR_DEFINE_INT32(shared_memory_upload_log, 0, "GPU",
+                     "Log this many shared-memory upload ranges (guest address and page count) "
+                     "and this many invalidation callbacks, then stop. Diagnostic only.");
+
 namespace rex::graphics {
+
+namespace {
+// One budget shared by both diagnostics below; they are read together.
+std::atomic<int32_t> g_upload_log_budget{-1};
+bool UploadLogTake() {
+  int32_t budget = g_upload_log_budget.load(std::memory_order_relaxed);
+  if (budget < 0) {
+    budget = REXCVAR_GET(shared_memory_upload_log);
+    g_upload_log_budget.store(budget, std::memory_order_relaxed);
+  }
+  if (budget <= 0) {
+    return false;
+  }
+  g_upload_log_budget.fetch_sub(1, std::memory_order_relaxed);
+  return true;
+}
+}  // namespace
 
 SharedMemory::SharedMemory(memory::Memory& memory) : memory_(memory) {
   page_size_log2_ = rex::log2_ceil(uint32_t(rex::memory::page_size()));
@@ -133,6 +161,29 @@ void SharedMemory::SetSystemPageBlocksValidWithGpuDataWritten() {
     gpu_written_data_dirty_.store(false, std::memory_order_relaxed);
     dirty_blocks_.store(0, std::memory_order_relaxed);
     return;
+  }
+
+  if (REXCVAR_GET(shared_memory_keep_uploaded_pages_valid)) {
+    // A page made valid by an upload has that bit only in the ACTIVE buffer -
+    // MakeRangeValid writes it there, while system_page_flags_valid_and_gpu_
+    // written_ tracks only the pages the GPU wrote. Refreshing staging from
+    // that mask alone and swapping it in therefore drops every CPU-uploaded
+    // page's valid bit once a frame, and the next draw that reads the page
+    // uploads it again. Carry the active bits over instead, which is what
+    // this refresh means: valid |= valid_and_gpu_written.
+    auto global_lock = global_critical_region_.Acquire();
+    uint64_t* active = active_valid_flags_.load(std::memory_order_relaxed);
+    if (active) {
+      for (uint32_t i = 0; i < num_system_page_flags_; ++i) {
+        staging[i] = active[i] | system_page_flags_valid_and_gpu_written_[i];
+      }
+      dirty_blocks_.store(0, std::memory_order_relaxed);
+      active_valid_flags_.store(staging, std::memory_order_release);
+      staging_valid_flags_.store(active, std::memory_order_release);
+      gpu_written_data_dirty_.store(false, std::memory_order_relaxed);
+      COUNT_profile_add("gpu/shared_memory/page_state_refreshes", 1);
+      return;
+    }
   }
 
   uint32_t dirty_mask = dirty_blocks_.exchange(0, std::memory_order_relaxed);
@@ -451,6 +502,8 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
   }
 
   SCOPE_profile_cpu_f("gpu");
+  COUNT_profile_add("gpu/shared_memory/request_calls", 1);
+  COUNT_profile_add("gpu/shared_memory/request_call_ranges", int64_t(merged_ranges.size()));
 
   std::sort(merged_ranges.begin(), merged_ranges.end(),
             [](const std::pair<uint32_t, uint32_t>& a, const std::pair<uint32_t, uint32_t>& b) {
@@ -510,6 +563,7 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
       }
     }
     if (all_valid) {
+      COUNT_profile_add("gpu/shared_memory/request_calls_already_valid", 1);
       COUNT_profile_set("gpu/shared_memory/request_ranges_count", uint32_t(count));
       COUNT_profile_set("gpu/shared_memory/request_ranges_merged_count",
                         uint32_t(merged_ranges.size()));
@@ -595,6 +649,26 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
     return true;
   }
 
+  COUNT_profile_add("gpu/shared_memory/request_calls_uploading", 1);
+  {
+    uint32_t upload_pages = 0;
+    for (const std::pair<uint32_t, uint32_t>& upload_range : upload_ranges_) {
+      upload_pages += upload_range.second;
+    }
+    COUNT_profile_add("gpu/shared_memory/request_upload_pages", int64_t(upload_pages));
+    if (upload_pages >= 4 && UploadLogTake()) {
+      std::string ranges;
+      for (const std::pair<uint32_t, uint32_t>& upload_range : upload_ranges_) {
+        ranges += fmt::format(" {:08X}+{}", upload_range.first << page_size_log2_,
+                              upload_range.second);
+      }
+      std::string asked;
+      for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
+        asked += fmt::format(" {:08X}+{:X}", range.first, range.second);
+      }
+      REXGPU_ERROR("[SMEM] upload {} pages, asked{}, uploading{}", upload_pages, asked, ranges);
+    }
+  }
   return UploadRanges(upload_ranges_);
 }
 
@@ -624,6 +698,10 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
 
   auto global_lock = global_critical_region_.Acquire();
 
+  // Measurement: how much of the invalidated (and therefore re-uploaded)
+  // span the guest actually wrote, versus what the widening below adds.
+  const uint32_t pages_asked = page_last - page_first + 1;
+
   if (!exact_range) {
     // Check if a somewhat wider range (up to 256 KB with 4 KB pages) can be
     // invalidated - if no GPU-written data nearby that was not intended to be
@@ -644,6 +722,18 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
       page_last =
           (page_last & ~uint32_t(63)) + (std::max(rex::tzcnt(gpu_written_end), uint8_t(1)) - 1);
     }
+  }
+
+  COUNT_profile_add("gpu/shared_memory/invalidate_calls", 1);
+  COUNT_profile_add("gpu/shared_memory/invalidate_pages_asked", int64_t(pages_asked));
+  COUNT_profile_add("gpu/shared_memory/invalidate_pages_widened",
+                    int64_t(page_last - page_first + 1));
+  if (!exact_range) {
+    COUNT_profile_add("gpu/shared_memory/invalidate_calls_inexact", 1);
+  }
+  if (page_last - page_first + 1 != pages_asked && UploadLogTake()) {
+    REXGPU_ERROR("[SMEM] invalidate {:08X}+{:X} ({} pages) widened to {} pages", 
+                 physical_address_start, length, pages_asked, page_last - page_first + 1);
   }
 
   uint32_t dirty_blocks_mask = 0;

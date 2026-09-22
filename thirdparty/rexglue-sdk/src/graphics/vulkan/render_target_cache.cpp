@@ -1733,6 +1733,7 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
         copy_dest_committed = texture_cache.CommitScaledResolveRange(
             resolve_info.copy_dest_base, copy_dest_range_unscaled, copy_shader_info.dest_bpe_log2);
       } else {
+        COUNT_profile_add("gpu/shared_memory/requests_from_resolve", 1);
         copy_dest_committed = shared_memory.RequestRange(resolve_info.copy_dest_extent_start,
                                                          resolve_info.copy_dest_extent_length);
       }

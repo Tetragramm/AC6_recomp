@@ -4701,6 +4701,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                       vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
           return false;
       }
+      COUNT_profile_add("gpu/shared_memory/requests_from_vfetch", 1);
       if (!shared_memory_->RequestRange(vfetch_constant.address << 2, vfetch_constant.size << 2)) {
         REXGPU_ERROR(
             "Failed to request vertex buffer at 0x{:08X} (size {}) in the shared "
@@ -4717,6 +4718,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   uint32_t memexport_extent_start = UINT32_MAX, memexport_extent_end = 0;
   for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
     uint32_t memexport_range_base_bytes = memexport_range.base_address_dwords << 2;
+    COUNT_profile_add("gpu/shared_memory/requests_from_memexport", 1);
     if (!shared_memory_->RequestRange(memexport_range_base_bytes, memexport_range.size_bytes)) {
       REXGPU_ERROR(
           "Failed to request memexport stream at 0x{:08X} (size {}) in the "
