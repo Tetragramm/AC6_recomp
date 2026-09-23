@@ -29,6 +29,12 @@ REXCVAR_DECLARE(bool, vfetch_index_rounding_bias);
 REXCVAR_DECLARE(bool, param_gen_host_subpixel_restore);
 REXCVAR_DECLARE(std::string, ac6_neutralize_deswizzle_hashes);
 REXCVAR_DECLARE(std::string, ac6_snap_guest_texel_hashes);
+REXCVAR_DEFINE_BOOL(ac6_fix_water_bottom_band, true, "AC6/Fixes",
+                    "Keep the sea shader's screen-space mask fetch (tf14, 320x360) out of the "
+                    "mask's last, half EDRAM tile row (rows 352-359). The game never writes "
+                    "those rows; they hold whatever an earlier pass left in EDRAM, and when that "
+                    "is zero the sea goes black along the bottom of the screen.")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DECLARE(std::string, ac6_densify_x_fetch_hashes);
 REXCVAR_DECLARE(std::string, ac6_densify_y_fetch_hashes);
 
@@ -831,6 +837,21 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
                               snap_hashes);
     }
 
+    // AC6 sea: the water pixel shader samples its screen-space mask (fetch
+    // constant 14, a 320x360 resolve) at the screen position plus a wave
+    // offset, which near the bottom edge reaches the mask's last, half EDRAM
+    // tile row. The game never renders those rows, so they carry leftover
+    // EDRAM contents - on the host render target path, whatever that host
+    // image last held, which depends on the passes run since start-up.
+    // Clamp v to the centre of the last whole-tile row the game does write.
+    const bool apply_water_band_clamp =
+        instr.opcode == ucode::FetchOpcode::kTextureFetch &&
+        !instr.attributes.unnormalized_coordinates &&
+        instr.dimension == xenos::FetchOpDimension::k2D && is_pixel_shader() &&
+        fetch_constant_index == 14 &&
+        current_shader().ucode_data_hash() == UINT64_C(0x35A80CB48A481624) &&
+        REXCVAR_GET(ac6_fix_water_bottom_band);
+
     // Axis densification for separable sparse-kernel passes (AC6 DoF gathers):
     // each allowlisted fetch becomes the average of 2*scale_axis samples spread
     // along the pass axis across one guest-texel half-gap on each side of the
@@ -932,6 +953,9 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           size_needed_components &= 0b0011;
           break;
       }
+    }
+    if (apply_water_band_clamp) {
+      size_needed_components |= 0b010;
     }
     if (apply_host_subpixel_correction || apply_deswizzle_identity ||
         apply_guest_texel_snap || apply_cluster_filter) {
@@ -1308,6 +1332,24 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
                                                  texture_resolution_scaled, snapped,
                                                  coordinates[i]);
         }
+      }
+      if (apply_water_band_clamp) {
+        assert_true(size[1] != spv::NoResult);
+        // v_max = (floor(height / 16) * 16 - 0.5) / height.
+        spv::Id whole_tile_rows = builder_->createNoContractionBinOp(
+            spv::OpFMul, type_float_,
+            builder_->createUnaryBuiltinCall(
+                type_float_, ext_inst_glsl_std_450_, GLSLstd450Floor,
+                builder_->createNoContractionBinOp(spv::OpFMul, type_float_, size[1],
+                                                   builder_->makeFloatConstant(1.0f / 16.0f))),
+            builder_->makeFloatConstant(16.0f));
+        spv::Id v_max = builder_->createNoContractionBinOp(
+            spv::OpFDiv, type_float_,
+            builder_->createNoContractionBinOp(spv::OpFSub, type_float_, whole_tile_rows,
+                                               builder_->makeFloatConstant(0.5f)),
+            size[1]);
+        coordinates[1] = builder_->createBinBuiltinCall(type_float_, ext_inst_glsl_std_450_,
+                                                        GLSLstd450FMin, coordinates[1], v_max);
       }
       if (instr.dimension == xenos::FetchOpDimension::k3DOrStacked) {
         spv::Id& z_coordinate_ref = coordinates[2];
