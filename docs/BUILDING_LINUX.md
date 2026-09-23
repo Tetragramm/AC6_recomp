@@ -59,9 +59,11 @@ minute from <https://github.com/XboxDev/extract-xiso>.
 ### Getting Clang 20
 
 The CMake preset asks for `clang-20` / `clang++-20` on `PATH`. If your
-distribution ships them, nothing more is needed.
+distribution ships them, nothing more is needed. For Ubuntu or Fedora, use your package manager to install `clang-20`.
 
-If it does not, download an upstream LLVM release and point CMake at it
+Arch calls it `clang20`, and then requires you to explicitly set the path. Default location is `/usr/lib/llvm20/bin/clang`.
+
+If your distro does not, download an upstream LLVM release and point CMake at it
 directly. Unpack it anywhere — the commands below assume
 `toolchain/LLVM-20.1.8-Linux-X64/` beside the repository — and pass the two
 compiler paths on the configure line as shown in
@@ -115,7 +117,10 @@ cmake --preset linux-amd64-relwithdebinfo \
   -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld"
 
 cmake --build --preset linux-amd64-relwithdebinfo --target ac6recomp_codegen
-cmake --preset linux-amd64-relwithdebinfo
+cmake --preset linux-amd64-relwithdebinfo \
+  -DCMAKE_C_COMPILER="$TOOLCHAIN/bin/clang" \
+  -DCMAKE_CXX_COMPILER="$TOOLCHAIN/bin/clang++" \
+  -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld"
 cmake --build --preset linux-amd64-relwithdebinfo
 ```
 
