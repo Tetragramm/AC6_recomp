@@ -25,7 +25,7 @@ See [Important console variables](#important-console-variables).
 - **60 FPS.** The game can now run up to 60 FPS, with the flight model corrected.
 - **High quality terrain.** Terrain is drawn at the full resolution shipped on the disc, twice what the console rendered. Cracks and seams that appear over mountains are also removed.
 - **Resolution scaling.** Render internally at 2× (1440p) or 3× (2160p) and beyond for a much sharper image.
-- **Ultrawide support.** Optional hor+ widescreen in missions and cutscenes.
+- **Ultrawide support.** Optional hor+ widescreen in missions and cutscenes. Windows only for now.
 - **AC7-like keyboard and mouse controls.** Remappable bindings, live-reloaded from a config file, on Windows and Linux alike. Mouse steering is Windows-only for now. Controllers work out of the box on both platforms, including a virtual pad when none is connected.
 - **Japanese language support.**
 - **Texture replacement modding** — see [Modding docs](#modding-docs).
@@ -51,9 +51,9 @@ See [Important console variables](#important-console-variables).
 
 *Note that the system requirement does not guarantees that the recomp will perform well on your system!*
 
-The Linux build is newer than the Windows one; mouse steering is the main thing
-still missing. See [Building on Linux](docs/BUILDING_LINUX.md) for the build
-steps and the full list of platform differences.
+The Linux build is newer than the Windows one; mouse steering and ultrawide are
+the main things still missing. See [Building on Linux](docs/BUILDING_LINUX.md)
+for a step-by-step build guide and the full list of platform differences.
 
 ### Steps
 
@@ -63,11 +63,11 @@ steps and the full list of platform differences.
    - the game's `.iso` disc image **or**
    - an `assets/` folder containing the extracted game files.
 
-4. **(Optional) Add DLC.** Extracted DLC packages can be placed next to the executable, inside a folder named `dlc/`.
+3. **(Optional) Add DLC.** Put your DLC packages in a folder named `dlc/` next to the executable. The packages can be used as they are; extracted packages work too.
 
-5. **Run the executable** — `ac6recomp.exe` on Windows, `./ac6recomp` on Linux. On first run it creates `ac6recomp.toml` beside the executable, which contains the game settings.
+4. **Run the executable** — `ac6recomp.exe` on Windows, `./ac6recomp` on Linux. On first run it creates `ac6recomp.toml` beside the executable, which contains the game settings.
 
-6. **In-game keys:**
+5. **In-game keys:**
    - `F3` - toggle FPS overlay
    - `F4` - settings overlay (browse and change most options live)
    - `F11` - toggle fullscreen
@@ -80,29 +80,68 @@ Settings live in **`ac6recomp.toml`** next to the executable. Most can also be c
 
 > [!IMPORTANT]
 > In `.toml`, **use forward slashes in paths**. A single backslash is an escape character and one bad line silently voids the entire file, sending every setting back to its default.
+>
+> Settings must be **top-level keys** — a setting placed under a `[section]` header is silently ignored.
+
+### Display
 
 | cvar | default | what it does |
 |---|---|---|
 | `user_language` | `1` | Sets the language. `1` for English, `2` for Japanese. |
 | `fullscreen` | `false` | Start in fullscreen (`F11` toggles at runtime) |
-| `draw_resolution_scale_x` | `1` | Internal render scale on the x axis. `1` for 1280, `2` for 2560, `3` for 3840, etc. |
-| `draw_resolution_scale_y` | `1` | Internal render scale on the y axis. `1` for 720, `2` for 1440, `3` for 2160, etc. |
-| `ac6_unlock_fps` | `true` | Allow framerates above the stock 30 fps |
-| `ac6_dynamic_vblank` | `true` | Keep menus and cutscenes at their native 60 Hz pacing while gameplay runs at your target |
-| `ac6_performance_mode` | `true` | Reduces logging and diagnostic overhead |
-| `ac6_widescreen` | `false` | Ultrawide support (hor+) in missions. Menus and hangar stay 16:9 |
+| `resolution` | *(empty)* | Window and output resolution preset: `720p`, `1080p`, `1440p`, `4k`, or e.g. `1920x1080` |
+| `monitor` | `0` | Which monitor to open on. `0` = default, `1` = primary, `2` = second monitor, etc. |
+| `vsync` | `true` | Vertical sync |
+| `resolution_scale` | `1` | Internal render scale on both axes. `1` = 720p, `2` = 1440p, `3` = 2160p (4K), etc. |
+| `draw_resolution_scale_x` | `1` | Internal render scale on the x axis only. `1` for 1280, `2` for 2560, `3` for 3840, etc. |
+| `draw_resolution_scale_y` | `1` | Internal render scale on the y axis only. `1` for 720, `2` for 1440, `3` for 2160, etc. |
+| `anisotropic_override` | `3` | Texture filtering at oblique angles. `-1` = game default, `0` = off, `1`/`2`/`3`/`4`/`5` = 1×/2×/4×/8×/16× |
+| `swap_post_effect` | `none` | Anti-aliasing on the final image: `none`, `fxaa`, `fxaa_extreme` |
+| `ac6_widescreen` | `false` | Ultrawide support (hor+) in missions. Menus and hangar stay 16:9. **Windows only for now** |
 | `ac6_widescreen_cinematics` | `true` | With ultrawide on, also widen in-engine cinematics. They are staged for 16:9, so this can expose set edges |
 | `ac6_terrain_hd` | `true` | Draw terrain at the full shipped resolution (2× what the console drew), which also removes terrain cracks |
 | `ac6_fullres_effects` | `false` | Draw clouds, smokes, trails, and afterburner effect at native resolution (2× what the console drew), slightly affects performance |
-| `ac6_cursor_hide_seconds` | `3.0` | Hide the mouse cursor after this many idle seconds. `0` = never hide. Windows only |
+| `show_build_stamp` | `true` | Show the short build version in the lower-left corner. Include it when reporting a bug |
+
+For 1440p, set `resolution_scale = 2`. For 2160p or 4K, set `resolution_scale = 3`.
+
+For 1440p Ultrawide, it is recommended to set `draw_resolution_scale_x` to `3` and `draw_resolution_scale_y` to `2` instead.
+
+### Frame rate
+
+| cvar | default | what it does |
+|---|---|---|
+| `ac6_unlock_fps` | `true` | Allow framerates above the stock 30 fps |
+| `ac6_fps_target` | `60` | Target framerate. `0` = the highest rate up to `ac6_max_sim_fps` that evenly divides your monitor's refresh rate (Windows only; Linux uses `ac6_max_sim_fps`) |
+| `ac6_max_sim_fps` | `60` | Ceiling on the game's simulation rate. The physics is only validated up to 60; raise it only for testing |
+| `ac6_min_sim_fps` | `20` | Below this framerate the game slows down instead of skipping ahead. The console used 30 |
+| `ac6_dynamic_vblank` | `true` | Keep menus and cutscenes at their native 60 Hz pacing while gameplay runs at your target |
+| `ac6_cutscene_clamp` | `true` | Play in-engine cutscenes at their native rate, so they don't run at double speed |
+| `ac6_dt_snap` | `true` | Smooth out tiny frame-to-frame timing differences that show up as micro-stutter or shake |
+| `ac6_performance_mode` | `true` | Reduces logging and diagnostic overhead |
+| `use_shader_disk_cache` | `true` | Save compiled shaders in `cache/shaders/` and load them at startup, so each scene only stutters the first time you see it |
+
+### Controls
+
+| cvar | default | what it does |
+|---|---|---|
 | `ac6_kbm_enabled` | `false` | **Enable keyboard and mouse controls.** Off by default — controllers work out of the box. Turning it on switches `mnk_mode` off |
 | `ac6_kbm_config` | `ac6_input.toml` | Path to the key bindings file. Edits are picked up live |
+| `ac6_kbm_padless` | `true` | Provide a virtual controller when none is connected, so keyboard and mouse work on their own |
+| `ac6_cursor_hide_seconds` | `3.0` | Hide the mouse cursor after this many idle seconds. `0` = never hide. Windows only |
 | `mnk_mode` | `false` | Alternative keyboard/mouse-as-a-virtual-controller mode. Superseded by `ac6_kbm_enabled`, which forces it off |
+
+### Game data, DLC, and mods
+
+| cvar | default | what it does |
+|---|---|---|
+| `game_iso` | *(empty)* | Path to the game's `.iso`. Empty = use the `assets/` folder if there is one, otherwise look for the `.iso` next to the executable |
+| `iso_direct` | `true` | Allow running straight from the `.iso`. An `assets/` folder always wins when present |
+| `dlc_dir` | *(empty)* | Where to find DLC. Empty = the `dlc/` folder next to the executable |
+| `dlc_containers` | `true` | Use DLC packages as they are, with no extraction needed |
+| `license_mask` | `0xFFFFFFFF` | Treat all installed DLC as owned. `0` = check each package's own license |
 | `ac6_texture_swaps_enabled` | `false` | Enable texture replacement mods (see [Modding docs](#modding-docs)) |
-
-For 1440p, set both `draw_resolution_scale_x` and `draw_resolution_scale_y` to `2`. For 2160p or 4K, set them to `3`.
-
-For 1440p Ultrawide, it is recommended to set `draw_resolution_scale_x` to `3` and `draw_resolution_scale_y` to `2`.
+| `audio_mute` | `false` | Mute all game audio |
 
 ### Fixes
 
@@ -116,8 +155,18 @@ These are on by default and exist so a problem can be isolated. Turning one off 
 | `ac6_fix_dof` | `true` | Cutscene depth-of-field striping and ghosting above 1× scale |
 | `ac6_fix_trails` | `true` | Invisible missile and jet trails |
 | `ac6_fix_water_line` | `true` |  Lines across open water seen at a grazing angle |
+| `ac6_fix_water_bottom_band` | `true` | Dark band across the sea along the bottom of the screen. Linux (Vulkan) only |
 | `ac6_flare_drop_quad2` | `true` | Faint rectangle around the sun |
 | `ac6_cutscene_resync` | `true` | Keeps cutscene video locked to its audio after a render hitch |
+| `ac6_profile_always_signed_in` | `true` | "Gamer Profile not selected" when the controller is not the first one connected (common with Steam Input) |
+| `ac6_fix_storage_submit_order` | `true` | A rare race that could make a save, replay, or content-cache operation do the wrong thing. Matches the retail title update |
+| `audio_xma_header_straddle_fix` | `true` | Dropped audio frames and combed cutscene dialogue |
+| `audio_xma_loop_end_guard` | `true` | Voices in multi-stream audio drifting out of alignment |
+| `audio_xma_preserve_timeline` | `true` | Timing drift in multi-stream audio when a frame cannot be decoded |
+
+### Performance options (Linux)
+
+The Linux (Vulkan) build has a set of performance options, all on by default, that make 60 fps at high resolution scales possible. They are listed in [Building on Linux](docs/BUILDING_LINUX.md#vulkan-performance-options), along with diagnostic settings for bug hunting.
 
 ---
 
@@ -223,7 +272,7 @@ Users must supply their own legally obtained game files locally.
 
 ## Other docs
 
-- [Building on Linux](docs/BUILDING_LINUX.md) — Linux build, platform differences, and debugging
+- [Building on Linux](docs/BUILDING_LINUX.md) — step-by-step Linux build, Linux performance options, platform differences, and debugging
 
 
 ## Project layout
